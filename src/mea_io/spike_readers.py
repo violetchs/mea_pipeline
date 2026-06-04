@@ -41,6 +41,7 @@ __all__ = [
     "read_blackrock_nev",
     "read_maxwell_h5",
     "read_unified_npz",
+    "save_spike_train_npz",
     "save_unified_npz",
 ]
 
@@ -890,6 +891,14 @@ def _maxwell_adc_zero_count(raw_dataset, group) -> float:
 
     settings = group.get("settings")
     if settings is not None:
+        for key in ("adc_zero", "adc_zero_count", "zero_count", "adc_offset", "offset"):
+            raw_value = _h5_scalar(settings, key, None)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            if np.isfinite(value) and value:
+                return value
         for key in ("adc_range", "adc_resolution", "bits"):
             raw_value = _h5_scalar(settings, key, None)
             try:
@@ -901,9 +910,7 @@ def _maxwell_adc_zero_count(raw_dataset, group) -> float:
                     return float(2 ** int(value - 1))
                 return value / 2.0
 
-    # Maxwell raw matrices are commonly stored as 10-bit offset-binary samples
-    # in uint16 containers. Zero voltage is code 512, not code 0.
-    return 512.0
+    return 0.0
 
 
 def _maxwell_decode_raw_snippet(snippet: np.ndarray, zero_count: float) -> np.ndarray:
@@ -1311,7 +1318,7 @@ def read_maxwell_h5(
     extract_waveforms: bool = True,
     waveform_window_ms: Tuple[float, float] = (1.0, 2.0),
     max_waveform_bytes: int = 512 * 1024 * 1024,
-    stim_artifact_window_ms: float = 1.0,
+    stim_artifact_window_ms: float = 0.0,
     cancel_check=None,
 ) -> UnifiedMEAData:
     """Read Maxwell Biosystems ``.raw.h5`` files into :class:`UnifiedMEAData`.
@@ -1322,9 +1329,9 @@ def read_maxwell_h5(
     are extracted using ``waveform_window_ms`` as ``(pre_ms, post_ms)``. If raw
     data cannot be read, for example because Maxwell's HDF5 compression plugin
     is missing, spike loading still succeeds and the extraction failure is kept
-    in metadata. When stimulation events are present, spike timestamps within
-    ``stim_artifact_window_ms`` before or after a stimulation marker are removed
-    as stimulation artifacts.
+    in metadata. Stimulation artifacts are preserved by default; pass a positive
+    ``stim_artifact_window_ms`` to remove spike timestamps within that window
+    before or after each stimulation marker at read time.
     """
 
     h5py = _require_h5py()
@@ -2098,13 +2105,14 @@ def read_unified_npz(path: str | Path) -> UnifiedMEAData:
     )
 
 
-def save_unified_npz(data: UnifiedMEAData, path: str | Path) -> Path:
+def save_unified_npz(data: UnifiedMEAData, path: str | Path, *, include_waveforms: bool = True) -> Path:
     """Save unified MEA data and sorting results to a compressed NPZ file.
 
-    The file preserves per-channel spikes/waveforms and sorting labels. It also
-    stores unit-level views as ``unit_spikes_{channel}_{unit}`` and
+    The file preserves per-channel spikes, waveforms and sorting labels. It
+    also stores unit-level views as ``unit_spikes_{channel}_{unit}`` and
     ``unit_waveforms_{channel}_{unit}``, including noise unit ``-1`` when
-    present.
+    present. Use :func:`save_spike_train_npz` for a lightweight file that omits
+    waveform arrays.
     """
 
     output = Path(path)
@@ -2120,6 +2128,13 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path) -> Path:
             _json_safe({key: value for key, value in data.sorting.items() if str(key).startswith("_")}),
             ensure_ascii=False,
         ),
+        "save_options_json": json.dumps(
+            {
+                "format": "unified_mea_npz" if include_waveforms else "unified_spike_train_npz",
+                "include_waveforms": bool(include_waveforms),
+            },
+            ensure_ascii=False,
+        ),
     }
     if data.sr is not None:
         arrays["sr"] = np.asarray(float(data.sr), dtype=float)
@@ -2127,9 +2142,11 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path) -> Path:
     for channel in data.channels():
         safe_channel = _safe_key(channel)
         spikes = np.asarray(data.spikes[channel], dtype=float)
-        waveforms = np.asarray(data.waveforms.get(channel, np.zeros((0, 0), dtype=float)))
         arrays[f"spikes_{safe_channel}"] = spikes
-        arrays[f"waveforms_{safe_channel}"] = waveforms
+        waveforms = None
+        if include_waveforms:
+            waveforms = np.asarray(data.waveforms.get(channel, np.zeros((0, 0), dtype=float)))
+            arrays[f"waveforms_{safe_channel}"] = waveforms
 
         sorting = data.sorting.get(channel, {}) if isinstance(data.sorting, dict) else {}
         labels = _labels_for_channel(sorting, spikes.size)
@@ -2140,7 +2157,7 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path) -> Path:
                 mask = labels == unit
                 unit_key = _safe_unit_key(unit)
                 arrays[f"unit_spikes_{safe_channel}_{unit_key}"] = spikes[mask]
-                if waveforms.ndim == 2 and waveforms.shape[0] == spikes.size:
+                if include_waveforms and waveforms is not None and waveforms.ndim == 2 and waveforms.shape[0] == spikes.size:
                     arrays[f"unit_waveforms_{safe_channel}_{unit_key}"] = waveforms[mask]
         embedding = sorting.get("embedding")
         if embedding is not None:
@@ -2148,6 +2165,12 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path) -> Path:
 
     np.savez_compressed(output, **arrays)
     return output
+
+
+def save_spike_train_npz(data: UnifiedMEAData, path: str | Path) -> Path:
+    """Save metadata, sorting results and spike trains without waveforms."""
+
+    return save_unified_npz(data, path, include_waveforms=False)
 
 
 def _labels_for_channel(sorting: Dict[str, Any], expected_size: int) -> Optional[np.ndarray]:

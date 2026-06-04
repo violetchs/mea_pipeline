@@ -15,6 +15,7 @@ from .spike_readers import (
     read_blackrock_nev,
     read_maxwell_h5,
     read_unified_npz,
+    save_spike_train_npz,
     save_unified_npz,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "read_blackrock_nev",
     "read_maxwell_h5",
     "read_unified_npz",
+    "save_spike_train_npz",
     "save_unified_npz",
 ]
 

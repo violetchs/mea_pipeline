@@ -9,7 +9,7 @@ LONG_DESCRIPTION = README.read_text(encoding="utf-8") if README.exists() else ""
 
 setup(
     name="mea-pipeline",
-    version="0.1.0",
+    version="0.1.1",
     description="MEA (Microelectrode Array) data processing pipeline for neural activity analysis",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
@@ -27,6 +27,7 @@ setup(
         "scikit-learn>=1.5.2",
         "PySide6>=6.8.0",
         "h5py>=3.10.0",
+        "Pillow>=11.0.0",
     ],
     entry_points={
         "console_scripts": [

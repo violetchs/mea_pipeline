@@ -1,6 +1,7 @@
 """PySide6 GUI entry point for the MEA pipeline."""
 
 import copy
+import colorsys
 import os
 import re
 import sys
@@ -56,11 +57,15 @@ except ImportError as exc:  # pragma: no cover - exercised by manual GUI startup
     ) from exc
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.cm import ScalarMappable
+from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.path import Path as MplPath
+from matplotlib.colors import Normalize
 from matplotlib.widgets import LassoSelector
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.ndimage import gaussian_filter
+from scipy.optimize import curve_fit
 from scipy.spatial.distance import squareform
 from sklearn.cluster import KMeans as SkKMeans
 from sklearn.decomposition import PCA as SkPCA
@@ -85,6 +90,7 @@ try:
         read_axion_spk,
         read_blackrock_nev,
         read_maxwell_h5,
+        save_spike_train_npz,
         save_unified_npz,
     )
     from ..pipeline import MEAPipeline, PipelineConfig, PipelineResult
@@ -110,6 +116,7 @@ except ImportError:
         read_axion_spk,
         read_blackrock_nev,
         read_maxwell_h5,
+        save_spike_train_npz,
         save_unified_npz,
     )
     from pipeline import MEAPipeline, PipelineConfig, PipelineResult
@@ -154,16 +161,29 @@ def _prefer_waveform_channel(spike_series, waveform_series) -> str:
     return spike_series[0][0]
 
 
-def _maxwell_channel_map_from_unified(data: UnifiedMEAData) -> ChannelMap | None:
-    if not isinstance(data.meta, dict):
-        return None
-    raw_map = data.meta.get("channel_map")
-    if not isinstance(raw_map, dict) or not raw_map:
-        return load_channel_map("maxwell_map")
-
+def _default_maxwell_channel_map() -> ChannelMap | None:
     base_map = load_channel_map("maxwell_map")
     if base_map is None:
-        return None
+        electrodes = {}
+        rows = 120
+        cols = 220
+        pitch_um = 17.5
+        for row in range(rows):
+            for col in range(cols):
+                electrode_int = 221 + row * cols + col
+                electrode = f"e{electrode_int}"
+                electrodes[electrode] = {
+                    "channel": "",
+                    "reference": False,
+                    "electrode": electrode_int,
+                    "grid_row": row,
+                    "grid_col": col,
+                    "x_um": (col + 1) * pitch_um,
+                    "y_um": (row + 1) * pitch_um,
+                    "aliases": [electrode, str(electrode_int)],
+                    "routed": False,
+                }
+        return ChannelMap(name="maxwell_map", rows=rows, cols=cols, electrodes=electrodes)
 
     electrodes = copy.deepcopy(base_map.electrodes)
     for payload in electrodes.values():
@@ -171,6 +191,23 @@ def _maxwell_channel_map_from_unified(data: UnifiedMEAData) -> ChannelMap | None
             continue
         payload["channel"] = ""
         payload["routed"] = False
+        payload.pop("source_channel", None)
+        payload.pop("recording", None)
+        payload.pop("data_group", None)
+    return ChannelMap(name="maxwell_map", rows=base_map.rows, cols=base_map.cols, electrodes=electrodes)
+
+
+def _maxwell_channel_map_from_unified(data: UnifiedMEAData) -> ChannelMap | None:
+    if not isinstance(data.meta, dict):
+        return _default_maxwell_channel_map()
+    raw_map = data.meta.get("channel_map")
+    base_map = _default_maxwell_channel_map()
+    if base_map is None:
+        return None
+    if not isinstance(raw_map, dict) or not raw_map:
+        return base_map
+
+    electrodes = copy.deepcopy(base_map.electrodes)
 
     for channel_name, payload in raw_map.items():
         if not isinstance(payload, dict):
@@ -363,6 +400,18 @@ def _display_indices(length: int, max_count: int):
     if length <= max_count:
         return np.arange(length)
     return np.linspace(0, length - 1, max_count, dtype=int)
+
+
+def _normalized_channel_keys(channels) -> set[str]:
+    keys = set()
+    for channel in channels or []:
+        text = str(channel or "").strip()
+        if not text:
+            continue
+        keys.add(normalize_channel_name(text))
+        if "_" in text:
+            keys.add(normalize_channel_name(text.split("_", 1)[1]))
+    return {key for key in keys if key}
 
 
 def _waveform_time_axis(sample_count: int, sampling_rate):
@@ -563,6 +612,656 @@ def _burst_sequence_payload(spike_series, burst_intervals):
         "burst_count": int(intervals.shape[0]),
         "row_count": int(labels.size),
     }
+
+
+def _stim_tail_keep_mask(times: np.ndarray, stim_times: np.ndarray, window_s: float) -> np.ndarray:
+    values = np.asarray(times, dtype=float)
+    events = np.asarray(stim_times, dtype=float)
+    events = events[np.isfinite(events)]
+    if values.size == 0 or events.size == 0 or window_s <= 0:
+        return np.ones(values.shape, dtype=bool)
+    events.sort()
+    indices = np.searchsorted(events, values)
+    artifact = np.zeros(values.shape, dtype=bool)
+    tolerance = window_s + 1e-12
+    right = indices < events.size
+    if np.any(right):
+        artifact[right] |= np.abs(events[indices[right]] - values[right]) <= tolerance
+    left = indices > 0
+    if np.any(left):
+        artifact[left] |= np.abs(values[left] - events[indices[left] - 1]) <= tolerance
+    return ~artifact
+
+
+def _filter_spike_series_stim_tail(spike_series, stim_times, window_ms: float):
+    stim_values = np.asarray(stim_times if stim_times is not None else [], dtype=float)
+    window_s = max(0.0, float(window_ms) / 1000.0)
+    filtered = []
+    masks = {}
+    removed = 0
+    for label, times in spike_series:
+        values = np.asarray(times, dtype=float)
+        keep = _stim_tail_keep_mask(values, stim_values, window_s)
+        masks[str(label)] = keep
+        removed += int(values.size - np.count_nonzero(keep))
+        filtered.append((label, values[keep]))
+    return filtered, masks, removed
+
+
+def _burst_delay_channel_series(spike_series, max_channels: int | None = None):
+    channel_chunks: dict[str, list[np.ndarray]] = {}
+    for label, times in spike_series:
+        text = str(label)
+        if " noise" in text.lower():
+            continue
+        channel = _base_channel_from_raster_label(text)
+        values = np.asarray(times, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size:
+            channel_chunks.setdefault(channel, []).append(values)
+
+    channel_series = []
+    for channel, chunks in channel_chunks.items():
+        merged = np.unique(np.concatenate(chunks)) if len(chunks) > 1 else np.unique(chunks[0])
+        if merged.size:
+            channel_series.append((channel, merged))
+    channel_series.sort(key=lambda item: (-item[1].size, _channel_sort_key(item[0])))
+    if max_channels is not None and int(max_channels) > 0:
+        channel_series = channel_series[: max(2, int(max_channels))]
+    return [channel for channel, _ in channel_series], [times for _, times in channel_series]
+
+
+def _burst_delay_limited_intervals(burst_intervals, burst_window_ms: float = 0.0):
+    window_s = max(0.0, float(burst_window_ms)) / 1000.0
+    intervals = []
+    for start, stop in burst_intervals:
+        start_s = float(start)
+        stop_s = float(stop)
+        if window_s > 0:
+            stop_s = min(stop_s, start_s + window_s)
+        if stop_s > start_s:
+            intervals.append((start_s, stop_s))
+    return intervals
+
+
+def _burst_delay_first_spike_matrix(spike_series, burst_intervals, max_channels: int | None = None, burst_window_ms: float = 0.0):
+    channels, channel_trains = _burst_delay_channel_series(spike_series, max_channels)
+    channel_series = list(zip(channels, channel_trains))
+
+    intervals = _burst_delay_limited_intervals(burst_intervals, burst_window_ms)
+    first_times = np.full((len(intervals), len(channel_series)), np.nan, dtype=np.float64)
+    for burst_index, (start_s, stop_s) in enumerate(intervals):
+        for channel_index, (_, times) in enumerate(channel_series):
+            lo = int(np.searchsorted(times, start_s, side="left"))
+            if lo < times.size and times[lo] <= stop_s:
+                first_times[burst_index, channel_index] = float(times[lo] - start_s)
+    return [channel for channel, _ in channel_series], intervals, first_times
+
+
+def _source_interval_delay_matches(
+    source_times: np.ndarray,
+    target_times: np.ndarray,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float = 0.0,
+    intervals: list[tuple[float, float]] | None = None,
+):
+    source_times = np.asarray(source_times, dtype=float)
+    target_times = np.asarray(target_times, dtype=float)
+    source_times = np.sort(source_times[np.isfinite(source_times)])
+    target_times = np.sort(target_times[np.isfinite(target_times)])
+    if source_times.size == 0 or target_times.size == 0 or (intervals is None and source_times.size < 2):
+        return np.zeros((0, 3), dtype=float)
+
+    source_starts, source_nexts, row_ids = _source_interval_candidates(source_times, intervals)
+    return _source_interval_delay_matches_from_candidates(
+        source_starts,
+        source_nexts,
+        row_ids,
+        target_times,
+        max_abs_delay_ms,
+        min_abs_delay_ms,
+    )
+
+
+def _source_interval_candidates(
+    source_times: np.ndarray,
+    intervals: list[tuple[float, float]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    source_times = np.asarray(source_times, dtype=float)
+    source_times = np.sort(source_times[np.isfinite(source_times)])
+    if source_times.size < 2:
+        if intervals is None or source_times.size == 0:
+            empty = np.array([], dtype=float)
+            return empty, empty, empty.astype(int)
+
+    if intervals is None:
+        return source_times[:-1], source_times[1:], np.zeros(source_times.size - 1, dtype=int)
+
+    start_chunks = []
+    next_chunks = []
+    row_chunks = []
+    for row_index, (start_s, stop_s) in enumerate(intervals):
+        start_s = float(start_s)
+        stop_s = float(stop_s)
+        if stop_s <= start_s:
+            continue
+        lo = int(np.searchsorted(source_times, start_s, side="left"))
+        hi = int(np.searchsorted(source_times, stop_s, side="right"))
+        local_source = source_times[lo:hi]
+        if local_source.size == 0:
+            continue
+        next_sources = np.empty(local_source.size, dtype=float)
+        if local_source.size > 1:
+            next_sources[:-1] = local_source[1:]
+        next_sources[-1] = stop_s
+        start_chunks.append(local_source)
+        next_chunks.append(next_sources)
+        row_chunks.append(np.full(local_source.size, int(row_index), dtype=int))
+
+    if not start_chunks:
+        empty = np.array([], dtype=float)
+        return empty, empty, empty.astype(int)
+    return np.concatenate(start_chunks), np.concatenate(next_chunks), np.concatenate(row_chunks)
+
+
+def _source_interval_delay_matches_from_candidates(
+    source_starts: np.ndarray,
+    source_nexts: np.ndarray,
+    row_ids: np.ndarray,
+    target_times: np.ndarray,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float = 0.0,
+) -> np.ndarray:
+    source_starts = np.asarray(source_starts, dtype=float)
+    source_nexts = np.asarray(source_nexts, dtype=float)
+    row_ids = np.asarray(row_ids, dtype=int)
+    target_times = np.asarray(target_times, dtype=float)
+    target_times = np.sort(target_times[np.isfinite(target_times)])
+    if source_starts.size == 0 or target_times.size == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    max_delay_s = max(0.0, float(max_abs_delay_ms)) / 1000.0
+    min_delay_s = max(0.0, float(min_abs_delay_ms)) / 1000.0
+    target_positions = np.searchsorted(target_times, source_starts, side="right")
+    valid = target_positions < target_times.size
+    if not np.any(valid):
+        return np.zeros((0, 3), dtype=float)
+
+    source_candidates = source_starts[valid]
+    next_sources = source_nexts[valid]
+    row_candidates = row_ids[valid]
+    target_candidates = target_times[target_positions[valid]]
+    delays_s = target_candidates - source_candidates
+    valid_delays = (target_candidates < next_sources) & (delays_s >= min_delay_s)
+    if max_delay_s > 0:
+        valid_delays &= delays_s <= max_delay_s
+    if not np.any(valid_delays):
+        return np.zeros((0, 3), dtype=float)
+    return np.column_stack(
+        [
+            source_candidates[valid_delays],
+            target_candidates[valid_delays],
+            row_candidates[valid_delays].astype(float, copy=False),
+        ]
+    ).astype(float, copy=False)
+
+
+def _source_interval_delay_values(
+    source_times: np.ndarray,
+    target_times: np.ndarray,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float = 0.0,
+    intervals: list[tuple[float, float]] | None = None,
+) -> np.ndarray:
+    matches = _source_interval_delay_matches(source_times, target_times, max_abs_delay_ms, min_abs_delay_ms, intervals)
+    if matches.size == 0:
+        return np.array([], dtype=float)
+    return ((matches[:, 1] - matches[:, 0]) * 1000.0).astype(float, copy=False)
+
+
+def _burst_delay_pair_values(
+    first_times: np.ndarray,
+    reference_index: int,
+    target_index: int,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float = 0.0,
+):
+    if first_times.ndim != 2 or first_times.shape[0] == 0:
+        return np.array([], dtype=float)
+    delays_ms = (first_times[:, target_index] - first_times[:, reference_index]) * 1000.0
+    delays_ms = delays_ms[np.isfinite(delays_ms)]
+    min_delay = max(0.0, float(min_abs_delay_ms))
+    if min_delay > 0:
+        delays_ms = delays_ms[np.abs(delays_ms) >= min_delay]
+    if max_abs_delay_ms > 0:
+        delays_ms = delays_ms[np.abs(delays_ms) <= float(max_abs_delay_ms)]
+    return delays_ms.astype(float, copy=False)
+
+
+BURST_DELAY_TABLE_ROW_LIMIT = 1000
+BURST_DELAY_COMBO_CHANNEL_LIMIT = 1200
+BURST_DELAY_DEFAULT_CHANNEL_LIMIT = 256
+BURST_DELAY_MAX_ACTIVE_PER_BURST = 384
+
+
+def _burst_delay_all_pair_values(
+    first_times: np.ndarray,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float = 0.0,
+    max_values: int = 250000,
+):
+    if first_times.ndim != 2 or first_times.shape[1] < 2:
+        return np.array([], dtype=float)
+    max_lag_s = max(1.0, float(max_abs_delay_ms)) / 1000.0
+    min_lag_s = max(0.0, float(min_abs_delay_ms)) / 1000.0
+    max_values = max(1, int(max_values))
+    chunks = []
+    collected = 0
+    participation = np.count_nonzero(np.isfinite(first_times), axis=0)
+    for burst_times in np.asarray(first_times, dtype=float):
+        active = np.flatnonzero(np.isfinite(burst_times))
+        if active.size < 2:
+            continue
+        if active.size > BURST_DELAY_MAX_ACTIVE_PER_BURST:
+            order = np.argsort(participation[active], kind="mergesort")[::-1]
+            active = active[order[:BURST_DELAY_MAX_ACTIVE_PER_BURST]]
+        order = np.argsort(burst_times[active], kind="mergesort")
+        sorted_times = burst_times[active][order]
+        right_edge = 1
+        for left_pos, left_time in enumerate(sorted_times[:-1]):
+            if collected >= max_values:
+                break
+            right_edge = max(right_edge, left_pos + 1)
+            while right_edge < sorted_times.size and sorted_times[right_edge] - left_time <= max_lag_s:
+                right_edge += 1
+            if right_edge <= left_pos + 1:
+                continue
+            delays_ms = (sorted_times[left_pos + 1 : right_edge] - left_time) * 1000.0
+            if min_lag_s > 0:
+                delays_ms = delays_ms[delays_ms >= min_lag_s * 1000.0]
+                if delays_ms.size == 0:
+                    continue
+            remaining = max_values - collected
+            if delays_ms.size > remaining:
+                delays_ms = delays_ms[_display_indices(delays_ms.size, remaining)]
+            chunks.append(delays_ms.astype(float, copy=False))
+            collected += int(delays_ms.size)
+        if collected >= max_values:
+            break
+    if not chunks:
+        return np.array([], dtype=float)
+    values = np.concatenate(chunks)
+    if values.size > max_values:
+        values = values[_display_indices(values.size, max_values)]
+    return values.astype(float, copy=False)
+
+
+def _burst_delay_aligned_pairs(
+    channels,
+    first_times: np.ndarray,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float,
+    bin_ms: float,
+    min_peak_count: int,
+    min_peak_fraction: float,
+    min_peak_to_background: float,
+    cancel_check=None,
+    progress_callback=None,
+):
+    if first_times.ndim != 2 or first_times.shape[1] < 2 or not channels:
+        return []
+    max_lag = max(1.0, float(max_abs_delay_ms))
+    min_lag = max(0.0, float(min_abs_delay_ms))
+    bin_width = max(0.1, float(bin_ms))
+    channel_count = min(len(channels), first_times.shape[1])
+    if channel_count < 2:
+        return []
+
+    participation = np.count_nonzero(np.isfinite(first_times[:, :channel_count]), axis=0)
+    eligible = np.flatnonzero(participation >= max(1, int(min_peak_count)))
+    if eligible.size < 2:
+        return []
+
+    if eligible.size < channel_count:
+        local_times = first_times[:, eligible]
+        local_to_original = eligible.astype(int, copy=False)
+        local_participation = participation[eligible]
+    else:
+        local_times = first_times[:, :channel_count]
+        local_to_original = np.arange(channel_count, dtype=int)
+        local_participation = participation[:channel_count]
+
+    max_lag_s = max_lag / 1000.0
+    bin_count = max(1, int(np.floor((2.0 * max_lag) / bin_width)) + 1)
+    pair_total: dict[tuple[int, int], int] = {}
+    pair_bins: dict[tuple[int, int], dict[int, int]] = {}
+    pair_bin_sums: dict[tuple[tuple[int, int], int], float] = {}
+    pair_bin_sumsq: dict[tuple[tuple[int, int], int], float] = {}
+    truncated_bursts = 0
+
+    for burst_index, burst_times in enumerate(np.asarray(local_times, dtype=float)):
+        if burst_index % 4 == 0:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("Burst delay analysis cancelled")
+            if progress_callback is not None:
+                progress = 35 + int(55 * burst_index / max(1, local_times.shape[0]))
+                progress_callback(min(94, progress), "Scanning burst-local delay candidates...")
+        active_local = np.flatnonzero(np.isfinite(burst_times))
+        if active_local.size < 2:
+            continue
+        if active_local.size > BURST_DELAY_MAX_ACTIVE_PER_BURST:
+            order = np.argsort(local_participation[active_local], kind="mergesort")[::-1]
+            active_local = active_local[order[:BURST_DELAY_MAX_ACTIVE_PER_BURST]]
+            truncated_bursts += 1
+        order = np.argsort(burst_times[active_local], kind="mergesort")
+        active_local = active_local[order]
+        sorted_times = burst_times[active_local]
+        right_edge = 1
+        for left_pos, left_time in enumerate(sorted_times[:-1]):
+            right_edge = max(right_edge, left_pos + 1)
+            while right_edge < sorted_times.size and sorted_times[right_edge] - left_time <= max_lag_s:
+                right_edge += 1
+            if right_edge <= left_pos + 1:
+                continue
+            earlier_original = int(local_to_original[active_local[left_pos]])
+            later_originals = local_to_original[active_local[left_pos + 1 : right_edge]]
+            delays_ms = (sorted_times[left_pos + 1 : right_edge] - left_time) * 1000.0
+            for later_original, delay_ms in zip(later_originals, delays_ms):
+                later_original = int(later_original)
+                if earlier_original == later_original:
+                    continue
+                low = min(earlier_original, later_original)
+                high = max(earlier_original, later_original)
+                signed_delay = float(delay_ms if earlier_original == low else -delay_ms)
+                if not np.isfinite(signed_delay) or abs(signed_delay) < min_lag or abs(signed_delay) > max_lag:
+                    continue
+                bin_index = int(np.floor((signed_delay + max_lag) / bin_width + 0.5))
+                bin_index = max(0, min(bin_count - 1, bin_index))
+                pair_key = (low, high)
+                pair_total[pair_key] = pair_total.get(pair_key, 0) + 1
+                counts = pair_bins.setdefault(pair_key, {})
+                counts[bin_index] = counts.get(bin_index, 0) + 1
+                stats_key = (pair_key, bin_index)
+                pair_bin_sums[stats_key] = pair_bin_sums.get(stats_key, 0.0) + signed_delay
+                pair_bin_sumsq[stats_key] = pair_bin_sumsq.get(stats_key, 0.0) + signed_delay * signed_delay
+
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Burst delay analysis cancelled")
+
+    results = []
+    for pair_key, counts_by_bin in pair_bins.items():
+        if not counts_by_bin:
+            continue
+        peak_index, peak_count = max(counts_by_bin.items(), key=lambda item: (item[1], -abs(item[0])))
+        peak_count = int(peak_count)
+        if peak_count < int(min_peak_count):
+            continue
+        total_count = int(pair_total.get(pair_key, peak_count))
+        non_peak_counts = [count for index, count in counts_by_bin.items() if index != peak_index]
+        zero_bins = max(0, bin_count - 1 - len(non_peak_counts))
+        if zero_bins:
+            non_peak_counts.extend([0] * min(zero_bins, 32))
+        background = float(np.median(non_peak_counts)) if non_peak_counts else 0.0
+        background = max(background, 0.5)
+        peak_fraction = float(peak_count) / float(max(1, total_count))
+        peak_to_background = float(peak_count) / background
+        if peak_fraction < float(min_peak_fraction):
+            continue
+        if peak_to_background < float(min_peak_to_background):
+            continue
+        delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
+        delay_window_count = int(sum(counts_by_bin.get(index, 0) for index in delay_window_indices))
+        delay_window_sum = float(
+            sum(pair_bin_sums.get((pair_key, index), 0.0) for index in delay_window_indices)
+        )
+        signed_delay = delay_window_sum / float(max(1, delay_window_count))
+        if signed_delay == 0.0:
+            signed_delay = -max_lag + float(peak_index) * bin_width
+        if signed_delay <= 0:
+            output_reference, output_target = pair_key[1], pair_key[0]
+            output_delay_ms = -signed_delay
+        else:
+            output_reference, output_target = pair_key[0], pair_key[1]
+            output_delay_ms = signed_delay
+        if output_delay_ms <= 0:
+            continue
+        sumsq = float(sum(pair_bin_sumsq.get((pair_key, index), 0.0) for index in delay_window_indices))
+        variance = max(0.0, sumsq / float(max(1, delay_window_count)) - signed_delay * signed_delay)
+        results.append(
+            {
+                "reference_index": int(output_reference),
+                "target_index": int(output_target),
+                "reference": str(channels[output_reference]),
+                "target": str(channels[output_target]),
+                "delay_ms": float(output_delay_ms),
+                "peak_center_ms": abs(float(-max_lag + float(peak_index) * bin_width)),
+                "peak_count": peak_count,
+                "delay_window_count": delay_window_count,
+                "total_count": total_count,
+                "peak_fraction": peak_fraction,
+                "peak_to_background": peak_to_background,
+                "background_count": background,
+                "std_ms": float(np.sqrt(variance)),
+                "truncated_bursts": int(truncated_bursts),
+            }
+        )
+    return sorted(
+        results,
+        key=lambda item: (
+            -float(item["peak_count"]),
+            -float(item["peak_fraction"]),
+            -float(item["peak_to_background"]),
+            abs(float(item["delay_ms"])),
+            item["reference"],
+            item["target"],
+        ),
+    )
+
+
+def _spike_train_delay_aligned_pairs(
+    channels,
+    channel_trains,
+    intervals: list[tuple[float, float]] | None,
+    max_abs_delay_ms: float,
+    min_abs_delay_ms: float,
+    bin_ms: float,
+    min_peak_count: int,
+    min_peak_fraction: float,
+    min_peak_to_background: float,
+    cancel_check=None,
+    progress_callback=None,
+    mode: str = "burst_all",
+):
+    if len(channels) < 2 or len(channel_trains) < 2:
+        return []
+    max_lag = max(1.0, float(max_abs_delay_ms))
+    min_lag = max(0.0, float(min_abs_delay_ms))
+    bin_width = max(0.1, float(bin_ms))
+    bin_count = max(1, int(np.floor(max_lag / bin_width)) + 1)
+    train_count = min(len(channels), len(channel_trains))
+    results = []
+    train_lengths = np.asarray([np.asarray(channel_trains[index]).size for index in range(train_count)], dtype=int)
+    eligible_indices = np.flatnonzero(train_lengths >= max(2, int(min_peak_count)))
+    if eligible_indices.size < 2:
+        return []
+    total_pairs = max(1, int(eligible_indices.size) * max(0, int(eligible_indices.size) - 1))
+    scanned = 0
+    source_candidates_by_index = {
+        int(index): _source_interval_candidates(
+            channel_trains[int(index)],
+            intervals,
+        )
+        for index in eligible_indices
+    }
+
+    for reference_index in eligible_indices:
+        reference_index = int(reference_index)
+        source_starts, source_nexts, row_ids = source_candidates_by_index[reference_index]
+        if source_starts.size == 0:
+            scanned += max(0, int(eligible_indices.size) - 1)
+            continue
+        for target_index in eligible_indices:
+            target_index = int(target_index)
+            if reference_index == target_index:
+                continue
+            scanned += 1
+            if scanned % 64 == 0:
+                if cancel_check is not None and cancel_check():
+                    raise InterruptedError("Burst delay analysis cancelled")
+                if progress_callback is not None:
+                    progress = 35 + int(55 * scanned / total_pairs)
+                    progress_callback(min(94, progress), "Scanning source-target spike train delays...")
+            matches = _source_interval_delay_matches_from_candidates(
+                source_starts,
+                source_nexts,
+                row_ids,
+                channel_trains[target_index],
+                max_lag,
+                min_lag,
+            )
+            if matches.size == 0:
+                continue
+            values = ((matches[:, 1] - matches[:, 0]) * 1000.0).astype(float, copy=False)
+            if values.size == 0:
+                continue
+            bin_indices = np.floor(values / bin_width + 0.5).astype(int)
+            bin_indices = np.clip(bin_indices, 0, bin_count - 1)
+            counts = np.bincount(bin_indices, minlength=bin_count)
+            peak_index = int(np.argmax(counts))
+            peak_count = int(counts[peak_index])
+            if peak_count < int(min_peak_count):
+                continue
+            total_count = int(values.size)
+            non_peak_counts = [int(count) for index, count in enumerate(counts) if index != peak_index]
+            background = float(np.median(non_peak_counts)) if non_peak_counts else 0.0
+            background = max(background, 0.5)
+            peak_fraction = float(peak_count) / float(max(1, total_count))
+            peak_to_background = float(peak_count) / background
+            if peak_fraction < float(min_peak_fraction):
+                continue
+            if peak_to_background < float(min_peak_to_background):
+                continue
+            delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
+            window_mask = np.isin(bin_indices, list(delay_window_indices))
+            window_values = values[window_mask]
+            delay_ms = float(np.mean(window_values)) if window_values.size else float(peak_index * bin_width)
+            if delay_ms <= 0:
+                continue
+            results.append(
+                {
+                    "reference_index": int(reference_index),
+                    "target_index": int(target_index),
+                    "reference": str(channels[reference_index]),
+                    "target": str(channels[target_index]),
+                    "delay_ms": delay_ms,
+                    "peak_center_ms": float(peak_index * bin_width),
+                    "peak_count": peak_count,
+                    "delay_window_count": int(window_values.size),
+                    "total_count": total_count,
+                    "peak_fraction": peak_fraction,
+                    "peak_to_background": peak_to_background,
+                    "background_count": background,
+                    "std_ms": float(np.std(window_values)) if window_values.size else 0.0,
+                    "truncated_bursts": 0,
+                    "mode": mode,
+                }
+            )
+
+    return sorted(
+        results,
+        key=lambda item: (
+            -float(item["peak_count"]),
+            -float(item["peak_fraction"]),
+            -float(item["peak_to_background"]),
+            abs(float(item["delay_ms"])),
+            item["reference"],
+            item["target"],
+        ),
+    )
+
+
+def _channel_map_positions(channel_map: ChannelMap | None):
+    if channel_map is None:
+        return {}, {}
+
+    coordinate_entries = []
+    for electrode, payload in channel_map.electrodes.items():
+        if not isinstance(payload, dict):
+            continue
+        try:
+            x_um = float(payload.get("x_um", payload.get("x")))
+            y_um = float(payload.get("y_um", payload.get("y")))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(x_um) and np.isfinite(y_um):
+            coordinate_entries.append((str(electrode), payload, x_um, y_um))
+
+    lookup = {}
+    electrode_positions = {}
+    if coordinate_entries:
+        xs = np.asarray([entry[2] for entry in coordinate_entries], dtype=float)
+        ys = np.asarray([entry[3] for entry in coordinate_entries], dtype=float)
+        xmin, xmax = float(np.nanmin(xs)), float(np.nanmax(xs))
+        ymin, ymax = float(np.nanmin(ys)), float(np.nanmax(ys))
+        for index, (electrode, payload, x_um, y_um) in enumerate(coordinate_entries):
+            x = (float(x_um) - xmin) / max(xmax - xmin, 1e-6)
+            y = (float(y_um) - ymin) / max(ymax - ymin, 1e-6)
+            electrode_positions[electrode] = (x, y, payload)
+            aliases = [str(payload.get("channel") or "").strip(), electrode]
+            raw_aliases = payload.get("aliases", [])
+            if isinstance(raw_aliases, (list, tuple)):
+                aliases.extend(str(alias).strip() for alias in raw_aliases)
+            for alias in aliases:
+                if not alias:
+                    continue
+                keys = [normalize_channel_name(alias)]
+                if "_" in alias:
+                    keys.append(normalize_channel_name(alias.split("_", 1)[1]))
+                for key in keys:
+                    if key and key not in lookup:
+                        lookup[key] = (x, y, electrode, index)
+        return lookup, electrode_positions
+
+    rows = max(1, int(getattr(channel_map, "rows", 8) or 8))
+    cols = max(1, int(getattr(channel_map, "cols", 8) or 8))
+    for index, (electrode, payload) in enumerate(channel_map.electrodes.items()):
+        if not isinstance(payload, dict):
+            continue
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", str(electrode))
+        if match:
+            row = ord(match.group(1)[0].upper()) - ord("A")
+            col = int(match.group(2)) - 1
+        else:
+            row = index // cols
+            col = index % cols
+        x = (col + 0.5) / float(cols)
+        y = (row + 0.5) / float(rows)
+        electrode_positions[str(electrode)] = (x, y, payload)
+        aliases = [str(payload.get("channel") or "").strip(), str(electrode)]
+        raw_aliases = payload.get("aliases", [])
+        if isinstance(raw_aliases, (list, tuple)):
+            aliases.extend(str(alias).strip() for alias in raw_aliases)
+        for alias in aliases:
+            if not alias:
+                continue
+            key = normalize_channel_name(alias)
+            if key and key not in lookup:
+                lookup[key] = (x, y, str(electrode), index)
+    return lookup, electrode_positions
+
+
+def _position_for_channel(channel: str, position_lookup: dict):
+    candidates = [
+        str(channel),
+        _base_channel_from_raster_label(str(channel)),
+    ]
+    if "_" in str(channel):
+        candidates.append(str(channel).split("_", 1)[1])
+    for candidate in candidates:
+        key = normalize_channel_name(candidate)
+        if key in position_lookup:
+            return position_lookup[key]
+    return None
 
 
 def _burst_total_spike_vectors(spike_series, burst_intervals, bin_ms: float = 5.0, window_ms: float = 0.0):
@@ -1072,6 +1771,261 @@ def _temporal_coupling_pairs(
     return sorted(results, key=lambda item: (item["strength"], item["peak_count"]), reverse=True)
 
 
+STIMULUS_RESPONSE_EXTENSIONS = {".nev", ".spk", ".h5", ".hdf5", ".npz"}
+
+
+def _stimulus_response_supported_files(paths) -> list[Path]:
+    files = []
+    seen = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            candidates = [
+                child
+                for child in path.rglob("*")
+                if child.is_file() and child.suffix.lower() in STIMULUS_RESPONSE_EXTENSIONS
+            ]
+        elif path.is_file() and path.suffix.lower() in STIMULUS_RESPONSE_EXTENSIONS:
+            candidates = [path]
+        else:
+            candidates = []
+        for candidate in candidates:
+            resolved = str(candidate.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            files.append(candidate)
+    return sorted(files, key=lambda item: str(item).lower())
+
+
+def _normalize_stimulus_parameter_key(key: str, unit: str = "") -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    unit_text = str(unit or "").replace("µ", "u").lower()
+    aliases = {
+        "el": "stim_electrode",
+        "electrode": "stim_electrode",
+        "freq": "frequency",
+        "frequency": "frequency",
+        "hz": "frequency",
+        "amp": "amplitude",
+        "ampl": "amplitude",
+        "amplitude": "amplitude",
+        "current": "amplitude",
+        "dur": "duration",
+        "duration": "duration",
+        "width": "width",
+        "pulse": "pulse",
+        "intensity": "intensity",
+        "level": "level",
+    }
+    base = aliases.get(text, text or "value")
+    if unit_text in {"hz", "khz"} and base == "value":
+        base = "frequency"
+    elif unit_text in {"ua", "ma", "a", "mv", "v"} and base == "value":
+        base = "amplitude"
+    elif unit_text in {"us", "ms", "s"} and base == "value":
+        base = "duration"
+    return f"{base}_{unit_text}" if unit_text else base
+
+
+def _extract_stimulus_parameters(path: str | Path) -> dict[str, object]:
+    path_text = str(path)
+    path = Path(path_text)
+    split_parts = [part for part in re.split(r"[\\/]+", path_text) if part]
+    if split_parts:
+        text_parts = split_parts[-4:-1] + [Path(split_parts[-1]).stem]
+    else:
+        text_parts = [part for part in path.parts[-4:-1] if part] + [path.stem]
+    text = " ".join(text_parts)
+    params: dict[str, object] = {}
+    pattern = re.compile(
+        r"([A-Za-z]+)\s*[-_= ]?\s*(-?\d+(?:\.\d+)?)\s*(Hz|kHz|uA|µA|mA|A|mV|V|us|ms|s)?(?=[^A-Za-zµu]|$)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        key = _normalize_stimulus_parameter_key(match.group(1), match.group(3))
+        try:
+            params[key] = float(match.group(2))
+        except ValueError:
+            continue
+    unit_only = re.compile(r"(?<![A-Za-z])(-?\d+(?:\.\d+)?)\s*(Hz|kHz|uA|µA|mA|A|mV|V|us|ms|s)\b", re.IGNORECASE)
+    for match in unit_only.finditer(text):
+        key = _normalize_stimulus_parameter_key("value", match.group(2))
+        params.setdefault(key, float(match.group(1)))
+    categorical = []
+    for part in text_parts[-3:]:
+        cleaned = re.sub(r"[_\-]+", " ", str(part)).strip()
+        if cleaned and not re.search(r"\d", cleaned):
+            categorical.append(cleaned)
+    if categorical:
+        params["condition"] = " / ".join(categorical[-2:])
+    lower_text = text.lower()
+    if re.search(r"(?<![a-z])spont(?![a-z])", lower_text):
+        params["activity"] = "spont"
+    if re.search(r"multi[\s_-]*site", lower_text):
+        params["stim_mode"] = "multi-site"
+        params.pop("site", None)
+    if re.search(r"(?<![a-z])pre(?![a-z])", lower_text):
+        params["period"] = "pre"
+    elif re.search(r"(?<![a-z])after(?![a-z])", lower_text):
+        params["period"] = "after"
+    return params
+
+
+def _stimulus_parameter_label(parameters: dict[str, object], path: str | Path) -> str:
+    label_items = []
+    for key in ("activity", "period", "stim_mode"):
+        value = str(parameters.get(key, "")).strip()
+        if value:
+            label_items.append(f"{key}={value}")
+    numeric_items = [
+        (key, value)
+        for key, value in parameters.items()
+        if key not in {"condition"} and isinstance(value, (int, float, np.integer, np.floating))
+    ]
+    label_items.extend(f"{key}={float(value):g}" for key, value in sorted(numeric_items))
+    if label_items:
+        return ", ".join(label_items)
+    condition = str(parameters.get("condition", "")).strip()
+    if condition:
+        return condition
+    path = Path(path)
+    return f"{path.parent.name} / {path.stem}" if path.parent.name else path.stem
+
+
+def _load_spike_only_data(path: str | Path, cancel_check=None) -> UnifiedMEAData:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in {".h5", ".hdf5"}:
+        data = read_maxwell_h5(path, cancel_check=cancel_check, extract_waveforms=False)
+    elif suffix == ".nev":
+        data = read_blackrock_nev(path, cancel_check=cancel_check)
+    elif suffix == ".spk":
+        data = read_axion_spk(path)
+    else:
+        data = MEAReader(path).load_data()
+    if not isinstance(data, UnifiedMEAData):
+        raise ValueError(f"Stimulus response analysis requires spike-event data: {path}")
+    data.waveforms = {}
+    return data
+
+
+def _stimulus_response_record_from_data(
+    path: str | Path,
+    data: UnifiedMEAData,
+    *,
+    pre_ms: float = 200.0,
+    response_ms: float = 1000.0,
+    bin_ms: float = 5.0,
+    artifact_ms: float = 0.0,
+) -> dict:
+    stim_times = np.asarray(data.stim_times, dtype=float)
+    stim_times = np.sort(stim_times[np.isfinite(stim_times)])
+    if stim_times.size == 0:
+        raise ValueError(f"No stimulus timestamps found: {path}")
+    try:
+        channels = sorted([str(channel) for channel in data.channels()], key=_channel_sort_key)
+    except Exception:
+        channels = []
+    if not channels:
+        channels = sorted([str(channel) for channel in data.spikes.keys()], key=_channel_sort_key)
+    channel_spikes = []
+    spike_chunks = []
+    for channel in channels:
+        times = data.spikes.get(channel, [])
+        values = np.asarray(times, dtype=float)
+        values = np.sort(values[np.isfinite(values)])
+        channel_spikes.append((channel, values))
+        if values.size:
+            spike_chunks.append(values)
+    if not spike_chunks:
+        raise ValueError(f"No spikes found: {path}")
+    all_spikes = np.sort(np.concatenate(spike_chunks))
+    channel_count = max(1, len(channel_spikes))
+    pre_ms = max(0.0, float(pre_ms))
+    response_ms = max(1.0, float(response_ms))
+    artifact_ms = max(0.0, float(artifact_ms))
+    response_counts = []
+    baseline_counts = []
+    latencies_ms = []
+    trial_spikes_ms = []
+    trial_channel_spikes_ms = []
+    for stim_s in stim_times:
+        window_start = float(stim_s) - pre_ms / 1000.0
+        window_stop = float(stim_s) + response_ms / 1000.0
+        channel_trial = []
+        relative_chunks = []
+        for _channel, values in channel_spikes:
+            lo = int(np.searchsorted(values, window_start, side="left"))
+            hi = int(np.searchsorted(values, window_stop, side="right"))
+            relative = (values[lo:hi] - float(stim_s)) * 1000.0
+            if artifact_ms > 0.0 and relative.size:
+                relative = relative[np.abs(relative) > artifact_ms]
+            relative = relative.astype(float, copy=False)
+            channel_trial.append(relative)
+            if relative.size:
+                relative_chunks.append(relative)
+        relative_ms = np.sort(np.concatenate(relative_chunks)) if relative_chunks else np.array([], dtype=float)
+        trial_spikes_ms.append(relative_ms.astype(float, copy=False))
+        trial_channel_spikes_ms.append(channel_trial)
+        response_mask = (relative_ms >= 0.0) & (relative_ms <= response_ms)
+        baseline_mask = (relative_ms < 0.0) & (relative_ms >= -pre_ms)
+        response_counts.append(int(np.count_nonzero(response_mask)))
+        baseline_counts.append(int(np.count_nonzero(baseline_mask)))
+        if np.any(response_mask):
+            latencies_ms.append(float(np.min(relative_ms[response_mask])))
+    response_s = response_ms / 1000.0
+    baseline_s = max(pre_ms / 1000.0, 1e-9)
+    parameters = _extract_stimulus_parameters(path)
+    return {
+        "path": str(path),
+        "file": Path(path).name,
+        "condition": _stimulus_parameter_label(parameters, path),
+        "parameters": parameters,
+        "stim_count": int(stim_times.size),
+        "channel_count": int(channel_count),
+        "spike_count": int(all_spikes.size),
+        "artifact_ms": float(artifact_ms),
+        "channels": [channel for channel, _values in channel_spikes],
+        "response_spikes_per_stim": float(np.mean(response_counts)) if response_counts else 0.0,
+        "response_rate_hz_per_channel": float(np.sum(response_counts) / max(float(stim_times.size) * response_s * channel_count, 1e-9)),
+        "baseline_rate_hz_per_channel": float(np.sum(baseline_counts) / max(float(stim_times.size) * baseline_s * channel_count, 1e-9)),
+        "mean_latency_ms": float(np.mean(latencies_ms)) if latencies_ms else np.nan,
+        "trial_spikes_ms": trial_spikes_ms,
+        "trial_channel_spikes_ms": trial_channel_spikes_ms,
+    }
+
+
+def _stimulus_response_group_records(records: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for record in records:
+        grouped.setdefault(str(record.get("condition", "")), []).append(record)
+    summaries = []
+    for condition, items in sorted(grouped.items(), key=lambda item: item[0].lower()):
+        stim_total = sum(int(item.get("stim_count", 0)) for item in items)
+        rates = np.asarray([float(item.get("response_rate_hz_per_channel", 0.0)) for item in items], dtype=float)
+        baseline = np.asarray([float(item.get("baseline_rate_hz_per_channel", 0.0)) for item in items], dtype=float)
+        latencies = np.asarray([float(item.get("mean_latency_ms", np.nan)) for item in items], dtype=float)
+        trial_spikes = []
+        for item in items:
+            for trial in item.get("trial_spikes_ms", []):
+                trial_spikes.append(np.asarray(trial, dtype=float))
+        summaries.append(
+            {
+                "condition": condition,
+                "file_count": len(items),
+                "stim_count": int(stim_total),
+                "response_rate_mean": float(np.mean(rates)) if rates.size else 0.0,
+                "response_rate_sem": float(np.std(rates, ddof=1) / np.sqrt(rates.size)) if rates.size > 1 else 0.0,
+                "baseline_rate_mean": float(np.mean(baseline)) if baseline.size else 0.0,
+                "mean_latency_ms": float(np.nanmean(latencies)) if np.any(np.isfinite(latencies)) else np.nan,
+                "trial_spikes_ms": trial_spikes,
+                "records": items,
+            }
+        )
+    return summaries
+
+
 def _fix_spinbox_hit_targets(root: QWidget) -> None:
     for spinbox in [*root.findChildren(QSpinBox), *root.findChildren(QDoubleSpinBox)]:
         spinbox.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1113,16 +2067,23 @@ class ElectrodeMapCanvas(QWidget):
         self.channel_map = channel_map
         self.selected_electrode = "A1"
         self.available_channels = set()
+        self.highlighted_electrodes: set[str] = set()
+        self.stim_electrodes: set[str] = set()
         self.setMinimumSize(920, 620)
 
     def set_available_channels(self, channels) -> None:
-        self.available_channels = {normalize_channel_name(channel) for channel in channels or []}
+        self.available_channels = _normalized_channel_keys(channels)
         self.update()
 
     def set_channel_map(self, channel_map: ChannelMap) -> None:
         self.channel_map = channel_map
         if self.selected_electrode not in channel_map.electrodes:
             self.selected_electrode = next(iter(channel_map.electrodes), "A1")
+        self.update()
+
+    def set_overlays(self, highlighted_electrodes=None, stim_electrodes=None) -> None:
+        self.highlighted_electrodes = {str(electrode) for electrode in highlighted_electrodes or [] if str(electrode)}
+        self.stim_electrodes = {str(electrode) for electrode in stim_electrodes or [] if str(electrode)}
         self.update()
 
     def paintEvent(self, event):  # noqa: N802 - Qt override
@@ -1159,10 +2120,26 @@ class ElectrodeMapCanvas(QWidget):
                 x, y = centers[electrode]
                 radius = self._radius()
 
-                fill = QColor("#36c986") if channel else QColor("#ef5f5f")
+                if electrode in self.stim_electrodes:
+                    fill = QColor("#7c3aed")
+                elif electrode in self.highlighted_electrodes:
+                    fill = QColor("#dc2626")
+                else:
+                    fill = QColor("#36c986") if channel else QColor("#ef5f5f")
                 painter.setBrush(fill)
-                outline = QColor("#1d4ed8") if electrode == self.selected_electrode else QColor("#233044")
-                painter.setPen(QPen(outline, 4 if electrode == self.selected_electrode else 2))
+                if electrode in self.stim_electrodes:
+                    outline = QColor("#f59e0b")
+                    outline_width = 5
+                elif electrode in self.highlighted_electrodes:
+                    outline = QColor("#7f1d1d")
+                    outline_width = 5
+                elif electrode == self.selected_electrode:
+                    outline = QColor("#1d4ed8")
+                    outline_width = 4
+                else:
+                    outline = QColor("#233044")
+                    outline_width = 2
+                painter.setPen(QPen(outline, outline_width))
                 painter.drawEllipse(QRectF(x - radius, y - radius, radius * 2, radius * 2))
 
                 painter.setPen(QPen(QColor("#0f172a"), 1))
@@ -1180,6 +2157,10 @@ class ElectrodeMapCanvas(QWidget):
                     inset = radius * 0.45
                     painter.drawLine(x - inset, y - inset, x + inset, y + inset)
                     painter.drawLine(x + inset, y - inset, x - inset, y + inset)
+                if electrode in self.stim_electrodes:
+                    painter.setPen(QPen(QColor("#ffffff"), 2))
+                    painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+                    painter.drawText(QRectF(x - radius, y + radius * 0.25, radius * 2, radius * 0.65), Qt.AlignmentFlag.AlignCenter, "STIM")
 
         painter.end()
 
@@ -1277,32 +2258,47 @@ class ElectrodeMapCanvas(QWidget):
         painter.setBrush(QColor("#101820"))
         painter.drawRoundedRect(rect.adjusted(-3, -3, 3, 3), 4, 4)
 
-        routed_points = []
+        background_points = []
         recorded_points = []
         selected_point = None
         for electrode, payload, x_um, y_um in entries:
             point = self._coordinate_point(rect, bounds, x_um, y_um)
             recorded = self._is_recording_electrode(electrode, payload)
-            routed = bool(payload.get("routed")) or recorded
             if electrode == self.selected_electrode:
                 selected_point = (point, electrode, payload)
             if recorded:
                 recorded_points.append((point, electrode, payload))
-            elif routed:
-                routed_points.append((point, electrode, payload))
             else:
-                painter.setPen(QPen(QColor("#2b3038"), 1))
-                painter.drawPoint(point)
+                background_points.append((point, electrode, payload))
 
         radius = max(1.6, min(3.8, rect.width() / 520.0))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#334155"))
-        for point, _, _ in routed_points:
-            painter.drawEllipse(QRectF(point.x() - radius * 0.75, point.y() - radius * 0.75, radius * 1.5, radius * 1.5))
+        painter.setBrush(QColor("#475569"))
+        background_radius = max(0.75, radius * 0.55)
+        for point, _, _ in background_points:
+            painter.drawEllipse(
+                QRectF(
+                    point.x() - background_radius,
+                    point.y() - background_radius,
+                    background_radius * 2,
+                    background_radius * 2,
+                )
+            )
 
         painter.setBrush(QColor("#18b7ff"))
         for point, _, _ in recorded_points:
             painter.drawEllipse(QRectF(point.x() - radius, point.y() - radius, radius * 2, radius * 2))
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for point, electrode, _payload in recorded_points + background_points:
+            if electrode in self.highlighted_electrodes:
+                painter.setPen(QPen(QColor("#ef4444"), 2.4))
+                painter.drawEllipse(QRectF(point.x() - radius * 2.3, point.y() - radius * 2.3, radius * 4.6, radius * 4.6))
+            if electrode in self.stim_electrodes:
+                painter.setPen(QPen(QColor("#f59e0b"), 2.6))
+                painter.drawEllipse(QRectF(point.x() - radius * 3.0, point.y() - radius * 3.0, radius * 6.0, radius * 6.0))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                painter.drawText(QRectF(point.x() + radius * 2.6, point.y() - 10, 60, 16), Qt.AlignmentFlag.AlignLeft, "STIM")
 
         if selected_point is not None:
             point, electrode, payload = selected_point
@@ -1332,15 +2328,13 @@ class ElectrodeMapCanvas(QWidget):
         painter.end()
 
     def _is_recording_electrode(self, electrode: str, payload: dict) -> bool:
+        if not self.available_channels:
+            return False
         aliases = payload.get("aliases", [])
         candidates = [payload.get("channel", ""), electrode]
         if isinstance(aliases, (list, tuple)):
             candidates.extend(aliases)
-        for candidate in candidates:
-            text = str(candidate or "").strip()
-            if text and normalize_channel_name(text) in self.available_channels:
-                return True
-        return bool(payload.get("routed")) and not self.available_channels
+        return bool(_normalized_channel_keys(candidates) & self.available_channels)
 
     def _draw_coordinate_legend(self, painter: QPainter) -> None:
         x = self.width() - 250
@@ -1788,6 +2782,1285 @@ class DataLoadWorker(QRunnable):
             self.signals.canceled.emit(str(exc) or "Data loading cancelled")
         except Exception:
             self.signals.failed.emit(traceback.format_exc())
+
+
+class StimulusResponseWorker(QRunnable):
+    def __init__(self, paths, *, pre_ms: float, response_ms: float, artifact_ms: float):
+        super().__init__()
+        self.paths = [str(path) for path in paths]
+        self.pre_ms = float(pre_ms)
+        self.response_ms = float(response_ms)
+        self.artifact_ms = float(artifact_ms)
+        self.signals = WorkerSignals()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    @Slot()
+    def run(self):
+        try:
+            records = []
+            errors = []
+            total = max(1, len(self.paths))
+            for index, path in enumerate(self.paths):
+                if self._is_cancelled():
+                    raise InterruptedError("Stimulus response analysis cancelled")
+                self.signals.progress.emit(5 + int(80 * index / total), f"Reading {Path(path).name}...")
+                try:
+                    data = _load_spike_only_data(path, cancel_check=self._is_cancelled)
+                    record = _stimulus_response_record_from_data(
+                        path,
+                        data,
+                        pre_ms=self.pre_ms,
+                        response_ms=self.response_ms,
+                        artifact_ms=self.artifact_ms,
+                    )
+                    records.append(record)
+                except Exception as exc:
+                    errors.append(f"{Path(path).name}: {exc}")
+            if self._is_cancelled():
+                raise InterruptedError("Stimulus response analysis cancelled")
+            self.signals.progress.emit(92, "Preparing stimulus response comparison...")
+            self.signals.finished.emit(
+                {
+                    "records": records,
+                    "errors": errors,
+                    "pre_ms": self.pre_ms,
+                    "response_ms": self.response_ms,
+                    "artifact_ms": self.artifact_ms,
+                    "paths": self.paths,
+                }
+            )
+        except InterruptedError as exc:
+            self.signals.canceled.emit(str(exc) or "Stimulus response analysis cancelled")
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+
+class StimulusResponseInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stimulus Response Files")
+        self.resize(860, 520)
+        self.paths: list[str] = []
+        self.cached_payload: dict | None = None
+
+        self.pre_ms = QDoubleSpinBox()
+        self.pre_ms.setRange(0.0, 10000.0)
+        self.pre_ms.setDecimals(1)
+        self.pre_ms.setValue(200.0)
+        self.pre_ms.setSuffix(" ms")
+        self.response_ms = QDoubleSpinBox()
+        self.response_ms.setRange(1.0, 60000.0)
+        self.response_ms.setDecimals(1)
+        self.response_ms.setValue(1000.0)
+        self.response_ms.setSuffix(" ms")
+        self.artifact_ms = QDoubleSpinBox()
+        self.artifact_ms.setRange(0.0, 1000.0)
+        self.artifact_ms.setDecimals(1)
+        self.artifact_ms.setSingleStep(0.5)
+        self.artifact_ms.setValue(1.0)
+        self.artifact_ms.setSuffix(" ms")
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Condition", "Folder"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+
+        add_files = QPushButton("Add Files")
+        add_files.clicked.connect(self._add_files)
+        add_folder = QPushButton("Add Folder")
+        add_folder.clicked.connect(self._add_folder)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_selected)
+        analyze = QPushButton("Analyze")
+        analyze.setObjectName("PrimaryButton")
+        analyze.clicked.connect(self.accept)
+        self.open_raster_button = QPushButton("Open Raster")
+        self.open_raster_button.setEnabled(False)
+        self.psth_button = QPushButton("PSTH")
+        self.psth_button.setEnabled(False)
+        self.activation_curve_button = QPushButton("Activation curve")
+        self.activation_curve_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Pre"))
+        controls.addWidget(self.pre_ms)
+        controls.addWidget(QLabel("Response"))
+        controls.addWidget(self.response_ms)
+        controls.addWidget(QLabel("Remove tail +/-"))
+        controls.addWidget(self.artifact_ms)
+        controls.addStretch(1)
+        controls.addWidget(add_files)
+        controls.addWidget(add_folder)
+        controls.addWidget(remove)
+        controls.addWidget(self.open_raster_button)
+        controls.addWidget(self.psth_button)
+        controls.addWidget(self.activation_curve_button)
+        controls.addWidget(cancel)
+        controls.addWidget(analyze)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Add spike-event files directly, or add folders recursively. Waveforms are not used."))
+        layout.addWidget(self.table, 1)
+        layout.addLayout(controls)
+        _fix_spinbox_hit_targets(self)
+
+    def _add_paths(self, paths) -> None:
+        files = _stimulus_response_supported_files(paths)
+        existing = set(self.paths)
+        for path in files:
+            path_text = str(path)
+            if path_text not in existing:
+                self.paths.append(path_text)
+                existing.add(path_text)
+        self.paths.sort(key=str.lower)
+        self._refresh_table()
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add stimulus response files",
+            "data",
+            "Spike files (*.nev *.spk *.h5 *.hdf5 *.npz);;All files (*)",
+        )
+        self._add_paths(paths)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Add stimulus response folder", "data")
+        if path:
+            self._add_paths([path])
+
+    def _remove_selected(self) -> None:
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in selected_rows:
+            if 0 <= row < len(self.paths):
+                self.paths.pop(row)
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self.paths))
+        for row, path_text in enumerate(self.paths):
+            path = Path(path_text)
+            params = _extract_stimulus_parameters(path)
+            values = [path.name, _stimulus_parameter_label(params, path), str(path.parent)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, path_text)
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+
+    def values(self) -> tuple[list[str], float, float, float]:
+        return list(self.paths), float(self.pre_ms.value()), float(self.response_ms.value()), float(self.artifact_ms.value())
+
+    def set_cached_payload(self, payload: dict | None) -> None:
+        self.cached_payload = payload if isinstance(payload, dict) else None
+        has_records = bool(self.cached_payload and self.cached_payload.get("records"))
+        self.open_raster_button.setEnabled(has_records)
+        self.psth_button.setEnabled(has_records)
+        self.activation_curve_button.setEnabled(has_records)
+
+
+class StimulusChannelMapWindow(QDialog):
+    def __init__(self, channel_map: ChannelMap | None, selection_callback=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stimulus Channel Map")
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.resize(1180, 880)
+        self.channel_map = channel_map or ChannelMap.new("No channel map")
+        self.selection_callback = selection_callback
+        self.position_lookup, self.electrode_positions = _channel_map_positions(self.channel_map)
+        self.available_channels: set[str] = set()
+        self.selected_channels: set[str] = set()
+        self.stim_electrodes: set[str] = set()
+        self.record_label = ""
+        self.canvas = ElectrodeMapCanvas(self.channel_map)
+        self.canvas.setMinimumSize(1120, 800)
+        self.canvas.electrode_selected.connect(self._electrode_selected)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.canvas, 1)
+
+    def set_context(self, *, available_channels=None, selected_channels=None, stim_electrodes=None, record_label: str = "") -> None:
+        self.available_channels = _normalized_channel_keys(available_channels)
+        self.selected_channels = _normalized_channel_keys(selected_channels)
+        self.stim_electrodes = {str(electrode) for electrode in stim_electrodes or [] if str(electrode)}
+        self.record_label = str(record_label or "")
+        highlighted = self._electrodes_for_channels(self.selected_channels)
+        self.canvas.set_available_channels(available_channels or [])
+        self.canvas.set_overlays(highlighted_electrodes=highlighted, stim_electrodes=self.stim_electrodes)
+
+    def _channels_for_electrodes(self, electrodes) -> list[str]:
+        if self.channel_map is None:
+            return []
+        selected = []
+        selected_set = {str(electrode) for electrode in electrodes}
+        for electrode in selected_set:
+            payload = self.channel_map.electrodes.get(electrode, {})
+            if not isinstance(payload, dict):
+                continue
+            candidates = [payload.get("channel", ""), electrode]
+            aliases = payload.get("aliases", [])
+            if isinstance(aliases, (list, tuple)):
+                candidates.extend(aliases)
+            for candidate in candidates:
+                keys = _normalized_channel_keys([candidate])
+                matches = sorted(keys & self.available_channels)
+                for key in matches:
+                    if key not in selected:
+                        selected.append(key)
+        return selected
+
+    def _electrodes_for_channels(self, channels) -> list[str]:
+        normalized = _normalized_channel_keys(channels)
+        electrodes = []
+        for electrode, payload in self.channel_map.electrodes.items():
+            if not isinstance(payload, dict):
+                continue
+            candidates = [payload.get("channel", ""), electrode]
+            aliases = payload.get("aliases", [])
+            if isinstance(aliases, (list, tuple)):
+                candidates.extend(aliases)
+            if _normalized_channel_keys(candidates) & normalized:
+                electrodes.append(str(electrode))
+        return electrodes
+
+    def _electrode_selected(self, electrode: str) -> None:
+        channels = self._channels_for_electrodes([electrode])
+        if channels:
+            self.selected_channels = set(channels)
+            if self.selection_callback is not None:
+                self.selection_callback(channels)
+
+
+class StimulusResponseWindow(QDialog):
+    RASTER_MAX_YTICKS = 36
+
+    def __init__(self, payload: dict, parent=None, channel_map: ChannelMap | None = None):
+        super().__init__(parent)
+        self.payload = payload
+        self.records = list(payload.get("records", []))
+        self.errors = list(payload.get("errors", []))
+        self.record_lookup = {index: record for index, record in enumerate(self.records)}
+        self.trial_indices = {"left": 0, "right": 0}
+        self.channel_map = self._channel_map_for_records(channel_map)
+        self.position_lookup, self.electrode_positions = _channel_map_positions(self.channel_map)
+        self.channel_map_window = None
+        self.highlight_channels: set[str] = set()
+        self.active_map_side = "left"
+        self.raster_lassos = []
+        self._raster_channel_points: dict[str, tuple[np.ndarray, np.ndarray, list[str]]] = {}
+        self._single_stim_electrodes = self._single_stim_electrodes_from_records()
+        self.left_axis = None
+        self.right_axis = None
+        self.setWindowTitle("Stimulus Response Comparison")
+        self.resize(1280, 820)
+
+        self.status = QLabel()
+        self.status.setObjectName("MutedText")
+        self.left_file_combo = QComboBox()
+        self.left_file_combo.setObjectName("StimulusLeftFile")
+        self.right_file_combo = QComboBox()
+        self.right_file_combo.setObjectName("StimulusRightFile")
+        self.left_file_combo.currentIndexChanged.connect(lambda _index: self._file_changed("left"))
+        self.right_file_combo.currentIndexChanged.connect(lambda _index: self._file_changed("right"))
+        total_ms = max(1.0, float(payload.get("pre_ms", 0.0)) + float(payload.get("response_ms", 1.0)))
+        self.display_window_ms = QDoubleSpinBox()
+        self.display_window_ms.setRange(1.0, max(1.0, total_ms))
+        self.display_window_ms.setDecimals(1)
+        self.display_window_ms.setSingleStep(10.0)
+        self.display_window_ms.setValue(total_ms)
+        self.display_window_ms.setSuffix(" ms")
+        self.display_window_ms.valueChanged.connect(lambda *_: self._draw_rasters())
+        self.row_order_combo = QComboBox()
+        self.row_order_combo.addItem("Local response", "local_response")
+        self.row_order_combo.addItem("Electrode sequence", "electrode")
+        self.row_order_combo.currentIndexChanged.connect(lambda *_: self._draw_rasters())
+        self.lasso_channels = QCheckBox("Lasso channels")
+        self.lasso_channels.toggled.connect(lambda *_: self._refresh_raster_lassos())
+        self.map_button = QPushButton("Channel map")
+        self.map_button.clicked.connect(self._show_channel_map)
+        self.raster_canvas = FigureCanvas(Figure(figsize=(11, 6.4), tight_layout=True))
+        self.raster_canvas.mpl_connect("scroll_event", self._raster_scrolled)
+        self.error_box = QTextEdit()
+        self.error_box.setReadOnly(True)
+        self.error_box.setMaximumHeight(90)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Left file"))
+        controls.addWidget(self.left_file_combo, 1)
+        controls.addSpacing(16)
+        controls.addWidget(QLabel("Right file"))
+        controls.addWidget(self.right_file_combo, 1)
+        controls.addSpacing(16)
+        controls.addWidget(QLabel("Window"))
+        controls.addWidget(self.display_window_ms)
+        controls.addWidget(QLabel("Row order"))
+        controls.addWidget(self.row_order_combo)
+        controls.addWidget(self.lasso_channels)
+        controls.addWidget(self.map_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addLayout(controls)
+        layout.addWidget(self.raster_canvas, 1)
+        layout.addWidget(QLabel("Skipped files / warnings"))
+        layout.addWidget(self.error_box)
+
+        self._populate()
+        self.showMaximized()
+        _fix_spinbox_hit_targets(self)
+
+    def _channel_map_for_records(self, channel_map: ChannelMap | None) -> ChannelMap | None:
+        if channel_map is not None and getattr(channel_map, "name", "") == "maxwell_map":
+            return _default_maxwell_channel_map() or channel_map
+        for record in self.records:
+            channels = [str(channel) for channel in record.get("channels", [])]
+            if any(re.search(r"(?:^|_)e\d+$", channel, flags=re.IGNORECASE) for channel in channels):
+                return _default_maxwell_channel_map() or channel_map
+        return channel_map
+
+    def _is_multi_site_record(self, record: dict | None) -> bool:
+        if not record:
+            return False
+        params = record.get("parameters", {})
+        if str(params.get("stim_mode", "")).lower() == "multi-site":
+            return True
+        text = " ".join([str(record.get("file", "")), str(record.get("path", "")), str(record.get("condition", ""))]).lower()
+        return bool(re.search(r"multi[\s_-]*site", text))
+
+    def _single_stim_electrodes_from_records(self) -> list[str]:
+        electrodes = []
+        for record in self.records:
+            if self._is_multi_site_record(record):
+                continue
+            electrode = self._resolve_stim_electrode(record.get("parameters", {}).get("stim_electrode"))
+            if electrode and electrode not in electrodes:
+                electrodes.append(electrode)
+        return electrodes
+
+    def _resolve_stim_electrode(self, value) -> str:
+        if value is None or value == "":
+            return ""
+        try:
+            number = float(value)
+            text = str(int(number)) if abs(number - int(number)) < 1e-9 else f"{number:g}"
+        except (TypeError, ValueError):
+            text = str(value).strip()
+        candidates = [text, f"e{text}", f"el{text}", f"chan{text}", f"ch{text}"]
+        for candidate in candidates:
+            if candidate in self.electrode_positions:
+                return candidate
+            position = _position_for_channel(candidate, self.position_lookup)
+            if position is not None:
+                return str(position[2])
+        return text
+
+    def _stim_electrodes_for_record(self, record: dict | None) -> list[str]:
+        if record is None:
+            return []
+        if self._is_multi_site_record(record):
+            return list(self._single_stim_electrodes)
+        electrode = self._resolve_stim_electrode(record.get("parameters", {}).get("stim_electrode"))
+        return [electrode] if electrode else []
+
+    def _record_channels(self, side: str) -> list[str]:
+        record = self._selected_record(side)
+        channels, _trials = self._trial_channel_payload(record)
+        return channels
+
+    def _show_channel_map(self) -> None:
+        if self.channel_map_window is None:
+            self.channel_map_window = StimulusChannelMapWindow(self.channel_map, self._map_channels_selected, self)
+        self._update_channel_map_context()
+        self.channel_map_window.show()
+        self.channel_map_window.raise_()
+        self.channel_map_window.activateWindow()
+
+    def _update_channel_map_context(self) -> None:
+        if self.channel_map_window is None:
+            return
+        side = self.active_map_side if self.active_map_side in {"left", "right"} else "left"
+        record = self._selected_record(side)
+        self.channel_map_window.set_context(
+            available_channels=self._record_channels(side),
+            selected_channels=self.highlight_channels,
+            stim_electrodes=self._stim_electrodes_for_record(record),
+            record_label=self._record_label(record) if record else "",
+        )
+
+    def _map_channels_selected(self, channels) -> None:
+        self._set_highlight_channels(channels, open_map=False)
+
+    def _set_highlight_channels(self, channels, *, open_map: bool = False, side: str | None = None) -> None:
+        normalized = _normalized_channel_keys(channels)
+        if not normalized:
+            return
+        self.highlight_channels = normalized
+        if side in {"left", "right"}:
+            self.active_map_side = side
+        self._draw_rasters()
+        if open_map:
+            self._show_channel_map()
+        else:
+            self._update_channel_map_context()
+
+    def _x_limits(self) -> tuple[float, float]:
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        total = max(1.0, pre_ms + response_ms)
+        window = min(total, max(1.0, float(self.display_window_ms.value())))
+        left = -pre_ms * window / total
+        right = left + window
+        return float(left), float(right)
+
+    def _populate(self):
+        self.status.setText(
+            f"{len(self.records)} files analyzed; spont/pre {self.payload.get('pre_ms', 0):g} ms, "
+            f"after {self.payload.get('response_ms', 0):g} ms, tail removed +/-{self.payload.get('artifact_ms', 0):g} ms"
+        )
+        self.error_box.setPlainText("\n".join(self.errors) if self.errors else "No skipped files.")
+        for combo in (self.left_file_combo, self.right_file_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for index, record in enumerate(self.records):
+                combo.addItem(self._record_label(record), index)
+            combo.blockSignals(False)
+        if self.records:
+            self.left_file_combo.setCurrentIndex(0)
+            self.right_file_combo.setCurrentIndex(1 if len(self.records) > 1 else 0)
+        self._draw_rasters()
+
+    def _record_label(self, record: dict) -> str:
+        file_name = str(record.get("file") or Path(str(record.get("path", ""))).name)
+        condition = str(record.get("condition", "")).strip()
+        label = f"{file_name} | {condition}" if condition and condition != file_name else file_name
+        if self._is_multi_site_record(record):
+            count = len(self._single_stim_electrodes)
+            if count:
+                label += f" | multi-site {count} sites"
+        return label
+
+    def _file_changed(self, side: str) -> None:
+        self.trial_indices[side] = 0
+        self.active_map_side = side
+        self._draw_rasters()
+        self._update_channel_map_context()
+
+    def _selected_record(self, side: str) -> dict | None:
+        combo = self.left_file_combo if side == "left" else self.right_file_combo
+        index = combo.currentData()
+        if index is None:
+            index = combo.currentIndex()
+        try:
+            return self.record_lookup.get(int(index))
+        except (TypeError, ValueError):
+            return None
+
+    def _trial_channel_payload(self, record: dict | None) -> tuple[list[str], list[list[np.ndarray]]]:
+        if record is None:
+            return [], []
+        channels = [str(channel) for channel in record.get("channels", [])]
+        trial_channels = record.get("trial_channel_spikes_ms", [])
+        if channels and trial_channels:
+            return channels, [
+                [np.asarray(values, dtype=float) for values in trial]
+                for trial in trial_channels
+            ]
+        aggregate_trials = record.get("trial_spikes_ms", [])
+        if aggregate_trials:
+            return ["all channels"], [[np.asarray(values, dtype=float)] for values in aggregate_trials]
+        return channels, []
+
+    def _ordered_trial_channel_payload(self, record: dict | None) -> tuple[list[str], list[list[np.ndarray]]]:
+        channels, trials = self._trial_channel_payload(record)
+        if not channels:
+            return channels, trials
+        order = self._channel_display_order(channels, trials)
+        if order == list(range(len(channels))):
+            return channels, trials
+        ordered_channels = [channels[index] for index in order]
+        ordered_trials = []
+        for trial in trials:
+            row_values = list(trial)
+            if len(row_values) < len(channels):
+                row_values.extend(np.array([], dtype=float) for _ in range(len(channels) - len(row_values)))
+            ordered_trials.append([np.asarray(row_values[index], dtype=float) for index in order])
+        return ordered_channels, ordered_trials
+
+    def _channel_display_order(self, channels: list[str], trials: list[list[np.ndarray]]) -> list[int]:
+        mode = str(self.row_order_combo.currentData() or "local_response") if hasattr(self, "row_order_combo") else "local_response"
+        if mode == "electrode" or len(channels) <= 2:
+            return list(range(len(channels)))
+        return self._local_response_channel_order(channels, trials)
+
+    def _channel_response_features(self, channels: list[str], trials: list[list[np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        channel_count = len(channels)
+        positions = np.full((channel_count, 2), np.nan, dtype=float)
+        features = np.zeros((channel_count, 5), dtype=float)
+        first_latency: list[list[float]] = [[] for _ in channels]
+        peak_values: list[list[float]] = [[] for _ in channels]
+        response_counts = np.zeros(channel_count, dtype=float)
+        baseline_counts = np.zeros(channel_count, dtype=float)
+        responsive_trials = np.zeros(channel_count, dtype=float)
+        valid_trials = 0
+
+        for index, channel in enumerate(channels):
+            position = _position_for_channel(channel, self.position_lookup)
+            if position is not None:
+                positions[index] = [float(position[0]), float(position[1])]
+
+        for trial in trials:
+            if not trial:
+                continue
+            valid_trials += 1
+            for index in range(channel_count):
+                values = np.asarray(trial[index] if index < len(trial) else [], dtype=float)
+                if not values.size:
+                    continue
+                values = values[np.isfinite(values)]
+                if not values.size:
+                    continue
+                response = values[(values >= 0.0) & (values <= response_ms)]
+                baseline = values[(values < 0.0) & (values >= -pre_ms)] if pre_ms > 0.0 else np.array([], dtype=float)
+                response_counts[index] += float(response.size)
+                baseline_counts[index] += float(baseline.size)
+                if response.size:
+                    responsive_trials[index] += 1.0
+                    first_latency[index].append(float(np.min(response)))
+                    peak_values[index].extend(response.tolist())
+
+        denominator = max(1, valid_trials)
+        response_probability = responsive_trials / float(denominator)
+        response_rate = response_counts / float(denominator)
+        baseline_rate = baseline_counts / float(denominator)
+        latency = np.full(channel_count, response_ms, dtype=float)
+        peak_time = np.full(channel_count, response_ms, dtype=float)
+        bin_count = max(4, min(30, int(np.ceil(response_ms / 10.0))))
+        edges = np.linspace(0.0, response_ms, bin_count + 1)
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        for index in range(channel_count):
+            if first_latency[index]:
+                latency[index] = float(np.median(first_latency[index]))
+            if peak_values[index]:
+                counts, _ = np.histogram(np.asarray(peak_values[index], dtype=float), bins=edges)
+                if counts.size:
+                    peak_time[index] = float(centers[int(np.argmax(counts))])
+
+        features[:, 0] = response_probability
+        features[:, 1] = np.log1p(response_rate)
+        features[:, 2] = np.log1p(baseline_rate)
+        features[:, 3] = latency / max(response_ms, 1e-9)
+        features[:, 4] = peak_time / max(response_ms, 1e-9)
+        return positions, features
+
+    def _local_response_channel_order(self, channels: list[str], trials: list[list[np.ndarray]]) -> list[int]:
+        count = len(channels)
+        if count <= 2:
+            return list(range(count))
+        positions, features = self._channel_response_features(channels, trials)
+        spatial = positions.copy()
+        if np.any(~np.isfinite(spatial)):
+            finite = np.isfinite(spatial).all(axis=1)
+            fallback = np.arange(count, dtype=float)
+            spatial[~finite, 0] = fallback[~finite] / max(count - 1, 1)
+            spatial[~finite, 1] = 1.0
+
+        if count > 1500:
+            latency_bins = np.floor(np.clip(features[:, 3], 0.0, 1.0) * 12.0).astype(int)
+            peak_bins = np.floor(np.clip(features[:, 4], 0.0, 1.0) * 12.0).astype(int)
+            response_bins = np.floor(np.clip(features[:, 0], 0.0, 1.0) * 10.0).astype(int)
+            return sorted(
+                range(count),
+                key=lambda index: (
+                    latency_bins[index],
+                    peak_bins[index],
+                    -response_bins[index],
+                    float(spatial[index, 1]),
+                    float(spatial[index, 0]),
+                    _channel_sort_key(channels[index]),
+                ),
+            )
+
+        behavior = features.copy()
+        med = np.nanmedian(behavior, axis=0)
+        behavior = np.where(np.isfinite(behavior), behavior, med)
+        spread = np.nanpercentile(behavior, 90, axis=0) - np.nanpercentile(behavior, 10, axis=0)
+        spread = np.where(spread > 1e-9, spread, 1.0)
+        behavior = (behavior - np.nanmedian(behavior, axis=0)) / spread
+        spatial_spread = np.nanpercentile(spatial, 90, axis=0) - np.nanpercentile(spatial, 10, axis=0)
+        spatial_spread = np.where(spatial_spread > 1e-9, spatial_spread, 1.0)
+        spatial = (spatial - np.nanmedian(spatial, axis=0)) / spatial_spread
+
+        behavior_delta = behavior[:, None, :] - behavior[None, :, :]
+        spatial_delta = spatial[:, None, :] - spatial[None, :, :]
+        behavior_distance = np.sqrt(np.sum(behavior_delta * behavior_delta, axis=2))
+        spatial_distance = np.sqrt(np.sum(spatial_delta * spatial_delta, axis=2))
+        behavior_scale = np.nanpercentile(behavior_distance, 90) or 1.0
+        spatial_scale = np.nanpercentile(spatial_distance, 90) or 1.0
+        distance = 0.58 * behavior_distance / max(behavior_scale, 1e-9) + 0.42 * spatial_distance / max(spatial_scale, 1e-9)
+        distance = np.asarray(distance, dtype=float)
+        distance[~np.isfinite(distance)] = 0.0
+        np.fill_diagonal(distance, 0.0)
+        try:
+            tree = linkage(squareform(distance, checks=False), method="average", optimal_ordering=count <= 350)
+            return [int(index) for index in leaves_list(tree)]
+        except Exception:
+            return sorted(
+                range(count),
+                key=lambda index: (
+                    float(features[index, 3]),
+                    float(features[index, 4]),
+                    -float(features[index, 0]),
+                    float(spatial[index, 1]),
+                    float(spatial[index, 0]),
+                    _channel_sort_key(channels[index]),
+                ),
+            )
+
+    def _scroll_bounds(self, record: dict | None) -> tuple[int, int]:
+        _channels, trials = self._trial_channel_payload(record)
+        total = len(trials)
+        return total, max(0, total - 1)
+
+    def _raster_scrolled(self, event) -> None:
+        if event.inaxes == self.left_axis:
+            side = "left"
+        elif event.inaxes == self.right_axis:
+            side = "right"
+        else:
+            return
+        record = self._selected_record(side)
+        total, max_index = self._scroll_bounds(record)
+        if total <= 1:
+            return
+        direction = -1 if getattr(event, "step", 0) > 0 else 1
+        self.trial_indices[side] = int(np.clip(self.trial_indices[side] + direction, 0, max_index))
+        self._draw_rasters()
+        self._update_channel_map_context()
+
+    def _refresh_raster_lassos(self) -> None:
+        for lasso in self.raster_lassos:
+            lasso.disconnect_events()
+        self.raster_lassos = []
+        if not self.lasso_channels.isChecked():
+            return
+        if self.left_axis is not None:
+            self.raster_lassos.append(LassoSelector(self.left_axis, lambda vertices: self._finish_raster_lasso(vertices, "left")))
+        if self.right_axis is not None:
+            self.raster_lassos.append(LassoSelector(self.right_axis, lambda vertices: self._finish_raster_lasso(vertices, "right")))
+
+    def _finish_raster_lasso(self, vertices, side: str) -> None:
+        selected = []
+        path = MplPath(vertices)
+        xs, ys, channels = self._raster_channel_points.get(side, (np.array([], dtype=float), np.array([], dtype=float), []))
+        if xs.size and ys.size:
+            points = np.column_stack([xs, ys])
+            mask = path.contains_points(points)
+            selected = [channels[index] for index in np.flatnonzero(mask)]
+        if not selected:
+            record = self._selected_record(side)
+            row_channels, _trials = self._ordered_trial_channel_payload(record)
+            if row_channels:
+                vertices_array = np.asarray(vertices, dtype=float)
+                y_low = float(np.nanmin(vertices_array[:, 1]))
+                y_high = float(np.nanmax(vertices_array[:, 1]))
+                low = max(1, int(np.floor(min(y_low, y_high))))
+                high = min(len(row_channels), int(np.ceil(max(y_low, y_high))))
+                selected = row_channels[low - 1 : high]
+        unique = []
+        seen = set()
+        for channel in selected:
+            key = normalize_channel_name(channel)
+            if key and key not in seen:
+                unique.append(channel)
+                seen.add(key)
+        if unique:
+            self._set_highlight_channels(unique, open_map=True, side=side)
+
+    def _draw_one_raster(self, ax, record: dict | None, side: str) -> None:
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        x_left, x_right = self._x_limits()
+        ax.axvspan(max(x_left, -pre_ms), min(0.0, x_right), color="#dbeafe", alpha=0.45, linewidth=0)
+        ax.axvspan(max(0.0, x_left), min(response_ms, x_right), color="#fee2e2", alpha=0.35, linewidth=0)
+        ax.axvline(0.0, color="#111827", linestyle="--", linewidth=1.1, alpha=0.75)
+        ax.set_xlim(x_left, x_right)
+        ax.set_xlabel("Time from stimulus (ms)")
+        ax.set_ylabel("Channel")
+        if record is None:
+            self._raster_channel_points[side] = (np.array([], dtype=float), np.array([], dtype=float), [])
+            ax.text(0.5, 0.5, "No stimulus response data", transform=ax.transAxes, ha="center", va="center")
+            return
+
+        channels, trials = self._ordered_trial_channel_payload(record)
+        total = len(trials)
+        trial_index = int(np.clip(self.trial_indices.get(side, 0), 0, max(0, total - 1)))
+        self.trial_indices[side] = trial_index
+        title = self._record_label(record)
+        ax.set_title(f"{title}\ntrial {trial_index + 1} / {total}" if total else title)
+        if total and channels:
+            trial = trials[trial_index]
+            if len(trial) < len(channels):
+                trial = list(trial) + [np.array([], dtype=float) for _ in range(len(channels) - len(trial))]
+            elif len(trial) > len(channels):
+                trial = trial[: len(channels)]
+            normal_x = []
+            normal_y = []
+            highlight_x = []
+            highlight_y = []
+            point_x = []
+            point_y = []
+            point_channels = []
+            for row_index, (channel, values) in enumerate(zip(channels, trial), start=1):
+                values = np.asarray(values, dtype=float)
+                if values.size:
+                    values = values[(values >= x_left) & (values <= x_right)]
+                if not values.size:
+                    continue
+                is_highlighted = bool(_normalized_channel_keys([channel]) & self.highlight_channels)
+                target_x = highlight_x if is_highlighted else normal_x
+                target_y = highlight_y if is_highlighted else normal_y
+                target_x.extend(values.tolist())
+                target_y.extend([float(row_index)] * int(values.size))
+                point_x.extend(values.tolist())
+                point_y.extend([float(row_index)] * int(values.size))
+                point_channels.extend([channel] * int(values.size))
+            if normal_x:
+                y_values = np.asarray(normal_y, dtype=float)
+                ax.vlines(normal_x, y_values - 0.38, y_values + 0.38, color="#111827", linewidth=0.72, alpha=0.94)
+            if highlight_x:
+                y_values = np.asarray(highlight_y, dtype=float)
+                ax.vlines(highlight_x, y_values - 0.44, y_values + 0.44, color="#dc2626", linewidth=1.35, alpha=0.98)
+            for row_index, channel in enumerate(channels, start=1):
+                if _normalized_channel_keys([channel]) & self.highlight_channels:
+                    ax.axhspan(row_index - 0.48, row_index + 0.48, color="#fee2e2", alpha=0.35, linewidth=0)
+            self._raster_channel_points[side] = (
+                np.asarray(point_x, dtype=float),
+                np.asarray(point_y, dtype=float),
+                list(point_channels),
+            )
+            ax.set_ylim(len(channels) + 0.75, 0.25)
+            tick_indices = _display_indices(len(channels), self.RASTER_MAX_YTICKS)
+            ax.set_yticks(tick_indices + 1)
+            ax.set_yticklabels([channels[index] for index in tick_indices], fontsize=8)
+        else:
+            self._raster_channel_points[side] = (np.array([], dtype=float), np.array([], dtype=float), [])
+            ax.text(0.5, 0.5, "No spikes in selected trial", transform=ax.transAxes, ha="center", va="center")
+            ax.set_ylim(1.0, 0.0)
+        if pre_ms > 0:
+            pre_label_x = (max(x_left, -pre_ms) + min(0.0, x_right)) * 0.5
+            ax.text(pre_label_x, 1.01, "spont / pre", transform=ax.get_xaxis_transform(), ha="center", va="bottom", fontsize=8, color="#1d4ed8")
+        after_label_x = (max(0.0, x_left) + min(response_ms, x_right)) * 0.5
+        ax.text(after_label_x, 1.01, "after", transform=ax.get_xaxis_transform(), ha="center", va="bottom", fontsize=8, color="#b91c1c")
+
+    def _draw_rasters(self) -> None:
+        figure = self.raster_canvas.figure
+        figure.clear()
+        axes = figure.subplots(1, 2, sharex=True)
+        self.left_axis, self.right_axis = np.ravel(axes)
+        self._draw_one_raster(self.left_axis, self._selected_record("left"), "left")
+        self._draw_one_raster(self.right_axis, self._selected_record("right"), "right")
+        figure.tight_layout()
+        self.raster_canvas.draw_idle()
+        self._refresh_raster_lassos()
+
+
+class StimulusPSTHWindow(QDialog):
+    def __init__(self, payload: dict, parent=None):
+        super().__init__(parent)
+        self.payload = payload
+        self.records = list(payload.get("records", []))
+        self.record_lookup = {index: record for index, record in enumerate(self.records)}
+        self.setWindowTitle("Stimulus PSTH")
+        self.resize(1180, 760)
+
+        self.left_file_combo = QComboBox()
+        self.right_file_combo = QComboBox()
+        self.channel_combo = QComboBox()
+        self.bin_ms = QDoubleSpinBox()
+        self.bin_ms.setRange(0.1, 1000.0)
+        self.bin_ms.setDecimals(1)
+        self.bin_ms.setSingleStep(1.0)
+        self.bin_ms.setValue(10.0)
+        self.bin_ms.setSuffix(" ms")
+        self.canvas = FigureCanvas(Figure(figsize=(10.5, 6.0), tight_layout=True))
+
+        self.left_file_combo.currentIndexChanged.connect(self._selection_changed)
+        self.right_file_combo.currentIndexChanged.connect(self._selection_changed)
+        self.channel_combo.currentIndexChanged.connect(lambda *_: self._draw())
+        self.bin_ms.valueChanged.connect(lambda *_: self._draw())
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Left file"))
+        controls.addWidget(self.left_file_combo, 1)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Right file"))
+        controls.addWidget(self.right_file_combo, 1)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Channel"))
+        controls.addWidget(self.channel_combo)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Bin"))
+        controls.addWidget(self.bin_ms)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self.canvas, 1)
+
+        self._populate()
+        _fix_spinbox_hit_targets(self)
+
+    def _record_label(self, record: dict) -> str:
+        file_name = str(record.get("file") or Path(str(record.get("path", ""))).name)
+        condition = str(record.get("condition", "")).strip()
+        return f"{file_name} | {condition}" if condition and condition != file_name else file_name
+
+    def _populate(self) -> None:
+        for combo in (self.left_file_combo, self.right_file_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for index, record in enumerate(self.records):
+                combo.addItem(self._record_label(record), index)
+            combo.blockSignals(False)
+        if self.records:
+            self.left_file_combo.setCurrentIndex(0)
+            self.right_file_combo.setCurrentIndex(1 if len(self.records) > 1 else 0)
+        self._refresh_channel_combo()
+        self._draw()
+
+    def _selected_record(self, side: str) -> dict | None:
+        combo = self.left_file_combo if side == "left" else self.right_file_combo
+        index = combo.currentData()
+        if index is None:
+            index = combo.currentIndex()
+        try:
+            return self.record_lookup.get(int(index))
+        except (TypeError, ValueError):
+            return None
+
+    def _selection_changed(self, *_args) -> None:
+        current = str(self.channel_combo.currentData() or "")
+        self._refresh_channel_combo(preferred=current)
+        self._draw()
+
+    def _refresh_channel_combo(self, preferred: str = "") -> None:
+        records = [record for record in (self._selected_record("left"), self._selected_record("right")) if record is not None]
+        channels = sorted(
+            {str(channel) for record in records for channel in record.get("channels", [])},
+            key=_channel_sort_key,
+        )
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItem("All channels", "")
+        for channel in channels:
+            self.channel_combo.addItem(channel, channel)
+        index = self.channel_combo.findData(preferred)
+        self.channel_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.channel_combo.blockSignals(False)
+
+    def _record_channel_trials(self, record: dict | None, channel: str) -> tuple[list[np.ndarray], int]:
+        if record is None:
+            return [], 1
+        channels = [str(value) for value in record.get("channels", [])]
+        trial_channels = record.get("trial_channel_spikes_ms", [])
+        if not channel:
+            rows = []
+            for trial in trial_channels:
+                chunks = [np.asarray(values, dtype=float) for values in trial if np.asarray(values, dtype=float).size]
+                rows.append(np.sort(np.concatenate(chunks)) if chunks else np.array([], dtype=float))
+            if rows:
+                return rows, max(1, len(channels))
+            aggregate = [np.asarray(values, dtype=float) for values in record.get("trial_spikes_ms", [])]
+            return aggregate, max(1, int(record.get("channel_count", len(channels) or 1)))
+
+        target_keys = _normalized_channel_keys([channel])
+        channel_index = None
+        for index, candidate in enumerate(channels):
+            if _normalized_channel_keys([candidate]) & target_keys:
+                channel_index = index
+                break
+        if channel_index is None:
+            return [], 1
+        rows = []
+        for trial in trial_channels:
+            values = trial[channel_index] if channel_index < len(trial) else []
+            rows.append(np.asarray(values, dtype=float))
+        return rows, 1
+
+    def _psth_for_record(self, record: dict | None, channel: str):
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        bin_ms = max(0.1, float(self.bin_ms.value()))
+        edges = np.arange(-pre_ms, response_ms + bin_ms * 0.5, bin_ms, dtype=float)
+        if edges.size == 0 or edges[-1] < response_ms:
+            edges = np.append(edges, response_ms)
+        if edges.size < 2:
+            edges = np.array([-pre_ms, response_ms], dtype=float)
+        trials, channel_count = self._record_channel_trials(record, channel)
+        counts = np.zeros(edges.size - 1, dtype=float)
+        valid_trials = 0
+        for values in trials:
+            values = np.asarray(values, dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                counts += np.histogram(values, bins=edges)[0]
+            valid_trials += 1
+        denom = max(1, valid_trials) * max(1, channel_count) * max(bin_ms / 1000.0, 1e-9)
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        return centers, counts / denom, valid_trials, channel_count
+
+    def _draw_one(self, ax, record: dict | None, side: str) -> None:
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        channel = str(self.channel_combo.currentData() or "")
+        ax.axvspan(-pre_ms, 0.0, color="#dbeafe", alpha=0.42, linewidth=0)
+        ax.axvspan(0.0, response_ms, color="#fee2e2", alpha=0.34, linewidth=0)
+        ax.axvline(0.0, color="#111827", linestyle="--", linewidth=1.1, alpha=0.75)
+        if record is None:
+            ax.text(0.5, 0.5, "No stimulus response data", transform=ax.transAxes, ha="center", va="center")
+            ax.set_xlim(-pre_ms, response_ms)
+            return
+        centers, rates, trial_count, channel_count = self._psth_for_record(record, channel)
+        width = max(0.1, float(self.bin_ms.value()) * 0.92)
+        ax.bar(centers, rates, width=width, color="#2563eb" if side == "left" else "#dc2626", alpha=0.72, linewidth=0)
+        ax.plot(centers, rates, color="#0f172a", linewidth=1.15, alpha=0.86)
+        label = self._record_label(record)
+        scope = channel or f"all channels ({channel_count})"
+        ax.set_title(f"{label}\n{scope}, {trial_count} trials")
+        ax.set_xlim(-pre_ms, response_ms)
+        ax.set_xlabel("Time from stimulus (ms)")
+        ax.set_ylabel("Rate (Hz/channel)" if not channel else "Rate (Hz)")
+        ax.grid(True, axis="y", color="#e2e8f0", linewidth=0.8)
+
+    def _draw(self) -> None:
+        figure = self.canvas.figure
+        figure.clear()
+        axes = figure.subplots(1, 2, sharex=True)
+        left_axis, right_axis = np.ravel(axes)
+        self._draw_one(left_axis, self._selected_record("left"), "left")
+        self._draw_one(right_axis, self._selected_record("right"), "right")
+        top = max(float(left_axis.get_ylim()[1]), float(right_axis.get_ylim()[1]), 1.0)
+        for axis in (left_axis, right_axis):
+            axis.set_ylim(0.0, top)
+        figure.tight_layout()
+        self.canvas.draw_idle()
+
+
+class StimulusActivationCurveWindow(QDialog):
+    def __init__(self, payload: dict, parent=None):
+        super().__init__(parent)
+        self.payload = payload
+        self.records = list(payload.get("records", []))
+        self.setWindowTitle("Stimulus Activation Curve")
+        self.resize(1120, 760)
+
+        self.site_combo = QComboBox()
+        self.channel_combo = QComboBox()
+        response_ms = max(1.0, float(payload.get("response_ms", 1.0)))
+        artifact_ms = max(0.0, float(payload.get("artifact_ms", 0.0)))
+        default_start = min(response_ms, max(1.0, artifact_ms))
+        default_stop = min(response_ms, max(default_start + 1.0, 50.0))
+        self.evoked_start_ms = QDoubleSpinBox()
+        self.evoked_start_ms.setRange(0.0, response_ms)
+        self.evoked_start_ms.setDecimals(1)
+        self.evoked_start_ms.setSingleStep(1.0)
+        self.evoked_start_ms.setValue(default_start)
+        self.evoked_start_ms.setSuffix(" ms")
+        self.evoked_stop_ms = QDoubleSpinBox()
+        self.evoked_stop_ms.setRange(0.1, max(0.1, response_ms))
+        self.evoked_stop_ms.setDecimals(1)
+        self.evoked_stop_ms.setSingleStep(1.0)
+        self.evoked_stop_ms.setValue(default_stop)
+        self.evoked_stop_ms.setSuffix(" ms")
+        self.canvas = FigureCanvas(Figure(figsize=(10.5, 6.0), tight_layout=True))
+        self.site_combo.currentIndexChanged.connect(lambda *_: self._draw())
+        self.channel_combo.currentIndexChanged.connect(lambda *_: self._draw())
+        self.evoked_start_ms.valueChanged.connect(lambda *_: self._draw())
+        self.evoked_stop_ms.valueChanged.connect(lambda *_: self._draw())
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Stim site"))
+        controls.addWidget(self.site_combo)
+        controls.addSpacing(14)
+        controls.addWidget(QLabel("Channel"))
+        controls.addWidget(self.channel_combo)
+        controls.addSpacing(14)
+        controls.addWidget(QLabel("Evoked"))
+        controls.addWidget(self.evoked_start_ms)
+        controls.addWidget(QLabel("to"))
+        controls.addWidget(self.evoked_stop_ms)
+        controls.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self.canvas, 1)
+
+        self._populate()
+        _fix_spinbox_hit_targets(self)
+
+    def _populate(self) -> None:
+        sites = sorted({self._stim_site(record) for record in self.records if self._stim_site(record)}, key=_channel_sort_key)
+        channels = sorted(
+            {str(channel) for record in self.records for channel in record.get("channels", [])},
+            key=_channel_sort_key,
+        )
+        self.site_combo.blockSignals(True)
+        self.site_combo.clear()
+        self.site_combo.addItem("All sites", "")
+        for site in sites:
+            self.site_combo.addItem(site, site)
+        self.site_combo.blockSignals(False)
+
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItem("All channels", "")
+        for channel in channels:
+            self.channel_combo.addItem(channel, channel)
+        self.channel_combo.blockSignals(False)
+        self._draw()
+
+    def _stim_site(self, record: dict) -> str:
+        params = record.get("parameters", {}) if isinstance(record, dict) else {}
+        value = params.get("stim_electrode") if isinstance(params, dict) else None
+        if value in (None, ""):
+            return ""
+        try:
+            number = float(value)
+            return f"el{int(number)}" if abs(number - int(number)) < 1e-9 else f"el{number:g}"
+        except (TypeError, ValueError):
+            text = str(value).strip()
+            return text if text.lower().startswith("el") else f"el{text}"
+
+    def _amplitude_value(self, record: dict) -> tuple[float | None, str]:
+        params = record.get("parameters", {}) if isinstance(record, dict) else {}
+        if not isinstance(params, dict):
+            return None, ""
+        preferred = [
+            key
+            for key in params
+            if re.search(r"(?:^|_)(?:amplitude|current|intensity|level)(?:_|$)", str(key), flags=re.IGNORECASE)
+        ]
+        for key in sorted(preferred, key=lambda item: (0 if str(item).startswith("amplitude") else 1, str(item))):
+            value = params.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+                label = str(key).replace("amplitude_", "").replace("current_", "")
+                return float(value), label or str(key)
+        return None, ""
+
+    def _record_channel_trials(self, record: dict, channel: str) -> tuple[list[np.ndarray], int]:
+        channels = [str(value) for value in record.get("channels", [])]
+        trial_channels = record.get("trial_channel_spikes_ms", [])
+        if not channel:
+            rows = []
+            for trial in trial_channels:
+                chunks = [np.asarray(values, dtype=float) for values in trial if np.asarray(values, dtype=float).size]
+                rows.append(np.sort(np.concatenate(chunks)) if chunks else np.array([], dtype=float))
+            if rows:
+                return rows, max(1, len(channels))
+            aggregate = [np.asarray(values, dtype=float) for values in record.get("trial_spikes_ms", [])]
+            return aggregate, max(1, int(record.get("channel_count", len(channels) or 1)))
+
+        target_keys = _normalized_channel_keys([channel])
+        channel_index = None
+        for index, candidate in enumerate(channels):
+            if _normalized_channel_keys([candidate]) & target_keys:
+                channel_index = index
+                break
+        if channel_index is None:
+            return [], 1
+        rows = []
+        for trial in trial_channels:
+            values = trial[channel_index] if channel_index < len(trial) else []
+            rows.append(np.asarray(values, dtype=float))
+        return rows, 1
+
+    def _record_trial_units(self, record: dict, channel: str) -> list[list[np.ndarray]]:
+        channels = [str(value) for value in record.get("channels", [])]
+        trial_channels = record.get("trial_channel_spikes_ms", [])
+        if trial_channels:
+            if channel:
+                target_keys = _normalized_channel_keys([channel])
+                channel_index = None
+                for index, candidate in enumerate(channels):
+                    if _normalized_channel_keys([candidate]) & target_keys:
+                        channel_index = index
+                        break
+                if channel_index is None:
+                    return []
+                return [
+                    [np.asarray(trial[channel_index] if channel_index < len(trial) else [], dtype=float)]
+                    for trial in trial_channels
+                ]
+            rows = []
+            channel_count = max(1, len(channels))
+            for trial in trial_channels:
+                row = []
+                for index in range(channel_count):
+                    row.append(np.asarray(trial[index] if index < len(trial) else [], dtype=float))
+                rows.append(row)
+            return rows
+        return [[np.asarray(values, dtype=float)] for values in record.get("trial_spikes_ms", [])]
+
+    def _evoked_window(self) -> tuple[float, float]:
+        start = max(0.0, float(self.evoked_start_ms.value()))
+        stop = max(0.1, float(self.evoked_stop_ms.value()))
+        if stop <= start:
+            stop = start + 0.1
+        response_ms = max(1.0, float(self.payload.get("response_ms", 1.0)))
+        return min(start, response_ms), min(stop, response_ms)
+
+    def _baseline_corrected_evoked_strength(self, record: dict, channel: str) -> float:
+        start_ms, stop_ms = self._evoked_window()
+        window_ms = max(0.1, stop_ms - start_ms)
+        pre_ms = max(0.0, float(self.payload.get("pre_ms", 0.0)))
+        trials, _channel_count = self._record_channel_trials(record, channel)
+        if not trials:
+            return 0.0
+        response_spikes = 0
+        baseline_spikes = 0
+        for values in trials:
+            values = np.asarray(values, dtype=float)
+            values = values[np.isfinite(values)]
+            response_spikes += int(np.count_nonzero((values >= start_ms) & (values <= stop_ms)))
+            if pre_ms > 0.0:
+                baseline_spikes += int(np.count_nonzero((values < 0.0) & (values >= -pre_ms)))
+        trial_count = max(1, len(trials))
+        response_per_stimulus = float(response_spikes) / float(trial_count)
+        baseline_per_stimulus = 0.0
+        if pre_ms > 0.0:
+            baseline_per_stimulus = float(baseline_spikes) / float(trial_count) * window_ms / max(pre_ms, 1e-9)
+        return response_per_stimulus - baseline_per_stimulus
+
+    def activation_curve_data(self, *, site: str = "", channel: str = "") -> dict[str, dict[str, np.ndarray | str]]:
+        grouped: dict[str, dict[float, list[float]]] = {}
+        unit_label = ""
+        for record in self.records:
+            stim_site = self._stim_site(record)
+            if not stim_site or (site and stim_site != site):
+                continue
+            amplitude, unit = self._amplitude_value(record)
+            if amplitude is None:
+                continue
+            if unit and not unit_label:
+                unit_label = unit
+            value = self._baseline_corrected_evoked_strength(record, channel)
+            grouped.setdefault(stim_site, {}).setdefault(float(amplitude), []).append(float(value))
+
+        result = {}
+        for stim_site, values_by_amp in sorted(grouped.items(), key=lambda item: _channel_sort_key(item[0])):
+            amplitudes = np.asarray(sorted(values_by_amp), dtype=float)
+            means = np.asarray([np.mean(values_by_amp[value]) for value in amplitudes], dtype=float)
+            errors = np.asarray(
+                [
+                    (np.std(values_by_amp[value], ddof=1) / np.sqrt(len(values_by_amp[value]))) if len(values_by_amp[value]) > 1 else 0.0
+                    for value in amplitudes
+                ],
+                dtype=float,
+            )
+            result[stim_site] = {"amplitude": amplitudes, "mean": means, "sem": errors, "unit": unit_label}
+        return result
+
+    def _sigmoid_fit(self, amplitudes: np.ndarray, responses: np.ndarray):
+        x = np.asarray(amplitudes, dtype=float)
+        y = np.asarray(responses, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        if x.size < 3 or np.unique(x).size < 3 or float(np.nanmax(y) - np.nanmin(y)) <= 0.0:
+            return None
+        span = max(float(np.max(x) - np.min(x)), 1e-9)
+        ymin = float(np.nanmin(y))
+        ymax = float(np.nanmax(y))
+        amplitude = max(ymax - ymin, 1e-9)
+
+        def model(values, bottom, top, x50, slope):
+            return bottom + (top - bottom) / (1.0 + np.exp(-(values - x50) / max(float(slope), 1e-9)))
+
+        try:
+            params, _cov = curve_fit(
+                model,
+                x,
+                y,
+                p0=[ymin, ymax, float(np.median(x)), span / 4.0],
+                bounds=(
+                    [max(0.0, ymin - amplitude * 2.0), ymin, float(np.min(x) - span), span / 1000.0],
+                    [ymax, ymax + amplitude * 2.0, float(np.max(x) + span), span * 10.0],
+                ),
+                maxfev=10000,
+            )
+        except Exception:
+            return None
+        draw_x = np.linspace(float(np.min(x)), float(np.max(x)), 160)
+        draw_y = model(draw_x, *params)
+        return draw_x, draw_y, params
+
+    def _draw(self) -> None:
+        site = str(self.site_combo.currentData() or "")
+        channel = str(self.channel_combo.currentData() or "")
+        curves = self.activation_curve_data(site=site, channel=channel)
+        figure = self.canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        if not curves:
+            ax.text(0.5, 0.5, "No amplitude series found for activation curve", transform=ax.transAxes, ha="center", va="center")
+            ax.set_xlabel("Stimulus amplitude")
+            ax.set_ylabel("Evoked spikes / stimulus")
+            ax.set_ylim(0.0, 1.0)
+            self.canvas.draw_idle()
+            return
+        colors = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#f97316", "#0891b2", "#be123c", "#4f46e5"]
+        unit_label = ""
+        y_values = []
+        for index, (stim_site, curve) in enumerate(curves.items()):
+            x = np.asarray(curve["amplitude"], dtype=float)
+            y = np.asarray(curve["mean"], dtype=float)
+            err = np.asarray(curve["sem"], dtype=float)
+            y_values.extend((y - err).tolist())
+            y_values.extend((y + err).tolist())
+            unit_label = str(curve.get("unit") or unit_label)
+            color = colors[index % len(colors)]
+            ax.errorbar(x, y, yerr=err, marker="o", linewidth=1.8, capsize=3, color=color, label=stim_site)
+            fit = self._sigmoid_fit(x, y)
+            if fit is not None:
+                fit_x, fit_y, params = fit
+                ax.plot(fit_x, fit_y, color=color, linewidth=2.0, alpha=0.72, linestyle="--", label=f"{stim_site} sigmoid")
+                ax.text(
+                    float(fit_x[len(fit_x) // 2]),
+                    float(np.nanmedian(fit_y)),
+                    f"x50={params[2]:g}",
+                    color=color,
+                    fontsize=8,
+                    ha="center",
+                    va="bottom",
+                )
+        finite_y = [float(value) for value in y_values if np.isfinite(value)]
+        ymax = max(finite_y + [1.0])
+        ymin = min(finite_y + [0.0])
+        pad = max((ymax - ymin) * 0.08, 0.5)
+        ax.set_ylim(min(0.0, ymin - pad), ymax + pad)
+        ax.axhline(0.0, color="#64748b", linestyle="--", linewidth=1.0)
+        ax.set_xlabel(f"Stimulus amplitude ({unit_label})" if unit_label else "Stimulus amplitude")
+        ax.set_ylabel("Evoked spikes / stimulus")
+        start_ms, stop_ms = self._evoked_window()
+        if channel:
+            ax.set_title(f"{channel}, evoked window {start_ms:g}-{stop_ms:g} ms")
+        else:
+            ax.set_title(f"All channels, evoked window {start_ms:g}-{stop_ms:g} ms")
+        ax.grid(True, axis="y", color="#e2e8f0", linewidth=0.8)
+        if len(curves) > 1:
+            ax.legend(loc="best", fontsize=8)
+        figure.tight_layout()
+        self.canvas.draw_idle()
 
 
 class AutoSortingDialog(QDialog):
@@ -2275,6 +4548,15 @@ class SpikeRasterCanvas(QWidget):
         widest = max(metrics.horizontalAdvance(label) for label in labels)
         return int(min(240, max(76, widest + 40)))
 
+    def set_spike_series(self, spike_series) -> None:
+        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        labels = [label for label, _ in self.spike_series]
+        if self.selected_channel not in labels:
+            self.selected_channel = labels[0] if labels else ""
+        self.plot_left = self._preferred_left_margin()
+        self.set_visible_rows(self.row_offset, self.visible_row_count)
+        self.update()
+
     @staticmethod
     def _row_center(top: int, plot_height: int, row: int, row_count: int) -> float:
         return top + plot_height / max(row_count, 1) * (row + 0.5)
@@ -2752,6 +5034,12 @@ class PopulationRateCanvas(QWidget):
         self._all_centers = (edges[:-1] + edges[1:]) / 2.0
         self._all_rates = counts.astype(float) / self.bin_s / max(1, len(self.spike_series))
 
+    def set_spike_series(self, spike_series) -> None:
+        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self._build_rate_cache()
+        self.centers, self.rates = self._average_rate_trace(self.window_start, self.window_start + self.window_duration)
+        self.update()
+
     def set_bursts(self, intervals) -> None:
         self.burst_intervals = sorted((float(start), float(stop)) for start, stop in intervals)
         if self.burst_intervals:
@@ -2883,8 +5171,10 @@ class ElectrodeHeatmapCanvas(QWidget):
         self.channel_map = channel_map
         self.counts = {}
         self._target_counts = {}
+        self._display_counts = {}
         self.well_counts = {}
         self._target_well_counts = {}
+        self._display_well_counts = {}
         self.active_wells = set()
         self.scale_max_count = 0
         self.fast_mode = False
@@ -2936,6 +5226,8 @@ class ElectrodeHeatmapCanvas(QWidget):
             return
         self._target_counts = normalized
         self._target_well_counts = well_counts
+        self.counts = dict(normalized)
+        self.well_counts = {well: dict(payload) for well, payload in well_counts.items()}
         if not self._transition_timer.isActive():
             self._transition_timer.start()
         self._advance_count_transition()
@@ -2971,16 +5263,20 @@ class ElectrodeHeatmapCanvas(QWidget):
 
     def _advance_count_transition(self) -> None:
         alpha = 0.42 if self.fast_mode else 0.30
-        self.counts, flat_delta = self._blend_count_dict(self.counts, self._target_counts, alpha)
-        self.well_counts, nested_delta = self._blend_nested_count_dict(
-            self.well_counts,
+        self._display_counts, flat_delta = self._blend_count_dict(self._display_counts, self._target_counts, alpha)
+        self._display_well_counts, nested_delta = self._blend_nested_count_dict(
+            self._display_well_counts,
             self._target_well_counts,
             alpha,
         )
-        self.active_wells = {well for well, payload in self.well_counts.items() if any(value > 0.01 for value in payload.values())}
+        self.active_wells = {
+            well
+            for well, payload in self._display_well_counts.items()
+            if any(value > 0.01 for value in payload.values())
+        }
         if max(flat_delta, nested_delta) <= 0.03:
-            self.counts = dict(self._target_counts)
-            self.well_counts = {well: dict(payload) for well, payload in self._target_well_counts.items()}
+            self._display_counts = dict(self._target_counts)
+            self._display_well_counts = {well: dict(payload) for well, payload in self._target_well_counts.items()}
             self.active_wells = {well for well, payload in self.well_counts.items() if any(value > 0 for value in payload.values())}
             self._transition_timer.stop()
         self.update()
@@ -3021,11 +5317,13 @@ class ElectrodeHeatmapCanvas(QWidget):
             painter.end()
             return
 
-        if self.well_counts:
-            selected_well = next(iter(self.active_wells)) if len(self.active_wells) == 1 else sorted(self.well_counts)[0]
-            active_counts = self.well_counts.get(selected_well, {})
+        display_well_counts = self._display_well_counts or self.well_counts
+        display_counts = self._display_counts or self.counts
+        if display_well_counts:
+            selected_well = next(iter(self.active_wells)) if len(self.active_wells) == 1 else sorted(display_well_counts)[0]
+            active_counts = display_well_counts.get(selected_well, {})
         else:
-            active_counts = self.counts
+            active_counts = display_counts
         max_count = self.scale_max_count or max(active_counts.values(), default=0)
 
         rect = self._map_rect_for_channel_map(margin, map_width, map_height)
@@ -3419,6 +5717,11 @@ class ElectrodeHeatmapCanvas(QWidget):
         ).astype(np.float32)
 
     def _heatmap_field_image(self, field: np.ndarray) -> QImage:
+        image_data = self._heatmap_field_rgb(field)
+        height, width, _ = image_data.shape
+        return QImage(image_data.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+
+    def _heatmap_field_rgb(self, field: np.ndarray) -> np.ndarray:
         stops = np.asarray(
             [
                 (position, QColor(color).red(), QColor(color).green(), QColor(color).blue())
@@ -3435,9 +5738,19 @@ class ElectrodeHeatmapCanvas(QWidget):
                 continue
             fraction = (values[mask] - left_pos) / max(right_pos - left_pos, 1e-6)
             rgb[mask] = left[1:] + (right[1:] - left[1:]) * fraction[:, None]
-        image_data = np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
-        height, width, _ = image_data.shape
-        return QImage(image_data.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+        return np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
+
+    def render_counts_rgb(self, counts: dict[str, int], resolution: int = 320, scale_max_count: int = 0) -> np.ndarray:
+        normalized, well_counts = self._normalize_count_payload(counts)
+        active_counts = well_counts[sorted(well_counts)[0]] if well_counts else normalized
+        max_count = max(0, int(scale_max_count)) or max(active_counts.values(), default=0)
+        resolution = max(32, int(resolution))
+        if self.channel_map is None or max_count <= 0:
+            return np.zeros((resolution, resolution, 3), dtype=np.uint8)
+        field = self._continuous_heatmap_field(active_counts, max_count, resolution)
+        if not np.any(field > 0):
+            field = self._fallback_heatmap_field(active_counts, max_count, resolution)
+        return self._heatmap_field_rgb(field)
 
 
 class IBIWindow(QDialog):
@@ -3537,6 +5850,1810 @@ class ISIWindow(QDialog):
             ax.set_xlim(0.0, 1000.0)
         self.canvas.draw_idle()
 
+
+class BurstDelayWorker(QRunnable):
+    def __init__(
+        self,
+        spike_series,
+        burst_intervals,
+        *,
+        max_channels: int,
+        max_lag_ms: float,
+        min_lag_ms: float,
+        delay_mode: str,
+        burst_window_ms: float,
+        bin_ms: float,
+        min_peak_count: int,
+        min_peak_fraction: float,
+        min_peak_ratio: float,
+    ):
+        super().__init__()
+        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
+        self.max_channels = int(max_channels)
+        self.max_lag_ms = float(max_lag_ms)
+        self.min_lag_ms = float(min_lag_ms)
+        self.delay_mode = str(delay_mode)
+        self.burst_window_ms = float(burst_window_ms)
+        self.bin_ms = float(bin_ms)
+        self.min_peak_count = int(min_peak_count)
+        self.min_peak_fraction = float(min_peak_fraction)
+        self.min_peak_ratio = float(min_peak_ratio)
+        self.signals = WorkerSignals()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    def _progress(self, value: int, message: str) -> None:
+        self.signals.progress.emit(int(value), str(message))
+
+    @Slot()
+    def run(self):
+        try:
+            if self._is_cancelled():
+                raise InterruptedError("Burst delay analysis cancelled")
+            self._progress(8, "Preparing channel spike trains...")
+            channels, channel_trains = _burst_delay_channel_series(
+                self.spike_series,
+                max_channels=self.max_channels,
+            )
+            intervals = _burst_delay_limited_intervals(self.burst_intervals, self.burst_window_ms)
+            first_times = np.zeros((0, len(channels)), dtype=float)
+            aligned_pairs = []
+
+            if self.delay_mode == "burst_first":
+                self._progress(12, "Preparing burst first-spike matrix...")
+                channels, intervals, first_times = _burst_delay_first_spike_matrix(
+                    self.spike_series,
+                    self.burst_intervals,
+                    max_channels=self.max_channels,
+                    burst_window_ms=self.burst_window_ms,
+                )
+                _channels, channel_trains = _burst_delay_channel_series(
+                    self.spike_series,
+                    max_channels=self.max_channels,
+                )
+                if self._is_cancelled():
+                    raise InterruptedError("Burst delay analysis cancelled")
+                self._progress(32, "Scanning burst first-spike delay pairs...")
+                aligned_pairs = _burst_delay_aligned_pairs(
+                    channels,
+                    first_times,
+                    max_abs_delay_ms=self.max_lag_ms,
+                    min_abs_delay_ms=self.min_lag_ms,
+                    bin_ms=self.bin_ms,
+                    min_peak_count=self.min_peak_count,
+                    min_peak_fraction=self.min_peak_fraction,
+                    min_peak_to_background=self.min_peak_ratio,
+                    cancel_check=self._is_cancelled,
+                    progress_callback=self._progress,
+                )
+            else:
+                analysis_intervals = intervals if self.delay_mode == "burst_all" else None
+                if self._is_cancelled():
+                    raise InterruptedError("Burst delay analysis cancelled")
+                self._progress(32, "Scanning source-target spike train delays...")
+                aligned_pairs = _spike_train_delay_aligned_pairs(
+                    channels,
+                    channel_trains,
+                    analysis_intervals,
+                    max_abs_delay_ms=self.max_lag_ms,
+                    min_abs_delay_ms=self.min_lag_ms,
+                    bin_ms=self.bin_ms,
+                    min_peak_count=self.min_peak_count,
+                    min_peak_fraction=self.min_peak_fraction,
+                    min_peak_to_background=self.min_peak_ratio,
+                    cancel_check=self._is_cancelled,
+                    progress_callback=self._progress,
+                    mode=self.delay_mode,
+                )
+            self._progress(98, "Preparing visualizations...")
+            self.signals.finished.emit(
+                {
+                    "channels": channels,
+                    "intervals": intervals,
+                    "first_times": first_times,
+                    "channel_trains": channel_trains,
+                    "delay_mode": self.delay_mode,
+                    "aligned_pairs": aligned_pairs,
+                }
+            )
+        except InterruptedError as exc:
+            self.signals.canceled.emit(str(exc) or "Burst delay analysis cancelled")
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+
+class BurstDelayWindow(QDialog):
+    def __init__(
+        self,
+        spike_series,
+        burst_intervals,
+        parent=None,
+        channel_map: ChannelMap | None = None,
+        waveform_series=None,
+        sampling_rate=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Burst Channel Delay")
+        self.resize(1180, 720)
+        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
+        self.waveform_series = {str(label): np.asarray(values) for label, values in (waveform_series or {}).items()}
+        self.sampling_rate = sampling_rate
+        self.channel_map = channel_map
+        self.position_lookup, self.electrode_positions = _channel_map_positions(channel_map)
+        self._map_recorded_xy, self._map_background_xy = self._channel_map_point_arrays()
+        self.channels = []
+        self.intervals = []
+        self.first_times = np.zeros((0, 0), dtype=float)
+        self.channel_trains = []
+        self.delay_mode = "burst_first"
+        self.aligned_pairs = []
+        self.thread_pool = QThreadPool.globalInstance()
+        self.active_delay_worker = None
+        self.delay_progress = None
+        self._analysis_pending = False
+        self._map_ax = None
+        self._map_channel_indices = np.array([], dtype=int)
+        self._map_channel_xy = np.zeros((0, 2), dtype=float)
+        self._map_channel_labels = []
+        self._pair_combo_updating = False
+        self._pair_anchor = None
+        self._manual_reference_index = -1
+        self._manual_target_index = -1
+        self._manual_pair_active = False
+        self._highlight_channel_index = -1
+
+        self.max_channels = QSpinBox()
+        available_channels = len(
+            {
+                _base_channel_from_raster_label(str(label))
+                for label, times in self.spike_series
+                if np.asarray(times, dtype=float).size and " noise" not in str(label).lower()
+            }
+        )
+        self.max_channels.setRange(2, max(2, available_channels))
+        self.max_channels.setValue(max(2, available_channels))
+        self.max_channels.valueChanged.connect(self._mark_analysis_stale)
+
+        self.max_lag_ms = QSpinBox()
+        self.max_lag_ms.setRange(1, 10000)
+        self.max_lag_ms.setSingleStep(5)
+        self.max_lag_ms.setValue(100)
+        self.max_lag_ms.setSuffix(" ms")
+        self.max_lag_ms.valueChanged.connect(self._mark_analysis_stale)
+
+        self.min_lag_ms = QDoubleSpinBox()
+        self.min_lag_ms.setRange(0.0, 10000.0)
+        self.min_lag_ms.setDecimals(1)
+        self.min_lag_ms.setSingleStep(0.5)
+        self.min_lag_ms.setValue(1.0)
+        self.min_lag_ms.setSuffix(" ms")
+        self.min_lag_ms.valueChanged.connect(self._mark_analysis_stale)
+
+        self.burst_window_ms = QDoubleSpinBox()
+        self.burst_window_ms.setRange(0.0, 100000.0)
+        self.burst_window_ms.setDecimals(1)
+        self.burst_window_ms.setSingleStep(5.0)
+        self.burst_window_ms.setValue(0.0)
+        self.burst_window_ms.setSuffix(" ms")
+        self.burst_window_ms.valueChanged.connect(self._mark_analysis_stale)
+
+        self.bin_ms = QDoubleSpinBox()
+        self.bin_ms.setRange(0.1, 1000.0)
+        self.bin_ms.setDecimals(1)
+        self.bin_ms.setSingleStep(1.0)
+        self.bin_ms.setValue(2.0)
+        self.bin_ms.setSuffix(" ms")
+        self.bin_ms.valueChanged.connect(self._mark_analysis_stale)
+
+        self.min_peak_count = QSpinBox()
+        self.min_peak_count.setRange(1, 100000)
+        self.min_peak_count.setValue(25)
+        self.min_peak_count.valueChanged.connect(self._mark_analysis_stale)
+
+        self.min_peak_fraction = QDoubleSpinBox()
+        self.min_peak_fraction.setRange(0.01, 1.0)
+        self.min_peak_fraction.setDecimals(2)
+        self.min_peak_fraction.setSingleStep(0.05)
+        self.min_peak_fraction.setValue(0.50)
+        self.min_peak_fraction.valueChanged.connect(self._mark_analysis_stale)
+
+        self.min_peak_ratio = QDoubleSpinBox()
+        self.min_peak_ratio.setRange(1.0, 1000.0)
+        self.min_peak_ratio.setDecimals(1)
+        self.min_peak_ratio.setSingleStep(1.0)
+        self.min_peak_ratio.setValue(10.0)
+        self.min_peak_ratio.valueChanged.connect(self._mark_analysis_stale)
+
+        self.max_map_pairs = QSpinBox()
+        self.max_map_pairs.setRange(1, 200)
+        self.max_map_pairs.setValue(30)
+        self.max_map_pairs.valueChanged.connect(lambda *_: self._draw_channel_map())
+
+        self.delay_mode_combo = QComboBox()
+        self.delay_mode_combo.addItem("Burst first spike", "burst_first")
+        self.delay_mode_combo.addItem("Burst all spikes", "burst_all")
+        self.delay_mode_combo.addItem("All spikes", "all_spikes")
+        self.delay_mode_combo.currentIndexChanged.connect(self._mark_analysis_stale)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Selected pair", "pair")
+        self.mode_combo.currentIndexChanged.connect(self._draw_histogram)
+
+        self.map_pick_combo = QComboBox()
+        self.map_pick_combo.addItem("Source", "source")
+        self.map_pick_combo.addItem("Target", "target")
+
+        self.manual_pair_check = QCheckBox("Manual pair")
+        self.manual_pair_check.toggled.connect(self._manual_pair_toggled)
+
+        self.significance_button = QPushButton("Significance")
+        self.significance_button.clicked.connect(self._open_significance_dialog)
+        self.analyze_button = QPushButton("Analyze")
+        self.analyze_button.clicked.connect(self._draw)
+
+        self.reference_combo = QComboBox()
+        self.reference_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("source"))
+        self.target_combo = QComboBox()
+        self.target_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("target"))
+        self.raster_align_combo = QComboBox()
+        self.raster_align_combo.addItem("Burst onset", "onset")
+        self.raster_align_combo.addItem("Source anchored", "source")
+        self.raster_align_combo.currentIndexChanged.connect(self._draw_delay_raster)
+
+        self.summary = QLabel()
+        self.summary.setObjectName("MutedText")
+        self.hist_canvas = FigureCanvas(Figure(figsize=(6, 3), tight_layout=True))
+        self.delay_raster_canvas = FigureCanvas(Figure(figsize=(6, 3), tight_layout=True))
+        self.waveform_canvas = FigureCanvas(Figure(figsize=(6, 2.4), tight_layout=True))
+        self.map_canvas = FigureCanvas(Figure(figsize=(6, 5), tight_layout=False))
+        self.map_canvas.mpl_connect("button_press_event", self._map_clicked)
+        self.aligned_table = QTableWidget(0, 8)
+        self.aligned_table.setHorizontalHeaderLabels(
+            ["Source", "Target", "Delay ms", "Peak", "Total", "Peak frac", "Peak/bg", "Peak SD"]
+        )
+        self.aligned_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.aligned_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.aligned_table.itemSelectionChanged.connect(self._aligned_pair_selected)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Delay mode"))
+        controls.addWidget(self.delay_mode_combo)
+        controls.addWidget(QLabel("Max lag"))
+        controls.addWidget(self.max_lag_ms)
+        controls.addWidget(QLabel("Min delay"))
+        controls.addWidget(self.min_lag_ms)
+        controls.addWidget(QLabel("Burst window"))
+        controls.addWidget(self.burst_window_ms)
+        controls.addWidget(QLabel("Histogram bin"))
+        controls.addWidget(self.bin_ms)
+        controls.addWidget(self.significance_button)
+        controls.addWidget(self.analyze_button)
+        controls.addWidget(QLabel("Source"))
+        controls.addWidget(self.reference_combo, 1)
+        controls.addWidget(QLabel("Target"))
+        controls.addWidget(self.target_combo, 1)
+        controls.addWidget(QLabel("Raster align"))
+        controls.addWidget(self.raster_align_combo)
+
+        right_plots = QVBoxLayout()
+        right_plots.addWidget(self.hist_canvas, 1)
+        right_plots.addWidget(self.delay_raster_canvas, 1)
+        right_plots.addWidget(self.waveform_canvas, 1)
+        plot_area = QHBoxLayout()
+        plot_area.addWidget(self.map_canvas, 3)
+        plot_area.addLayout(right_plots, 2)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self.summary)
+        layout.addLayout(plot_area, 1)
+        QTimer.singleShot(0, self._draw)
+        _fix_spinbox_hit_targets(self)
+        self.showMaximized()
+
+    def _mark_analysis_stale(self, *_args) -> None:
+        if not hasattr(self, "summary"):
+            return
+        if self.active_delay_worker is not None:
+            self.summary.setText("Burst delay parameters changed; click Analyze after the current run finishes.")
+            return
+        current = self.summary.text().strip()
+        if current and "click Analyze" not in current:
+            self.summary.setText(f"{current} Parameters changed; click Analyze.")
+        elif not current:
+            self.summary.setText("Burst delay parameters changed; click Analyze.")
+
+    def _open_significance_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Significance Parameters")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        peak_count = QSpinBox()
+        peak_count.setRange(self.min_peak_count.minimum(), self.min_peak_count.maximum())
+        peak_count.setValue(int(self.min_peak_count.value()))
+
+        peak_fraction = QDoubleSpinBox()
+        peak_fraction.setRange(self.min_peak_fraction.minimum(), self.min_peak_fraction.maximum())
+        peak_fraction.setDecimals(2)
+        peak_fraction.setSingleStep(0.05)
+        peak_fraction.setValue(float(self.min_peak_fraction.value()))
+
+        peak_ratio = QDoubleSpinBox()
+        peak_ratio.setRange(self.min_peak_ratio.minimum(), self.min_peak_ratio.maximum())
+        peak_ratio.setDecimals(1)
+        peak_ratio.setSingleStep(1.0)
+        peak_ratio.setValue(float(self.min_peak_ratio.value()))
+
+        form.addRow("Min peak count", peak_count)
+        form.addRow("Min peak fraction", peak_fraction)
+        form.addRow("Min peak/background", peak_ratio)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        apply_button = QPushButton("Apply")
+        cancel_button = QPushButton("Cancel")
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(apply_button)
+        layout.addLayout(buttons)
+        apply_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        _fix_spinbox_hit_targets(dialog)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.min_peak_count.setValue(int(peak_count.value()))
+        self.min_peak_fraction.setValue(float(peak_fraction.value()))
+        self.min_peak_ratio.setValue(float(peak_ratio.value()))
+        self._mark_analysis_stale()
+
+    def _draw(self):
+        if self.active_delay_worker is not None:
+            self.summary.setText("Burst delay analysis is already running.")
+            return
+        self._analysis_pending = False
+        self._set_controls_enabled(False)
+        self.delay_progress = _create_progress_dialog(self, "Burst delay", "Starting burst delay analysis...", 100)
+        worker = BurstDelayWorker(
+            self.spike_series,
+            self.burst_intervals,
+            max_channels=int(self.max_channels.value()),
+            max_lag_ms=float(self.max_lag_ms.value()),
+            min_lag_ms=float(self.min_lag_ms.value()),
+            delay_mode=str(self.delay_mode_combo.currentData() or "burst_first"),
+            burst_window_ms=(
+                float(self.burst_window_ms.value())
+                if str(self.delay_mode_combo.currentData() or "burst_first") != "all_spikes"
+                else 0.0
+            ),
+            bin_ms=float(self.bin_ms.value()),
+            min_peak_count=int(self.min_peak_count.value()),
+            min_peak_fraction=float(self.min_peak_fraction.value()),
+            min_peak_ratio=float(self.min_peak_ratio.value()),
+        )
+        self.delay_progress.canceled.connect(worker.cancel)
+        worker.signals.progress.connect(lambda value, message: _set_progress_dialog(self.delay_progress, message, value))
+        worker.signals.finished.connect(lambda result, worker=worker: self._analysis_finished(result, worker))
+        worker.signals.failed.connect(lambda details, worker=worker: self._analysis_failed(details, worker))
+        worker.signals.canceled.connect(lambda message, worker=worker: self._analysis_canceled(message, worker))
+        self.active_delay_worker = worker
+        self.thread_pool.start(worker)
+
+    def _set_controls_enabled(self, enabled: bool):
+        for widget in [
+            self.max_channels,
+            self.max_lag_ms,
+            self.min_lag_ms,
+            self.burst_window_ms,
+            self.bin_ms,
+            self.min_peak_count,
+            self.min_peak_fraction,
+            self.min_peak_ratio,
+            self.max_map_pairs,
+            self.delay_mode_combo,
+            self.map_pick_combo,
+            self.mode_combo,
+            self.manual_pair_check,
+            self.significance_button,
+            self.analyze_button,
+            self.reference_combo,
+            self.target_combo,
+            self.raster_align_combo,
+        ]:
+            widget.setEnabled(enabled)
+
+    def _finish_active_worker(self, worker: BurstDelayWorker):
+        if self.active_delay_worker is worker:
+            self.active_delay_worker = None
+        _close_progress_dialog(self.delay_progress)
+        self.delay_progress = None
+        self._set_controls_enabled(True)
+
+    def _analysis_finished(self, result: dict, worker: BurstDelayWorker):
+        previous_reference = self.reference_combo.currentText()
+        previous_target = self.target_combo.currentText()
+        self._finish_active_worker(worker)
+        self.channels = list(result.get("channels", []))
+        self.intervals = list(result.get("intervals", []))
+        self.first_times = np.asarray(result.get("first_times", np.zeros((0, 0))), dtype=float)
+        self.channel_trains = [np.asarray(train, dtype=float) for train in result.get("channel_trains", [])]
+        self.delay_mode = str(result.get("delay_mode", "burst_first"))
+        self.aligned_pairs = list(result.get("aligned_pairs", []))
+        truncated_bursts = max((int(item.get("truncated_bursts", 0)) for item in self.aligned_pairs), default=0)
+        note = (
+            f"{self._delay_mode_label()} analyzed {len(self.channels)} channels across {len(self.intervals)} bursts; "
+            f"{len(self.aligned_pairs)} aligned delay patterns available for the map."
+        )
+        if truncated_bursts:
+            note += f" {truncated_bursts} dense bursts were limited to the most active channels for responsiveness."
+        burst_window_ms = float(self.burst_window_ms.value())
+        if self.delay_mode != "all_spikes" and burst_window_ms > 0:
+            note += f" Burst window: onset + {burst_window_ms:g} ms."
+        self.summary.setText(note)
+        self._refresh_channel_combos(previous_reference, previous_target)
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+        if self._analysis_pending:
+            QTimer.singleShot(0, self._draw)
+
+    def _analysis_failed(self, details: str, worker: BurstDelayWorker):
+        self._finish_active_worker(worker)
+        QMessageBox.critical(self, "Burst delay failed", details.splitlines()[-1] if details else "Unknown error")
+        if self._analysis_pending:
+            QTimer.singleShot(0, self._draw)
+
+    def _analysis_canceled(self, message: str, worker: BurstDelayWorker):
+        self._finish_active_worker(worker)
+        self.summary.setText(message or "Burst delay analysis cancelled")
+        if self._analysis_pending:
+            QTimer.singleShot(0, self._draw)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt override
+        if self.active_delay_worker is not None:
+            self.active_delay_worker.cancel()
+        _close_progress_dialog(self.delay_progress)
+        self.delay_progress = None
+        event.accept()
+
+    def _channel_map_point_arrays(self):
+        recorded_points = []
+        background_points = []
+        for _electrode, (x, y, payload) in self.electrode_positions.items():
+            recorded = bool(payload.get("channel")) or bool(payload.get("routed"))
+            target = recorded_points if recorded else background_points
+            target.append((float(x), float(y)))
+        recorded_xy = np.asarray(recorded_points, dtype=float) if recorded_points else np.zeros((0, 2), dtype=float)
+        background_xy = np.asarray(background_points, dtype=float) if background_points else np.zeros((0, 2), dtype=float)
+        return recorded_xy, background_xy
+
+    def _refresh_channel_position_cache(self):
+        indices = []
+        points = []
+        labels = []
+        for index, channel in enumerate(self.channels):
+            position = _position_for_channel(channel, self.position_lookup)
+            if position is None:
+                continue
+            indices.append(index)
+            points.append((float(position[0]), float(position[1])))
+            labels.append(str(channel))
+        self._map_channel_indices = np.asarray(indices, dtype=int) if indices else np.array([], dtype=int)
+        self._map_channel_xy = np.asarray(points, dtype=float) if points else np.zeros((0, 2), dtype=float)
+        self._map_channel_labels = labels
+
+    def _refresh_channel_combos(self, previous_reference: str, previous_target: str, anchor: str | None = None):
+        self._refresh_channel_position_cache()
+        pairs = self._significant_pair_records()
+        self._pair_combo_updating = True
+        try:
+            if not pairs:
+                self.reference_combo.clear()
+                self.target_combo.clear()
+                self._pair_anchor = None
+                return
+
+            all_sources = sorted({reference for reference, _target, _result in pairs}, key=self._channel_index_sort_key)
+            previous_reference_index = self._channel_index_for_label(previous_reference)
+            previous_target_index = self._channel_index_for_label(previous_target)
+            current_reference_index = self._combo_channel_index(self.reference_combo)
+            current_target_index = self._combo_channel_index(self.target_combo)
+            reference_index = previous_reference_index if previous_reference_index in all_sources else current_reference_index
+            if reference_index not in all_sources:
+                reference_index = -1
+
+            target_options = []
+            if reference_index >= 0:
+                target_options = sorted(
+                    {target for reference, target, _result in pairs if reference == reference_index},
+                    key=self._channel_index_sort_key,
+                )
+            if anchor == "source":
+                target_index = -1
+            else:
+                target_index = previous_target_index if previous_target_index in target_options else current_target_index
+                if target_index not in target_options:
+                    target_index = -1
+
+            self._pair_anchor = "source" if reference_index >= 0 else None
+            self._populate_pair_combo(self.reference_combo, all_sources, reference_index)
+            self._populate_pair_combo(self.target_combo, target_options, target_index)
+        finally:
+            self._pair_combo_updating = False
+
+    def _significant_pair_records(self) -> list[tuple[int, int, dict]]:
+        records = []
+        for result in self.aligned_pairs:
+            try:
+                reference_index = int(result.get("reference_index", -1))
+                target_index = int(result.get("target_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= reference_index < len(self.channels) and 0 <= target_index < len(self.channels):
+                records.append((reference_index, target_index, result))
+        return records
+
+    def _channel_index_sort_key(self, index: int):
+        label = self.channels[int(index)] if 0 <= int(index) < len(self.channels) else ""
+        return _channel_sort_key(str(label))
+
+    def _channel_index_for_label(self, label: str) -> int:
+        if label in self.channels:
+            return int(self.channels.index(label))
+        return -1
+
+    def _populate_pair_combo(self, combo: QComboBox, indices: list[int], selected_index: int) -> None:
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("None", -1)
+            for index in indices:
+                combo.addItem(self.channels[index], index)
+            item_index = combo.findData(int(selected_index))
+            combo.setCurrentIndex(item_index if item_index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+
+    def _pair_result(self, reference_index: int, target_index: int) -> dict | None:
+        for result_reference, result_target, result in self._significant_pair_records():
+            if result_reference == int(reference_index) and result_target == int(target_index):
+                return result
+        return None
+
+    def _selected_pair_result(self) -> dict | None:
+        if self._manual_pair_active or self.manual_pair_check.isChecked():
+            return self._manual_pair_result(self._manual_reference_index, self._manual_target_index)
+        reference_index = self._combo_channel_index(self.reference_combo)
+        target_index = self._combo_channel_index(self.target_combo)
+        result = self._pair_result(reference_index, target_index)
+        return result
+
+    def _manual_pair_result(self, reference_index: int, target_index: int) -> dict | None:
+        if reference_index < 0 or target_index < 0 or reference_index == target_index:
+            return None
+        if reference_index >= len(self.channels) or target_index >= len(self.channels):
+            return None
+        values = self._pair_delay_values(reference_index, target_index)
+        if values.size == 0:
+            delay_ms = 0.0
+            peak_count = 0
+            delay_window_count = 0
+            total_count = 0
+        else:
+            bin_ms = max(0.1, float(self.bin_ms.value()))
+            max_lag = max(1.0, float(self.max_lag_ms.value()))
+            if self.delay_mode == "burst_first":
+                bin_count = max(1, int(np.floor((2.0 * max_lag) / bin_ms)) + 1)
+                bin_indices = np.floor((values + max_lag) / bin_ms + 0.5).astype(int)
+            else:
+                bin_count = max(1, int(np.floor(max_lag / bin_ms)) + 1)
+                bin_indices = np.floor(values / bin_ms + 0.5).astype(int)
+            bin_indices = np.clip(bin_indices, 0, bin_count - 1)
+            counts = np.bincount(bin_indices, minlength=bin_count)
+            peak_index = int(np.argmax(counts))
+            delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
+            window_mask = np.isin(bin_indices, list(delay_window_indices))
+            window_values = values[window_mask]
+            delay_ms = float(np.mean(window_values)) if window_values.size else float(np.mean(values))
+            peak_count = int(counts[peak_index])
+            delay_window_count = int(window_values.size)
+            total_count = int(values.size)
+        return {
+            "reference_index": int(reference_index),
+            "target_index": int(target_index),
+            "reference": str(self.channels[reference_index]),
+            "target": str(self.channels[target_index]),
+            "delay_ms": float(delay_ms),
+            "peak_center_ms": float(delay_ms),
+            "peak_count": int(peak_count),
+            "delay_window_count": int(delay_window_count),
+            "total_count": int(total_count),
+            "peak_fraction": 0.0,
+            "peak_to_background": 0.0,
+            "background_count": 0.0,
+            "std_ms": 0.0,
+            "truncated_bursts": 0,
+            "manual": True,
+        }
+
+    def _delay_mode_label(self) -> str:
+        labels = {
+            "burst_first": "Burst first-spike delay",
+            "burst_all": "Burst all-spike delay",
+            "all_spikes": "All-spike delay",
+        }
+        return labels.get(str(self.delay_mode), "Burst delay")
+
+    def _selected_pair_delay_values(self, selected_pair: dict | None) -> np.ndarray:
+        if selected_pair is None:
+            return np.array([], dtype=float)
+        try:
+            reference_index = int(selected_pair["reference_index"])
+            target_index = int(selected_pair["target_index"])
+        except (KeyError, TypeError, ValueError):
+            return np.array([], dtype=float)
+        return self._pair_delay_values(reference_index, target_index)
+
+    def _pair_delay_values(self, reference_index: int, target_index: int) -> np.ndarray:
+        max_lag = max(1.0, float(self.max_lag_ms.value()))
+        min_lag = max(0.0, float(self.min_lag_ms.value()))
+        if self.delay_mode == "burst_first":
+            if self.first_times.ndim != 2 or reference_index >= self.first_times.shape[1] or target_index >= self.first_times.shape[1]:
+                return np.array([], dtype=float)
+            return _burst_delay_pair_values(
+                self.first_times,
+                reference_index,
+                target_index,
+                max_lag,
+                min_abs_delay_ms=min_lag,
+            )
+        if reference_index >= len(self.channel_trains) or target_index >= len(self.channel_trains):
+            return np.array([], dtype=float)
+        intervals = self.intervals if self.delay_mode == "burst_all" else None
+        return _source_interval_delay_values(
+            self.channel_trains[reference_index],
+            self.channel_trains[target_index],
+            max_lag,
+            min_lag,
+            intervals,
+        )
+
+    def _selected_pair_delay_matches(self, selected_pair: dict | None) -> np.ndarray:
+        if selected_pair is None:
+            return np.zeros((0, 3), dtype=float)
+        try:
+            reference_index = int(selected_pair["reference_index"])
+            target_index = int(selected_pair["target_index"])
+        except (KeyError, TypeError, ValueError):
+            return np.zeros((0, 3), dtype=float)
+        if reference_index >= len(self.channel_trains) or target_index >= len(self.channel_trains):
+            return np.zeros((0, 3), dtype=float)
+        intervals = self.intervals if self.delay_mode == "burst_all" else None
+        return _source_interval_delay_matches(
+            self.channel_trains[reference_index],
+            self.channel_trains[target_index],
+            max(1.0, float(self.max_lag_ms.value())),
+            max(0.0, float(self.min_lag_ms.value())),
+            intervals,
+        )
+
+    def _combo_channel_index(self, combo: QComboBox) -> int:
+        data = combo.currentData()
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return -1
+
+    def _set_combo_channel_index(self, combo: QComboBox, channel_index: int) -> None:
+        item_index = combo.findData(int(channel_index))
+        if item_index < 0 and 0 <= int(channel_index) < len(self.channels):
+            insert_at = max(0, combo.count() - 1 if combo.count() and combo.itemData(combo.count() - 1) == -1 else combo.count())
+            combo.insertItem(insert_at, self.channels[int(channel_index)], int(channel_index))
+            item_index = insert_at
+        if item_index >= 0:
+            combo.setCurrentIndex(item_index)
+
+    def _map_clicked(self, event) -> None:
+        if event.inaxes is not self._map_ax or event.xdata is None or event.ydata is None:
+            return
+        if self._map_channel_xy.size == 0:
+            return
+        display_points = self._map_ax.transData.transform(self._map_channel_xy)
+        click = np.asarray([float(event.x), float(event.y)], dtype=float)
+        distances = np.sum((display_points - click) ** 2, axis=1)
+        nearest_pos = int(np.argmin(distances))
+        nearest_distance = float(np.sqrt(distances[nearest_pos]))
+        if nearest_distance > 12.0:
+            return
+        channel_index = int(self._map_channel_indices[nearest_pos])
+        if channel_index < 0 or channel_index >= len(self.channels):
+            return
+
+        role = self.map_pick_combo.currentData()
+        if event.button == 3:
+            role = "target"
+        elif event.button == 1 and role not in {"source", "target"}:
+            role = "source"
+        self._highlight_channel_index = int(channel_index)
+        self._manual_pair_active = True
+        self._set_manual_pair_channel(role, channel_index)
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+
+    def _pair_selection_changed(self, role: str) -> None:
+        if self._pair_combo_updating:
+            return
+        self._manual_pair_active = False
+        self._highlight_channel_index = -1
+        if role == "target" and self._combo_channel_index(self.reference_combo) < 0:
+            self._refresh_channel_combos("", "", anchor=None)
+            self._draw_histogram()
+            self._draw_delay_raster()
+            self._draw_waveforms()
+            self._draw_channel_map()
+            return
+        self._refresh_channel_combos(
+            self.reference_combo.currentText(),
+            self.target_combo.currentText(),
+            anchor=role,
+        )
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+
+    def _manual_pair_toggled(self):
+        if self.manual_pair_check.isChecked():
+            self._manual_pair_active = True
+            self._manual_reference_index = self._combo_channel_index(self.reference_combo)
+            self._manual_target_index = self._combo_channel_index(self.target_combo)
+        else:
+            self._manual_pair_active = False
+        self._refresh_channel_combos(self.reference_combo.currentText(), self.target_combo.currentText(), anchor=self._pair_anchor)
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+
+    def _set_manual_pair_channel(self, role: str, channel_index: int) -> None:
+        if role == "target":
+            self._manual_target_index = int(channel_index)
+            if self._manual_reference_index == self._manual_target_index:
+                self._manual_reference_index = -1
+        else:
+            self._manual_reference_index = int(channel_index)
+            if self._manual_target_index == self._manual_reference_index:
+                self._manual_target_index = -1
+
+    def _ensure_distinct_pair_selection(self) -> None:
+        reference_index = self._combo_channel_index(self.reference_combo)
+        target_index = self._combo_channel_index(self.target_combo)
+        if reference_index < 0 or target_index < 0 or reference_index != target_index:
+            return
+        for index in range(len(self.channels)):
+            if index != reference_index:
+                self.target_combo.blockSignals(True)
+                self._set_combo_channel_index(self.target_combo, index)
+                self.target_combo.blockSignals(False)
+                return
+
+    def _select_matching_aligned_pair(self) -> None:
+        reference_index = self._combo_channel_index(self.reference_combo)
+        target_index = self._combo_channel_index(self.target_combo)
+        if reference_index < 0 or target_index < 0:
+            return
+        for row, result in enumerate(self.aligned_pairs[:BURST_DELAY_TABLE_ROW_LIMIT]):
+            if int(result.get("reference_index", -1)) == reference_index and int(result.get("target_index", -1)) == target_index:
+                self.aligned_table.blockSignals(True)
+                self.aligned_table.selectRow(row)
+                self.aligned_table.blockSignals(False)
+                return
+        self.aligned_table.blockSignals(True)
+        self.aligned_table.clearSelection()
+        self.aligned_table.blockSignals(False)
+
+    def _refresh_aligned_pairs(self):
+        if self.delay_mode == "burst_first":
+            self.aligned_pairs = _burst_delay_aligned_pairs(
+                self.channels,
+                self.first_times,
+                max_abs_delay_ms=float(self.max_lag_ms.value()),
+                min_abs_delay_ms=float(self.min_lag_ms.value()),
+                bin_ms=float(self.bin_ms.value()),
+                min_peak_count=int(self.min_peak_count.value()),
+                min_peak_fraction=float(self.min_peak_fraction.value()),
+                min_peak_to_background=float(self.min_peak_ratio.value()),
+            )
+        else:
+            intervals = self.intervals if self.delay_mode == "burst_all" else None
+            self.aligned_pairs = _spike_train_delay_aligned_pairs(
+                self.channels,
+                self.channel_trains,
+                intervals,
+                max_abs_delay_ms=float(self.max_lag_ms.value()),
+                min_abs_delay_ms=float(self.min_lag_ms.value()),
+                bin_ms=float(self.bin_ms.value()),
+                min_peak_count=int(self.min_peak_count.value()),
+                min_peak_fraction=float(self.min_peak_fraction.value()),
+                min_peak_to_background=float(self.min_peak_ratio.value()),
+                mode=self.delay_mode,
+            )
+        self._refresh_channel_combos(self.reference_combo.currentText(), self.target_combo.currentText(), anchor=self._pair_anchor)
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+
+    def _populate_aligned_table(self):
+        self.aligned_table.blockSignals(True)
+        try:
+            display_pairs = self.aligned_pairs[:BURST_DELAY_TABLE_ROW_LIMIT]
+            self.aligned_table.setRowCount(len(display_pairs))
+            for row, result in enumerate(display_pairs):
+                values = [
+                    result["reference"],
+                    result["target"],
+                    f"{result['delay_ms']:.3f}",
+                    str(result["peak_count"]),
+                    str(result["total_count"]),
+                    f"{result['peak_fraction']:.3f}",
+                    f"{result['peak_to_background']:.1f}",
+                    f"{result['std_ms']:.3f}",
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, row)
+                    self.aligned_table.setItem(row, column, item)
+            self.aligned_table.resizeColumnsToContents()
+        finally:
+            self.aligned_table.blockSignals(False)
+
+    def _aligned_pair_selected(self):
+        items = self.aligned_table.selectedItems()
+        if not items:
+            return
+        row = items[0].row()
+        source_row = items[0].data(Qt.ItemDataRole.UserRole)
+        if source_row is not None:
+            try:
+                row = int(source_row)
+            except (TypeError, ValueError):
+                pass
+        if row < 0 or row >= len(self.aligned_pairs):
+            return
+        result = self.aligned_pairs[row]
+        reference_index = int(result["reference_index"])
+        target_index = int(result["target_index"])
+        if reference_index >= len(self.channels) or target_index >= len(self.channels):
+            return
+        self._manual_pair_active = False
+        self._highlight_channel_index = -1
+        self.reference_combo.blockSignals(True)
+        self.target_combo.blockSignals(True)
+        self._set_combo_channel_index(self.reference_combo, reference_index)
+        self._set_combo_channel_index(self.target_combo, target_index)
+        self.reference_combo.blockSignals(False)
+        self.target_combo.blockSignals(False)
+        mode_index = self.mode_combo.findData("pair")
+        if mode_index >= 0:
+            self.mode_combo.setCurrentIndex(mode_index)
+        self._draw_histogram()
+        self._draw_delay_raster()
+        self._draw_waveforms()
+        self._draw_channel_map()
+
+    def _delay_connected_components(self) -> list[list[int]]:
+        adjacency: dict[int, set[int]] = {}
+        for reference_index, target_index, _result in self._significant_pair_records():
+            adjacency.setdefault(reference_index, set()).add(target_index)
+            adjacency.setdefault(target_index, set()).add(reference_index)
+        components = []
+        visited = set()
+        for start in sorted(adjacency, key=self._channel_index_sort_key):
+            if start in visited:
+                continue
+            stack = [start]
+            visited.add(start)
+            component = []
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor in sorted(adjacency.get(current, ()), key=self._channel_index_sort_key, reverse=True):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            components.append(sorted(component, key=self._channel_index_sort_key))
+        return components
+
+    def _component_colors(self, components: list[list[int]]) -> dict[int, str]:
+        palette = [
+            "#22c55e",
+            "#38bdf8",
+            "#f97316",
+            "#e879f9",
+            "#facc15",
+            "#a78bfa",
+            "#14b8a6",
+            "#ef4444",
+            "#84cc16",
+            "#06b6d4",
+            "#f43f5e",
+            "#8b5cf6",
+            "#10b981",
+            "#f59e0b",
+            "#0ea5e9",
+            "#d946ef",
+            "#65a30d",
+            "#fb7185",
+            "#2dd4bf",
+            "#c084fc",
+        ]
+        colors = {}
+        for component_index, component in enumerate(components):
+            if component_index < len(palette):
+                color = palette[component_index]
+            else:
+                hue = (component_index * 0.61803398875) % 1.0
+                red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 0.95)
+                color = f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
+            for channel_index in component:
+                colors[int(channel_index)] = color
+        return colors
+
+    def _first_spike_probability_window_ms(self) -> float:
+        burst_window_ms = max(0.0, float(self.burst_window_ms.value())) if self.delay_mode != "all_spikes" else 0.0
+        if burst_window_ms > 0:
+            return float(burst_window_ms)
+        durations = [float(stop - start) * 1000.0 for start, stop in self.intervals if float(stop) > float(start)]
+        if durations:
+            return max(1.0, max(durations))
+        return max(1.0, float(self.max_lag_ms.value()))
+
+    def _first_spike_peak_times_by_channel(self) -> dict[int, float]:
+        if not self.channels or not self.intervals:
+            return {}
+        right_ms = self._first_spike_probability_window_ms()
+        peak_times = {}
+        for channel_index in range(len(self.channels)):
+            fit = self._first_spike_probability_fit(channel_index, 0.0, right_ms)
+            if fit is None or fit["spike_count"] <= 0 or not fit["centers_ms"].size:
+                continue
+            probabilities = np.asarray(fit["fit_probability"], dtype=float)
+            if not probabilities.size or not np.any(np.isfinite(probabilities)):
+                continue
+            peak_index = int(np.nanargmax(probabilities))
+            if probabilities[peak_index] <= 0:
+                continue
+            peak_times[int(channel_index)] = float(fit["centers_ms"][peak_index])
+        return peak_times
+
+    def _first_spike_peak_color(self, value_ms: float, low_ms: float, high_ms: float) -> str:
+        if not np.isfinite(value_ms):
+            return "#64748b"
+        if high_ms <= low_ms:
+            fraction = 0.5
+        else:
+            fraction = (float(value_ms) - float(low_ms)) / max(float(high_ms) - float(low_ms), 1e-9)
+            fraction = max(0.0, min(1.0, fraction))
+        blue = np.asarray([0, 22, 120], dtype=float)
+        green = np.asarray([0, 230, 118], dtype=float)
+        red = np.asarray([139, 0, 0], dtype=float)
+        if fraction <= 0.5:
+            local = fraction * 2.0
+            color = blue + (green - blue) * local
+        else:
+            local = (fraction - 0.5) * 2.0
+            color = green + (red - green) * local
+        return f"#{int(color[0]):02x}{int(color[1]):02x}{int(color[2]):02x}"
+
+    def _channel_position_array(self, channel_indices: list[int]) -> np.ndarray:
+        points = []
+        for channel_index in channel_indices:
+            if 0 <= int(channel_index) < len(self.channels):
+                position = _position_for_channel(self.channels[int(channel_index)], self.position_lookup)
+            else:
+                position = None
+            if position is None:
+                points.append((np.nan, np.nan))
+            else:
+                points.append((float(position[0]), float(position[1])))
+        return np.asarray(points, dtype=float) if points else np.zeros((0, 2), dtype=float)
+
+    def _propagation_paths(self, components: list[list[int]]) -> list[dict]:
+        pair_records = self._significant_pair_records()
+        if not pair_records:
+            return []
+        pair_lookup = {(reference, target): result for reference, target, result in pair_records}
+        paths = []
+        for component in components:
+            component = [int(index) for index in component]
+            if len(component) < 10:
+                continue
+            local_index = {channel_index: pos for pos, channel_index in enumerate(component)}
+            edges = [
+                (reference, target, float(result.get("delay_ms", 0.0)))
+                for reference, target, result in pair_records
+                if reference in local_index and target in local_index and float(result.get("delay_ms", 0.0)) > 0
+            ]
+            if len(edges) < 2:
+                continue
+            outgoing: dict[int, list[tuple[int, dict]]] = {index: [] for index in component}
+            in_degree = {index: 0 for index in component}
+            out_degree = {index: 0 for index in component}
+            for reference, target, _delay_ms in edges:
+                result = pair_lookup.get((reference, target), {})
+                outgoing.setdefault(reference, []).append((target, result))
+                out_degree[reference] = out_degree.get(reference, 0) + 1
+                in_degree[target] = in_degree.get(target, 0) + 1
+
+            rows = []
+            values = []
+            for reference, target, delay_ms in edges:
+                row = np.zeros(len(component), dtype=float)
+                row[local_index[target]] = 1.0
+                row[local_index[reference]] = -1.0
+                rows.append(row)
+                values.append(delay_ms)
+            if not rows:
+                continue
+            matrix = np.vstack(rows)
+            vector = np.asarray(values, dtype=float)
+            anchored = np.vstack([matrix, np.ones(len(component), dtype=float)])
+            anchored_values = np.concatenate([vector, np.array([0.0])])
+            try:
+                times_ms = np.linalg.lstsq(anchored, anchored_values, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                continue
+            times_ms = times_ms - float(np.nanmin(times_ms))
+            positions = self._channel_position_array(component)
+            if not positions.size or not np.all(np.isfinite(positions)):
+                continue
+
+            def node_score(index: int) -> float:
+                incoming = float(in_degree.get(index, 0))
+                outgoing_count = float(out_degree.get(index, 0))
+                return min(incoming, outgoing_count) + 0.12 * (incoming + outgoing_count)
+
+            def edge_score(result: dict) -> float:
+                peak_count = max(1.0, float(result.get("peak_count", 1.0)))
+                peak_fraction = max(0.0, float(result.get("peak_fraction", 0.0)))
+                peak_ratio = max(1.0, float(result.get("peak_to_background", 1.0)))
+                return np.log1p(peak_count) * (1.0 + peak_fraction) * min(4.0, peak_ratio)
+
+            sorted_nodes = sorted(component, key=lambda index: float(times_ms[local_index[index]]))
+            start_candidates = sorted(
+                [index for index in component if out_degree.get(index, 0) > 0],
+                key=lambda index: (
+                    out_degree.get(index, 0) - in_degree.get(index, 0),
+                    out_degree.get(index, 0),
+                    -float(times_ms[local_index[index]]),
+                ),
+                reverse=True,
+            )
+            end_candidates = sorted(
+                [index for index in component if in_degree.get(index, 0) > 0],
+                key=lambda index: (
+                    in_degree.get(index, 0) - out_degree.get(index, 0),
+                    in_degree.get(index, 0),
+                    float(times_ms[local_index[index]]),
+                ),
+                reverse=True,
+            )
+            if not start_candidates or not end_candidates:
+                continue
+            start_candidates = start_candidates[: max(3, min(8, len(start_candidates)))]
+            end_candidate_set = set(end_candidates[: max(3, min(8, len(end_candidates)))])
+
+            best_score = {index: -np.inf for index in component}
+            previous = {index: None for index in component}
+            path_length = {index: 1 for index in component}
+            for start in start_candidates:
+                start_purity = max(0, out_degree.get(start, 0) - in_degree.get(start, 0))
+                best_score[start] = max(best_score[start], float(start_purity + out_degree.get(start, 0)))
+
+            for source in sorted_nodes:
+                if not np.isfinite(best_score.get(source, -np.inf)):
+                    continue
+                source_time = float(times_ms[local_index[source]])
+                for target, result in outgoing.get(source, []):
+                    if target not in local_index:
+                        continue
+                    target_time = float(times_ms[local_index[target]])
+                    if target_time <= source_time:
+                        continue
+                    score = best_score[source] + edge_score(result) + node_score(target)
+                    if score > best_score.get(target, -np.inf):
+                        best_score[target] = float(score)
+                        previous[target] = source
+                        path_length[target] = path_length[source] + 1
+
+            viable_ends = [
+                index
+                for index in end_candidate_set
+                if np.isfinite(best_score.get(index, -np.inf)) and path_length.get(index, 0) >= 3
+            ]
+            if not viable_ends:
+                viable_ends = [
+                    index
+                    for index in component
+                    if in_degree.get(index, 0) > out_degree.get(index, 0)
+                    and np.isfinite(best_score.get(index, -np.inf))
+                    and path_length.get(index, 0) >= 3
+                ]
+            if not viable_ends:
+                continue
+            end = max(
+                viable_ends,
+                key=lambda index: (
+                    best_score[index],
+                    in_degree.get(index, 0) - out_degree.get(index, 0),
+                    float(times_ms[local_index[index]]),
+                ),
+            )
+            path_nodes = []
+            current = end
+            while current is not None:
+                path_nodes.append(int(current))
+                current = previous.get(current)
+            path_nodes.reverse()
+            if len(path_nodes) < 3:
+                continue
+            path_edges = list(zip(path_nodes[:-1], path_nodes[1:]))
+            paths.append(
+                {
+                    "component": component,
+                    "layers": [[index] for index in path_nodes],
+                    "times_ms": {component[pos]: float(times_ms[pos]) for pos in range(len(component))},
+                    "edges": path_edges,
+                    "pair_lookup": pair_lookup,
+                }
+            )
+        return paths
+
+    def _draw_channel_map(self):
+        figure = self.map_canvas.figure
+        if hasattr(figure, "set_layout_engine"):
+            figure.set_layout_engine(None)
+        else:
+            figure.set_tight_layout(False)
+        figure.clear()
+        figure.patch.set_facecolor("#ffffff")
+        figure.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+        ax = figure.add_axes([0.0, 0.0, 1.0, 1.0])
+        ax.set_facecolor("#ffffff")
+        self._map_ax = ax
+        if not self.position_lookup:
+            ax.text(0.5, 0.5, "No channel map coordinates available", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.map_canvas.draw_idle()
+            return
+
+        components = self._delay_connected_components()
+        component_colors = self._component_colors(components)
+        subset_indices = set(component_colors)
+        propagation_paths = self._propagation_paths(components)
+        peak_times = self._first_spike_peak_times_by_channel()
+        peak_values = np.asarray(list(peak_times.values()), dtype=float) if peak_times else np.array([], dtype=float)
+        finite_peak_values = peak_values[np.isfinite(peak_values)]
+        peak_low = float(np.nanmin(finite_peak_values)) if finite_peak_values.size else 0.0
+        peak_high = float(np.nanmax(finite_peak_values)) if finite_peak_values.size else 0.0
+        peak_rank_fraction = {}
+        if peak_times:
+            sorted_peak_items = sorted(peak_times.items(), key=lambda item: (float(item[1]), self._channel_index_sort_key(item[0])))
+            denominator = max(1, len(sorted_peak_items) - 1)
+            for rank, (channel_index, _value) in enumerate(sorted_peak_items):
+                peak_rank_fraction[int(channel_index)] = float(rank) / float(denominator)
+
+        if self._map_background_xy.size:
+            ax.scatter(
+                self._map_background_xy[:, 0],
+                self._map_background_xy[:, 1],
+                s=3,
+                color="#e5e7eb",
+                alpha=0.9,
+                linewidths=0,
+                zorder=1,
+                rasterized=True,
+            )
+        if self._map_recorded_xy.size:
+            ax.scatter(
+                self._map_recorded_xy[:, 0],
+                self._map_recorded_xy[:, 1],
+                s=7,
+                color="#cbd5e1",
+                alpha=0.85,
+                linewidths=0,
+                zorder=2,
+                rasterized=True,
+            )
+        if self._map_channel_xy.size:
+            point_colors = []
+            point_sizes = []
+            for channel_index in self._map_channel_indices:
+                channel_index = int(channel_index)
+                if channel_index in peak_times:
+                    rank_fraction = peak_rank_fraction.get(channel_index)
+                    if rank_fraction is None:
+                        point_colors.append(self._first_spike_peak_color(peak_times[channel_index], peak_low, peak_high))
+                    else:
+                        point_colors.append(self._first_spike_peak_color(rank_fraction, 0.0, 1.0))
+                else:
+                    point_colors.append("#64748b")
+                point_sizes.append(120 if channel_index in subset_indices else 78)
+            ax.scatter(
+                self._map_channel_xy[:, 0],
+                self._map_channel_xy[:, 1],
+                s=point_sizes,
+                color=point_colors,
+                edgecolors="#ffffff",
+                marker="s",
+                linewidths=0.8,
+                alpha=0.96,
+                zorder=3.2,
+                rasterized=True,
+            )
+        selected_pair = self._selected_pair_result()
+        selected_key = None
+        if selected_pair is not None:
+            selected_key = (int(selected_pair["reference_index"]), int(selected_pair["target_index"]))
+
+        highlight_index = int(self._highlight_channel_index)
+        for path_index, path in enumerate(propagation_paths):
+            path_color = "#475569"
+            for source, target in path.get("edges", []):
+                if selected_key == (int(source), int(target)):
+                    continue
+                is_highlighted = highlight_index in {int(source), int(target)}
+                source_pos = _position_for_channel(self.channels[int(source)], self.position_lookup)
+                target_pos = _position_for_channel(self.channels[int(target)], self.position_lookup)
+                if source_pos is None or target_pos is None:
+                    continue
+                ax.plot(
+                    [float(source_pos[0]), float(target_pos[0])],
+                    [float(source_pos[1]), float(target_pos[1])],
+                    color="#111827",
+                    linewidth=5.4 if is_highlighted else 4.0,
+                    alpha=0.18 if is_highlighted else 0.06,
+                    solid_capstyle="round",
+                    zorder=4.5,
+                )
+                ax.annotate(
+                    "",
+                    xy=(float(target_pos[0]), float(target_pos[1])),
+                    xytext=(float(source_pos[0]), float(source_pos[1])),
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "color": "#d97706" if is_highlighted else path_color,
+                        "lw": 3.0 if is_highlighted else 1.55,
+                        "alpha": 0.96 if is_highlighted else 0.38,
+                        "shrinkA": 8,
+                        "shrinkB": 8,
+                        "mutation_scale": 16 if is_highlighted else 10,
+                    },
+                    zorder=6.5 if is_highlighted else 4.8,
+                )
+
+        for reference_index, target_index, result in self._significant_pair_records():
+            ref_pos = _position_for_channel(result["reference"], self.position_lookup)
+            target_pos = _position_for_channel(result["target"], self.position_lookup)
+            if ref_pos is None or target_pos is None:
+                continue
+            is_selected = selected_key == (reference_index, target_index)
+            is_highlighted = highlight_index in {int(reference_index), int(target_index)}
+            ax.annotate(
+                "",
+                xy=(float(target_pos[0]), float(target_pos[1])),
+                xytext=(float(ref_pos[0]), float(ref_pos[1])),
+                arrowprops={
+                    "arrowstyle": "->",
+                    "color": "#f97316" if is_selected else "#d97706" if is_highlighted else "#475569",
+                    "lw": 3.0 if is_selected else 2.4 if is_highlighted else 1.1,
+                    "alpha": 0.95 if is_selected or is_highlighted else 0.28,
+                    "shrinkA": 5,
+                    "shrinkB": 5,
+                    "mutation_scale": 12 if is_selected or is_highlighted else 7,
+                },
+                zorder=7 if is_selected or is_highlighted else 4,
+            )
+
+        for component_index, component in enumerate(components):
+            points = []
+            for channel_index in component:
+                if 0 <= channel_index < len(self.channels):
+                    position = _position_for_channel(self.channels[channel_index], self.position_lookup)
+                    if position is not None:
+                        points.append((float(position[0]), float(position[1])))
+            if not points:
+                continue
+            xy = np.asarray(points, dtype=float)
+            ax.scatter(
+                xy[:, 0],
+                xy[:, 1],
+                s=140,
+                facecolors="none",
+                edgecolors="#64748b",
+                linewidths=0.9,
+                alpha=0.32,
+                zorder=6,
+            )
+            centroid = np.mean(xy, axis=0)
+            ax.text(
+                float(centroid[0]),
+                float(centroid[1]),
+                str(component_index + 1),
+                color="#111827",
+                fontsize=7,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                zorder=8,
+            )
+
+        for path_index, path in enumerate(propagation_paths):
+            for layer_number, layer in enumerate(path.get("layers", []), start=1):
+                positions = self._channel_position_array([int(index) for index in layer])
+                if positions.size == 0 or not np.all(np.isfinite(positions)):
+                    continue
+                centroid = np.mean(positions, axis=0)
+                ax.text(
+                    float(centroid[0]),
+                    float(centroid[1]) - 0.018,
+                    f"P{path_index + 1}.{layer_number}",
+                    color="#334155",
+                    fontsize=6.5,
+                    fontweight="bold",
+                    ha="center",
+                    va="bottom",
+                    zorder=10,
+                    bbox={"boxstyle": "round,pad=0.10", "facecolor": "#ffffff", "edgecolor": "#94a3b8", "alpha": 0.82},
+                )
+
+        delay_note = f"{len(components)} sets; {len(propagation_paths)} paths"
+        if finite_peak_values.size:
+            delay_note += f"\nfirst-spike peak color: {peak_low:.1f}-{peak_high:.1f} ms"
+        selected_pair = self._selected_pair_result()
+        if selected_pair is None:
+            if self._manual_pair_active or self.manual_pair_check.isChecked():
+                source_label = (
+                    self.channels[self._manual_reference_index]
+                    if 0 <= self._manual_reference_index < len(self.channels)
+                    else "None"
+                )
+                target_label = (
+                    self.channels[self._manual_target_index]
+                    if 0 <= self._manual_target_index < len(self.channels)
+                    else "None"
+                )
+                delay_note += f"\nmanual source: {source_label}; target: {target_label}"
+            else:
+                delay_note += "\nSelect source, then target"
+        else:
+            ref_pos = _position_for_channel(selected_pair["reference"], self.position_lookup)
+            target_pos = _position_for_channel(selected_pair["target"], self.position_lookup)
+            if ref_pos is None or target_pos is None:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Selected pair is not present in the channel map",
+                    ha="center",
+                    va="center",
+                    color="#334155",
+                    transform=ax.transAxes,
+                )
+            else:
+                rx, ry = float(ref_pos[0]), float(ref_pos[1])
+                tx, ty = float(target_pos[0]), float(target_pos[1])
+                delay = float(selected_pair.get("delay_ms", 0.0))
+                pair_prefix = "manual" if selected_pair.get("manual") else "selected"
+                delay_note += f"\n{pair_prefix}: {selected_pair['reference']} -> {selected_pair['target']} ({delay:.2f} ms)"
+                ax.scatter([rx], [ry], s=64, color="#16a34a", edgecolors="#111827", linewidths=1.0, zorder=9)
+                ax.scatter([tx], [ty], s=72, color="#dc2626", edgecolors="#111827", linewidths=1.0, zorder=9)
+
+        ax.set_xlim(-0.015, 1.015)
+        ax.set_ylim(1.015, -0.015)
+        ax.set_aspect("auto")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.text(
+            0.01,
+            0.99,
+            delay_note,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=6.5,
+            color="#334155",
+            bbox={"boxstyle": "round,pad=0.10", "facecolor": "#ffffff", "edgecolor": "#cbd5e1", "alpha": 0.88},
+        )
+        self.map_canvas.draw_idle()
+
+    def _waveforms_for_channel(self, channel: str) -> np.ndarray:
+        channel_text = str(channel)
+        chunks = []
+        for label, waveforms in self.waveform_series.items():
+            label_text = str(label)
+            if label_text != channel_text and _base_channel_from_raster_label(label_text) != channel_text:
+                continue
+            array = np.asarray(waveforms, dtype=float)
+            if array.ndim == 1:
+                array = array.reshape(1, -1)
+            if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
+                continue
+            finite_rows = np.any(np.isfinite(array), axis=1)
+            array = array[finite_rows]
+            if array.size:
+                chunks.append(array)
+        if not chunks:
+            return np.zeros((0, 0), dtype=float)
+        width = min(chunk.shape[1] for chunk in chunks)
+        if width <= 0:
+            return np.zeros((0, 0), dtype=float)
+        return np.vstack([chunk[:, :width] for chunk in chunks])
+
+    def _waveform_display_subset(self, waveforms: np.ndarray, max_traces: int = 120) -> np.ndarray:
+        array = np.asarray(waveforms, dtype=float)
+        if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
+            return np.zeros((0, 0), dtype=float)
+        finite_rows = np.any(np.isfinite(array), axis=1)
+        array = array[finite_rows]
+        if array.shape[0] > max_traces:
+            array = array[_display_indices(array.shape[0], max_traces)]
+        return array
+
+    def _draw_waveform_axis(
+        self,
+        ax,
+        channel: str,
+        role: str,
+        waveforms: np.ndarray,
+        color: str,
+        mean_color: str,
+        ylim: tuple[float, float] | None,
+    ) -> None:
+        ax.set_title(f"{role}: {channel}")
+        ax.set_xlabel("Time (ms)" if self.sampling_rate else "Sample")
+        ax.set_ylabel("Amplitude")
+        if waveforms.size == 0:
+            ax.text(0.5, 0.5, "No waveform data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return
+
+        x = _waveform_time_axis(waveforms.shape[1], self.sampling_rate)
+        for waveform in waveforms:
+            ax.plot(x, waveform, color=color, linewidth=0.65, alpha=0.16)
+        ax.plot(x, np.nanmean(waveforms, axis=0), color=mean_color, linewidth=2.0, label="mean")
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.text(
+            0.98,
+            0.95,
+            f"n={waveforms.shape[0]}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            bbox={"boxstyle": "round,pad=0.18", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.85},
+        )
+        ax.legend(loc="best", fontsize=8)
+
+    def _draw_waveforms(self):
+        figure = self.waveform_canvas.figure
+        figure.clear()
+        selected_pair = self._selected_pair_result()
+        if selected_pair is None:
+            ax = figure.add_subplot(111)
+            ax.text(0.5, 0.5, "Select source, then target", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.waveform_canvas.draw_idle()
+            return
+
+        source = str(selected_pair.get("reference", ""))
+        target = str(selected_pair.get("target", ""))
+        source_waveforms = self._waveform_display_subset(self._waveforms_for_channel(source))
+        target_waveforms = self._waveform_display_subset(self._waveforms_for_channel(target))
+        visible = [values.reshape(-1) for values in (source_waveforms, target_waveforms) if values.size]
+        ylim = None
+        if visible:
+            samples = np.concatenate(visible)
+            samples = samples[np.isfinite(samples)]
+            if samples.size:
+                ymin, ymax = np.nanpercentile(samples, [1, 99])
+                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
+                    ymin = float(np.nanmin(samples))
+                    ymax = float(np.nanmax(samples))
+                if ymin == ymax:
+                    ymin -= 1.0
+                    ymax += 1.0
+                pad = (float(ymax) - float(ymin)) * 0.08
+                ylim = (float(ymin) - pad, float(ymax) + pad)
+
+        axes = figure.subplots(1, 2, squeeze=False)[0]
+        self._draw_waveform_axis(axes[0], source, "Source", source_waveforms, "#16a34a", "#15803d", ylim)
+        self._draw_waveform_axis(axes[1], target, "Target", target_waveforms, "#dc2626", "#991b1b", ylim)
+        self.waveform_canvas.draw_idle()
+
+    def _delay_raster_points(self, selected_pair: dict | None):
+        if selected_pair is None:
+            return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
+        reference_index = int(selected_pair["reference_index"])
+        target_index = int(selected_pair["target_index"])
+        max_lag = max(1.0, float(self.max_lag_ms.value()))
+
+        if self.delay_mode == "burst_first":
+            if self.first_times.ndim != 2 or self.first_times.shape[0] == 0:
+                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
+            if reference_index >= self.first_times.shape[1] or target_index >= self.first_times.shape[1]:
+                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
+
+            source_ms = np.asarray(self.first_times[:, reference_index], dtype=float) * 1000.0
+            target_ms = np.asarray(self.first_times[:, target_index], dtype=float) * 1000.0
+            delay_ms = target_ms - source_ms
+            min_lag = max(0.0, float(self.min_lag_ms.value()))
+            valid = np.isfinite(source_ms) & np.isfinite(target_ms) & (np.abs(delay_ms) >= min_lag) & (np.abs(delay_ms) <= max_lag)
+            rows = np.flatnonzero(valid).astype(int)
+            if not rows.size:
+                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
+            source_x = source_ms[rows]
+            target_x = target_ms[rows]
+        else:
+            matches = self._selected_pair_delay_matches(selected_pair)
+            if matches.size == 0:
+                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
+            if self.delay_mode == "burst_all":
+                rows = matches[:, 2].astype(int, copy=False)
+                starts = np.asarray(
+                    [self.intervals[row][0] if 0 <= row < len(self.intervals) else matches[index, 0] for index, row in enumerate(rows)],
+                    dtype=float,
+                )
+                source_x = (matches[:, 0] - starts) * 1000.0
+                target_x = (matches[:, 1] - starts) * 1000.0
+            else:
+                rows = np.arange(matches.shape[0], dtype=int)
+                finite_starts = [
+                    float(train[0])
+                    for train in self.channel_trains
+                    if np.asarray(train, dtype=float).size and np.isfinite(np.asarray(train, dtype=float)[0])
+                ]
+                baseline = min(finite_starts) if finite_starts else float(matches[0, 0])
+                source_x = (matches[:, 0] - baseline) * 1000.0
+                target_x = (matches[:, 1] - baseline) * 1000.0
+
+        anchor_ms = 0.0
+        if self.raster_align_combo.currentData() == "source":
+            anchor_ms = max(5.0, min(50.0, max_lag * 0.2))
+            target_x = anchor_ms + (target_x - source_x)
+            source_x = np.full_like(target_x, anchor_ms, dtype=float)
+        return source_x.astype(float), target_x.astype(float), rows.astype(int), float(anchor_ms)
+
+    def _delay_raster_xlim(self, anchor_ms: float) -> tuple[float, float, str]:
+        max_lag = max(1.0, float(self.max_lag_ms.value()))
+        burst_window_ms = max(0.0, float(self.burst_window_ms.value())) if self.delay_mode != "all_spikes" else 0.0
+        if self.raster_align_combo.currentData() == "source":
+            span_ms = min(max_lag, burst_window_ms) if burst_window_ms > 0 else max_lag
+            return float(anchor_ms - span_ms), float(anchor_ms + span_ms), "Time (ms, source anchored)"
+        if self.delay_mode == "all_spikes":
+            starts = []
+            stops = []
+            for train in self.channel_trains:
+                values = np.asarray(train, dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size:
+                    starts.append(float(values[0]))
+                    stops.append(float(values[-1]))
+            if starts and stops:
+                duration_ms = max(1.0, (max(stops) - min(starts)) * 1000.0)
+            else:
+                duration_ms = max_lag
+            return 0.0, float(duration_ms), "Time from recording start (ms)"
+        if burst_window_ms > 0:
+            return 0.0, float(max(1.0, burst_window_ms)), f"Time from burst onset, first {burst_window_ms:g} ms"
+        burst_duration_ms = max(
+            [float(stop - start) * 1000.0 for start, stop in self.intervals if float(stop) > float(start)] or [max_lag]
+        )
+        return 0.0, float(max(max_lag, burst_duration_ms)), "Time from burst onset (ms)"
+
+    def _channel_first_spike_times_ms(self, channel_index: int) -> np.ndarray:
+        if channel_index < 0 or channel_index >= len(self.channels):
+            return np.array([], dtype=float)
+        if not self.intervals:
+            return np.array([], dtype=float)
+        if (
+            self.delay_mode == "burst_first"
+            and self.first_times.ndim == 2
+            and self.first_times.shape[0] == len(self.intervals)
+            and channel_index < self.first_times.shape[1]
+        ):
+            values_ms = np.asarray(self.first_times[:, channel_index], dtype=float) * 1000.0
+            return values_ms[np.isfinite(values_ms)]
+        if channel_index >= len(self.channel_trains):
+            return np.array([], dtype=float)
+        train = np.asarray(self.channel_trains[channel_index], dtype=float)
+        train = np.sort(train[np.isfinite(train)])
+        if train.size == 0:
+            return np.array([], dtype=float)
+        values = []
+        for start_s, stop_s in self.intervals:
+            lo = int(np.searchsorted(train, float(start_s), side="left"))
+            if lo < train.size and train[lo] <= float(stop_s):
+                values.append((float(train[lo]) - float(start_s)) * 1000.0)
+        return np.asarray(values, dtype=float)
+
+    def _first_spike_probability_fit(self, channel_index: int, left_ms: float, right_ms: float) -> dict | None:
+        burst_count = len(self.intervals)
+        if burst_count <= 0:
+            return None
+        left_ms = max(0.0, float(left_ms))
+        right_ms = max(left_ms + 1.0, float(right_ms))
+        bin_ms = max(0.5, float(self.bin_ms.value()))
+        edges = np.arange(left_ms, right_ms + bin_ms * 0.5, bin_ms, dtype=float)
+        if edges.size < 2 or edges[-1] < right_ms:
+            edges = np.append(edges, right_ms)
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        first_spikes = self._channel_first_spike_times_ms(channel_index)
+        first_spikes = first_spikes[(first_spikes >= left_ms) & (first_spikes <= right_ms)]
+        counts, _ = np.histogram(first_spikes, bins=edges)
+        counts = counts.astype(float, copy=False)
+        sigma_bins = max(0.75, min(4.0, 5.0 / bin_ms))
+        fitted_counts = gaussian_filter(counts, sigma=sigma_bins, mode="nearest", truncate=3.0)
+        probability = np.clip(fitted_counts / float(burst_count), 0.0, 1.0)
+        count_se = np.sqrt(np.maximum(fitted_counts, 1e-9))
+        lower = np.clip((fitted_counts - 1.96 * count_se) / float(burst_count), 0.0, 1.0)
+        upper = np.clip((fitted_counts + 1.96 * count_se) / float(burst_count), 0.0, 1.0)
+        observed = counts / float(burst_count)
+        return {
+            "centers_ms": centers,
+            "observed_probability": observed,
+            "fit_probability": probability,
+            "lower_probability": lower,
+            "upper_probability": upper,
+            "burst_count": int(burst_count),
+            "spike_count": int(first_spikes.size),
+        }
+
+    def _draw_first_spike_probability_overlay(self, ax, selected_pair: dict, left_ms: float, right_ms: float):
+        if self.delay_mode == "all_spikes" or self.raster_align_combo.currentData() == "source":
+            return None
+        try:
+            source_index = int(selected_pair["reference_index"])
+            target_index = int(selected_pair["target_index"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        source_fit = self._first_spike_probability_fit(source_index, left_ms, right_ms)
+        target_fit = self._first_spike_probability_fit(target_index, left_ms, right_ms)
+        fits = [
+            ("source", source_fit, "#16a34a", "#86efac"),
+            ("target", target_fit, "#dc2626", "#fecaca"),
+        ]
+        if not any(fit is not None and fit["centers_ms"].size for _role, fit, _line, _fill in fits):
+            return None
+        prob_ax = ax.twinx()
+        max_probability = 0.0
+        for role, fit, line_color, fill_color in fits:
+            if fit is None or not fit["centers_ms"].size:
+                continue
+            x = fit["centers_ms"]
+            y = fit["fit_probability"]
+            lower = fit["lower_probability"]
+            upper = fit["upper_probability"]
+            observed = fit["observed_probability"]
+            max_probability = max(max_probability, float(np.nanmax(upper)) if upper.size else 0.0)
+            prob_ax.fill_between(x, lower, upper, color=fill_color, alpha=0.20, linewidth=0)
+            prob_ax.plot(x, y, color=line_color, linewidth=1.8, linestyle="-", label=f"{role} Poisson fit")
+            prob_ax.scatter(x, observed, s=10, color=line_color, alpha=0.35, linewidths=0)
+        prob_ax.set_ylabel("First-spike probability")
+        prob_ax.set_ylim(0.0, min(1.0, max(0.05, max_probability * 1.15)))
+        prob_ax.tick_params(axis="y", labelsize=8, colors="#475569")
+        prob_ax.spines["right"].set_color("#94a3b8")
+        return prob_ax
+
+    def _draw_delay_raster(self):
+        figure = self.delay_raster_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        selected_pair = self._selected_pair_result()
+        source_x, target_x, burst_rows, anchor_ms = self._delay_raster_points(selected_pair)
+        if selected_pair is None:
+            ax.text(0.5, 0.5, "Select source, then target", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.delay_raster_canvas.draw_idle()
+            return
+        if not burst_rows.size:
+            ax.text(0.5, 0.5, "No source/target spike matches", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.delay_raster_canvas.draw_idle()
+            return
+
+        ax.scatter(source_x, burst_rows + 1, s=14, color="#16a34a", label="source", alpha=0.88)
+        ax.scatter(target_x, burst_rows + 1, s=14, color="#dc2626", label="target", alpha=0.88)
+        for sx, tx, row in zip(source_x, target_x, burst_rows):
+            ax.plot([sx, tx], [row + 1, row + 1], color="#94a3b8", linewidth=0.65, alpha=0.42)
+        left, right, xlabel = self._delay_raster_xlim(anchor_ms)
+        if self.raster_align_combo.currentData() == "source":
+            ax.axvline(anchor_ms, color="#16a34a", linewidth=1.0, linestyle="--", alpha=0.75)
+
+        ax.set_xlim(left, right)
+        ax.set_ylim(max(0.5, burst_rows.min() + 0.5), burst_rows.max() + 1.5)
+        ax.invert_yaxis()
+        ax.set_title(f"{self._delay_mode_label()} raster")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Event" if self.delay_mode == "all_spikes" else "Burst")
+        prob_ax = self._draw_first_spike_probability_overlay(ax, selected_pair, left, right)
+        handles, labels = ax.get_legend_handles_labels()
+        if prob_ax is not None:
+            probability_handles, probability_labels = prob_ax.get_legend_handles_labels()
+            handles.extend(probability_handles)
+            labels.extend(probability_labels)
+        if handles:
+            ax.legend(handles, labels, loc="best", fontsize=7)
+        self.delay_raster_canvas.draw_idle()
+
+    def _draw_histogram(self):
+        figure = self.hist_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        if len(self.channels) < 2:
+            ax.text(0.5, 0.5, "No burst delay data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.hist_canvas.draw_idle()
+            return
+
+        max_lag = max(1.0, float(self.max_lag_ms.value()))
+        selected_pair = self._selected_pair_result()
+        if selected_pair is None:
+            values = np.array([], dtype=float)
+            title = f"Selected-pair {self._delay_mode_label().lower()} distribution"
+        else:
+            values = self._selected_pair_delay_values(selected_pair)
+            title = f"{selected_pair['reference']} -> {selected_pair['target']} {self._delay_mode_label().lower()}"
+
+        if values.size == 0:
+            message = "No matched spikes for selected pair" if selected_pair and selected_pair.get("manual") else "No matched bursts for selected significant pair"
+            ax.text(0.5, 0.5, message, ha="center", va="center")
+            ax.set_xlim((-max_lag, max_lag) if self.delay_mode == "burst_first" else (0.0, max_lag))
+        else:
+            bin_ms = max(0.1, float(self.bin_ms.value()))
+            start = -max_lag if self.delay_mode == "burst_first" else 0.0
+            bins = np.arange(start, max_lag + bin_ms * 1.5, bin_ms)
+            ax.hist(values, bins=bins, color="#2563eb", alpha=0.78, edgecolor="#1e3a8a")
+            mean_delay = float(selected_pair.get("delay_ms", np.mean(values)))
+            ax.axvline(0.0, color="#475569", linewidth=1.0)
+            ax.axvline(mean_delay, color="#dc2626", linewidth=1.5, linestyle="--", label=f"5-bin mean {mean_delay:.2f} ms")
+            ax.legend(loc="best", fontsize=8)
+            ax.text(
+                0.98,
+                0.96,
+                f"n={values.size}\n5-bin mean={mean_delay:.2f} ms",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Delay (ms)")
+        ax.set_ylabel("Count")
+        ax.set_xlim((-max_lag, max_lag) if self.delay_mode == "burst_first" else (0.0, max_lag))
+        self.hist_canvas.draw_idle()
 
 class BurstClusteringWindow(QDialog):
     def __init__(self, spike_series, burst_intervals, parent=None):
@@ -4352,6 +8469,66 @@ class BurstCorrelationWindow(QDialog):
         }
 
 
+class HeatmapGifExportDialog(QDialog):
+    def __init__(self, min_time: float, max_time: float, frame_step_ms: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Heatmap GIF")
+        self.min_time = float(min_time)
+        self.max_time = float(max_time)
+
+        lower = min(self.min_time, self.max_time)
+        upper = max(self.min_time, self.max_time)
+        if upper <= lower:
+            upper = lower + 1.0
+
+        self.start_s = QDoubleSpinBox()
+        self.start_s.setRange(lower, upper)
+        self.start_s.setDecimals(3)
+        self.start_s.setSingleStep(0.1)
+        self.start_s.setValue(lower)
+        self.start_s.setSuffix(" s")
+
+        self.end_s = QDoubleSpinBox()
+        self.end_s.setRange(lower, upper)
+        self.end_s.setDecimals(3)
+        self.end_s.setSingleStep(0.1)
+        self.end_s.setValue(upper)
+        self.end_s.setSuffix(" s")
+
+        self.frame_step_ms = QSpinBox()
+        self.frame_step_ms.setRange(10, 60000)
+        self.frame_step_ms.setSingleStep(10)
+        self.frame_step_ms.setValue(max(10, int(frame_step_ms)))
+        self.frame_step_ms.setSuffix(" ms")
+
+        export_button = QPushButton("Export")
+        export_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        form = QFormLayout()
+        form.addRow("Start time", self.start_s)
+        form.addRow("End time", self.end_s)
+        form.addRow("Frame step", self.frame_step_ms)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(export_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(buttons)
+        _fix_spinbox_hit_targets(self)
+
+    def values(self) -> tuple[float, float, int]:
+        start = float(self.start_s.value())
+        end = float(self.end_s.value())
+        if end < start:
+            start, end = end, start
+        return start, end, int(self.frame_step_ms.value())
+
+
 class SpikeRasterWindow(QDialog):
     def __init__(
         self,
@@ -4367,10 +8544,12 @@ class SpikeRasterWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1280, 820)
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self.raw_spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self.spike_series = [(label, times.copy()) for label, times in self.raw_spike_series]
         self.spike_lookup = {label: times for label, times in self.spike_series}
         self._count_series = [(_base_channel_from_raster_label(label), times) for label, times in self.spike_series]
-        self.waveform_series = waveform_series or {}
+        self.raw_waveform_series = {label: np.asarray(values) for label, values in (waveform_series or {}).items()}
+        self.waveform_series = dict(self.raw_waveform_series)
         self.sampling_rate = sampling_rate
         self.channel_map = channel_map
         self.analysis_windows = []
@@ -4384,7 +8563,7 @@ class SpikeRasterWindow(QDialog):
         self.stim_times = np.asarray(stim_times if stim_times is not None else [], dtype=float)
         self.stim_times = self.stim_times[np.isfinite(self.stim_times)]
         self.stim_times.sort()
-        all_times = [times for _, times in self.spike_series if times.size]
+        all_times = [times for _, times in self.raw_spike_series if times.size]
         if self.stim_times.size:
             all_times.append(self.stim_times)
         if all_times:
@@ -4431,10 +8610,25 @@ class SpikeRasterWindow(QDialog):
         self.isi_button.clicked.connect(self._open_isi_window)
         self.burst_corr_button = QPushButton("Burst Corr")
         self.burst_corr_button.clicked.connect(self._open_burst_correlation_window)
+        self.burst_delay_button = QPushButton("Burst Delay")
+        self.burst_delay_button.clicked.connect(self._open_burst_delay_window)
         self.burst_cluster_button = QPushButton("Burst Cluster")
         self.burst_cluster_button.clicked.connect(self._open_burst_clustering_window)
         self.save_bursts_button = QPushButton("Save Bursts")
         self.save_bursts_button.clicked.connect(self._save_bursts)
+        self.export_heatmap_gif_button = QPushButton("Export GIF")
+        self.export_heatmap_gif_button.clicked.connect(self._export_heatmap_gif)
+        self.raster_action_combo = QComboBox()
+        self.raster_action_combo.addItem("Choose action...", "")
+        self.raster_action_combo.addItem("IBI", "ibi")
+        self.raster_action_combo.addItem("ISI", "isi")
+        self.raster_action_combo.addItem("Burst correlation", "burst_corr")
+        self.raster_action_combo.addItem("Burst delay", "burst_delay")
+        self.raster_action_combo.addItem("Burst clustering", "burst_cluster")
+        self.raster_action_combo.addItem("Save bursts", "save_bursts")
+        self.raster_action_combo.addItem("Export heatmap GIF", "export_heatmap_gif")
+        self.raster_action_combo.setMinimumWidth(170)
+        self.raster_action_combo.activated.connect(self._raster_action_selected)
 
         self.window_grids = QSpinBox()
         self.window_grids.setRange(1, 500)
@@ -4490,6 +8684,20 @@ class SpikeRasterWindow(QDialog):
         self.burst_min_spikes.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.burst_min_spikes.setCursor(Qt.CursorShape.ArrowCursor)
         self.burst_min_spikes.valueChanged.connect(self._refresh_bursts)
+
+        self.hide_stim_tail = QCheckBox("Hide stim tail")
+        self.hide_stim_tail.setEnabled(self.stim_times.size > 0)
+        self.hide_stim_tail.stateChanged.connect(self._apply_stim_tail_filter)
+        self.stim_tail_ms = QDoubleSpinBox()
+        self.stim_tail_ms.setRange(0.1, 1000.0)
+        self.stim_tail_ms.setDecimals(1)
+        self.stim_tail_ms.setSingleStep(0.5)
+        self.stim_tail_ms.setValue(1.0)
+        self.stim_tail_ms.setFixedWidth(58)
+        self.stim_tail_ms.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self.stim_tail_ms.setCursor(Qt.CursorShape.ArrowCursor)
+        self.stim_tail_ms.setEnabled(self.stim_times.size > 0)
+        self.stim_tail_ms.valueChanged.connect(self._apply_stim_tail_filter)
 
         self.visible_rows = QSpinBox()
         self.visible_rows.setRange(1, max(1, len(self.spike_series)))
@@ -4548,6 +8756,9 @@ class SpikeRasterWindow(QDialog):
         parameter_controls.addWidget(QLabel("Heatmap"))
         parameter_controls.addWidget(self.heatmap_ms)
         parameter_controls.addWidget(QLabel("ms"))
+        parameter_controls.addWidget(self.hide_stim_tail)
+        parameter_controls.addWidget(self.stim_tail_ms)
+        parameter_controls.addWidget(QLabel("ms"))
         parameter_controls.addWidget(QLabel("Burst bin"))
         parameter_controls.addWidget(self.burst_bin_ms)
         parameter_controls.addWidget(QLabel("ms"))
@@ -4566,12 +8777,8 @@ class SpikeRasterWindow(QDialog):
         parameter_controls.addWidget(QLabel("visible"))
         parameter_controls.addWidget(self.row_label)
         parameter_controls.addStretch(1)
-        parameter_controls.addWidget(QLabel("Analysis"))
-        parameter_controls.addWidget(self.ibi_button)
-        parameter_controls.addWidget(self.isi_button)
-        parameter_controls.addWidget(self.burst_corr_button)
-        parameter_controls.addWidget(self.burst_cluster_button)
-        parameter_controls.addWidget(self.save_bursts_button)
+        parameter_controls.addWidget(QLabel("Action"))
+        parameter_controls.addWidget(self.raster_action_combo)
 
         layout = QVBoxLayout(self)
         raster_area = QWidget()
@@ -4606,6 +8813,26 @@ class SpikeRasterWindow(QDialog):
 
     def _finish_progress(self, dialog: QProgressDialog | None) -> None:
         _close_progress_dialog(dialog)
+
+    def _raster_action_selected(self, index: int) -> None:
+        action = str(self.raster_action_combo.itemData(int(index)) or "")
+        if not action:
+            return
+        self.raster_action_combo.blockSignals(True)
+        self.raster_action_combo.setCurrentIndex(0)
+        self.raster_action_combo.blockSignals(False)
+        handlers = {
+            "ibi": self._open_ibi_window,
+            "isi": self._open_isi_window,
+            "burst_corr": self._open_burst_correlation_window,
+            "burst_delay": self._open_burst_delay_window,
+            "burst_cluster": self._open_burst_clustering_window,
+            "save_bursts": self._save_bursts,
+            "export_heatmap_gif": self._export_heatmap_gif,
+        }
+        handler = handlers.get(action)
+        if handler is not None:
+            handler()
 
     def _total_duration_ms(self) -> int:
         return max(1, int(np.ceil((self.max_time - self.min_time) * 1000)))
@@ -4676,6 +8903,50 @@ class SpikeRasterWindow(QDialog):
         else:
             self.row_label.setText("Rows 0 / 0")
 
+    def _apply_stim_tail_filter(self):
+        if not hasattr(self, "hide_stim_tail"):
+            return
+        previous_selected = self.selected_channel
+        if self.hide_stim_tail.isChecked() and self.stim_times.size:
+            filtered, masks, removed = _filter_spike_series_stim_tail(
+                self.raw_spike_series,
+                self.stim_times,
+                float(self.stim_tail_ms.value()),
+            )
+            self.spike_series = filtered
+            self.waveform_series = {}
+            for label, waveforms in self.raw_waveform_series.items():
+                mask = masks.get(str(label))
+                values = np.asarray(waveforms)
+                if mask is not None and values.ndim >= 2 and values.shape[0] == mask.size:
+                    self.waveform_series[label] = values[mask]
+                else:
+                    self.waveform_series[label] = values
+            suffix = f"stim tail hidden: {removed} spikes"
+        else:
+            self.spike_series = [(label, times.copy()) for label, times in self.raw_spike_series]
+            self.waveform_series = dict(self.raw_waveform_series)
+            suffix = "stim tail shown"
+
+        self.spike_lookup = {label: times for label, times in self.spike_series}
+        self._count_series = [(_base_channel_from_raster_label(label), times) for label, times in self.spike_series]
+        labels = [label for label, _ in self.spike_series]
+        if previous_selected in labels:
+            self.selected_channel = previous_selected
+        else:
+            self.selected_channel = _prefer_waveform_channel(self.spike_series, self.waveform_series)
+        self.canvas.set_spike_series(self.spike_series)
+        self.canvas.set_selected_channel(self.selected_channel)
+        self.rate_canvas.set_spike_series(self.spike_series)
+        self._heatmap_scale_cache.clear()
+        self._last_waveform_view = None
+        self._refresh_bursts()
+        self._refresh_heatmap_scale()
+        self._update_row_scroll_range()
+        self._update_view(force_heatmap=True)
+        self._refresh_waveforms_for_window(force=True)
+        self.summary_text = suffix if hasattr(self, "summary_text") else suffix
+
     def _slider_value_changed(self):
         if not self._internal_slider_update:
             if self._short_data_window():
@@ -4726,6 +8997,20 @@ class SpikeRasterWindow(QDialog):
         self._refresh_heatmap_scale()
         self._refresh_heatmap_for_view(force=True)
 
+    def _heatmap_gif_frame_times(self, start_s: float, end_s: float, frame_step_ms: int) -> np.ndarray:
+        start_s = max(float(self.min_time), float(start_s))
+        end_s = min(float(self.max_time), float(end_s))
+        step_s = max(0.01, float(frame_step_ms) / 1000.0)
+        if end_s < start_s:
+            start_s, end_s = end_s, start_s
+        if end_s <= start_s:
+            return np.asarray([start_s], dtype=float)
+        values = np.arange(start_s, end_s + step_s * 0.5, step_s, dtype=float)
+        values = values[values <= end_s + 1e-9]
+        if values.size == 0 or values[-1] < end_s:
+            values = np.append(values, end_s)
+        return values.astype(float, copy=False)
+
     def _refresh_heatmap_scale(self):
         heatmap_duration_s = max(0.001, self.heatmap_ms.value() / 1000.0)
         cache_key = round(float(heatmap_duration_s), 6)
@@ -4762,19 +9047,90 @@ class SpikeRasterWindow(QDialog):
         self._heatmap_scale_cache[cache_key] = self.heatmap_scale_count
         self.heatmap_canvas.set_scale_max_count(self.heatmap_scale_count)
 
+    def _export_heatmap_gif(self):
+        if self.channel_map is None:
+            QMessageBox.information(self, "Export Heatmap GIF", "Set a channel map before exporting a heatmap GIF.")
+            return False
+
+        dialog = HeatmapGifExportDialog(self.min_time, self.max_time, self.heatmap_ms.value(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        start_s, end_s, frame_step_ms = dialog.values()
+        frame_times = self._heatmap_gif_frame_times(start_s, end_s, frame_step_ms)
+        if frame_times.size == 0:
+            QMessageBox.information(self, "Export Heatmap GIF", "No frames are available for the selected time range.")
+            return False
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export firing-rate heatmap GIF",
+            str(Path("data") / "heatmap_activity.gif"),
+            "GIF image (*.gif);;All files (*)",
+        )
+        if not path:
+            return False
+        if Path(path).suffix.lower() != ".gif":
+            path = f"{path}.gif"
+
+        try:
+            from PIL import Image
+        except ImportError:
+            QMessageBox.critical(self, "Export Heatmap GIF failed", "Pillow is required to export animated GIF files.")
+            return False
+
+        self._refresh_heatmap_scale()
+        progress = self._start_progress("Export Heatmap GIF", "Rendering heatmap frames...", int(frame_times.size))
+        frames = []
+        heatmap_duration_s = max(0.001, self.heatmap_ms.value() / 1000.0)
+        selected_start_s = max(float(self.min_time), min(float(start_s), float(end_s)))
+        resolution = max(128, min(512, int(max(self.heatmap_canvas.width(), self.heatmap_canvas.height(), 320))))
+        try:
+            for frame_index, stop_s in enumerate(frame_times):
+                QApplication.processEvents()
+                if _progress_cancel_requested(progress):
+                    self._log("Heatmap GIF export cancelled")
+                    return False
+                window_start_s = max(selected_start_s, float(stop_s) - heatmap_duration_s)
+                counts = self._window_channel_counts(window_start_s, float(stop_s))
+                rgb = self.heatmap_canvas.render_counts_rgb(
+                    counts,
+                    resolution=resolution,
+                    scale_max_count=self.heatmap_scale_count,
+                )
+                frames.append(Image.fromarray(rgb, mode="RGB"))
+                _set_progress_dialog(progress, f"Rendering frame {frame_index + 1}/{frame_times.size}", frame_index + 1)
+
+            if not frames:
+                QMessageBox.information(self, "Export Heatmap GIF", "No frames were rendered for the selected time range.")
+                return False
+            frames[0].save(
+                path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=max(10, int(frame_step_ms)),
+                loop=0,
+                optimize=False,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Heatmap GIF failed", str(exc))
+            return False
+        finally:
+            self._finish_progress(progress)
+
+        QMessageBox.information(self, "Export Heatmap GIF", f"Saved heatmap GIF:\n{path}")
+        return True
+
     def _toggle_playback(self):
         if self.play_button.isChecked():
             total_ms = self._total_duration_ms()
             start_offset = self._window_start_offset_ms()
+            stop_offset = min(total_ms, self._window_stop_offset_ms())
             if self._playback_time_ms is None:
                 self._set_playback_time_ms(start_offset)
             elif self._playback_time_ms >= total_ms:
                 self._set_playback_time_ms(start_offset)
-                if self._short_data_window():
-                    self._set_slider_value_internal(self.slider.minimum())
-                elif self.slider.value() >= self.slider.maximum():
-                    self._set_slider_value_internal(self.slider.minimum())
-                    self._set_playback_time_ms(self._window_start_offset_ms())
+            elif not (start_offset <= int(self._playback_time_ms) < stop_offset):
+                self._set_playback_time_ms(start_offset)
             self.play_button.setText("Pause")
             self._update_view()
             self.play_timer.start()
@@ -4805,13 +9161,18 @@ class SpikeRasterWindow(QDialog):
 
         if self._short_data_window():
             self._set_slider_value_internal(min(self.slider.maximum(), int(self._playback_time_ms or 0)))
+            self._refresh_heatmap_for_view(force=True)
         else:
             window_stop = self._window_stop_offset_ms()
             if next_playhead > window_stop and self.slider.value() < self.slider.maximum():
-                target_start = min(self.slider.maximum(), max(self.slider.minimum(), next_playhead - self._window_ms()))
+                target_start = min(
+                    self.slider.maximum(),
+                    max(self.slider.minimum(), next_playhead - self._window_ms()),
+                )
                 self._set_slider_value_internal(target_start)
+                self._refresh_heatmap_for_view(force=True)
             else:
-                self._update_view()
+                self._update_view(force_heatmap=True)
 
         if next_playhead >= total_ms:
             self._stop_playback()
@@ -4870,6 +9231,23 @@ class SpikeRasterWindow(QDialog):
             window = BurstCorrelationWindow(self.spike_series, self.burst_intervals, self, self.channel_map)
         finally:
             self._finish_progress(progress)
+        return self._show_analysis_window(window)
+
+    def _open_burst_delay_window(self):
+        for window in list(self.analysis_windows):
+            if isinstance(window, BurstDelayWindow):
+                window.show()
+                window.raise_()
+                window.activateWindow()
+                return window
+        window = BurstDelayWindow(
+            self.spike_series,
+            self.burst_intervals,
+            self,
+            self.channel_map,
+            waveform_series=self.waveform_series,
+            sampling_rate=self.sampling_rate,
+        )
         return self._show_analysis_window(window)
 
     def _open_burst_clustering_window(self):
@@ -6415,10 +10793,13 @@ class MainWindow(QMainWindow):
         self.data_kind = ""
         self.raw_data = None
         self.result = None
-        self.channel_map = default_channel_map()
+        self.channel_map = _default_maxwell_channel_map() or default_channel_map()
         self.child_windows = []
         self.pipeline_progress = None
         self.active_load_worker = None
+        self.active_stimulus_worker = None
+        self.stimulus_response_dialog = None
+        self.stimulus_response_payload = None
 
         self._build_ui()
         self._build_menu()
@@ -6448,9 +10829,14 @@ class MainWindow(QMainWindow):
 
         self.open_button = QPushButton("Open Data")
         self.open_button.clicked.connect(self.open_data)
+        self.stimulus_response_button = QPushButton("Stimulus Response Analysis")
+        self.stimulus_response_button.clicked.connect(self.open_stimulus_response_analysis)
         self.preview_button = QPushButton("Raw Data Raster")
         self.preview_button.clicked.connect(self.preview_raw)
         self.preview_button.setEnabled(False)
+        self.save_spike_train_button = QPushButton("Save Spike Train")
+        self.save_spike_train_button.clicked.connect(self.save_spike_train)
+        self.save_spike_train_button.setEnabled(False)
         self.settings_button = QPushButton("Settings")
         self.settings_button.clicked.connect(self.open_settings)
         self.channel_map_button = QPushButton("Channel Map")
@@ -6469,8 +10855,10 @@ class MainWindow(QMainWindow):
         self.results_button.setEnabled(False)
 
         for button in [
+            self.stimulus_response_button,
             self.open_button,
             self.preview_button,
+            self.save_spike_train_button,
             self.settings_button,
             self.channel_map_button,
             self.sorting_button,
@@ -6515,6 +10903,10 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open Data", self)
         open_action.triggered.connect(self.open_data)
         file_menu.addAction(open_action)
+        self.save_spike_train_action = QAction("Save Spike Train", self)
+        self.save_spike_train_action.triggered.connect(self.save_spike_train)
+        self.save_spike_train_action.setEnabled(False)
+        file_menu.addAction(self.save_spike_train_action)
         file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -6536,6 +10928,9 @@ class MainWindow(QMainWindow):
         temporal_action = QAction("Temporal Coupling", self)
         temporal_action.triggered.connect(self.open_temporal_coupling)
         tools_menu.addAction(temporal_action)
+        stimulus_action = QAction("Stimulus Response Analysis", self)
+        stimulus_action.triggered.connect(self.open_stimulus_response_analysis)
+        tools_menu.addAction(stimulus_action)
 
     def _start_progress(self, title: str, message: str, maximum: int = 0) -> QProgressDialog:
         return _create_progress_dialog(self, title, message, maximum)
@@ -6545,6 +10940,127 @@ class MainWindow(QMainWindow):
 
     def _finish_progress(self, dialog: QProgressDialog | None) -> None:
         _close_progress_dialog(dialog)
+
+    def open_stimulus_response_analysis(self):
+        if self.active_stimulus_worker is not None:
+            QMessageBox.information(self, "Stimulus Response", "Stimulus response analysis is already running.")
+            return
+        dialog = self._stimulus_response_analysis_dialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _stimulus_response_analysis_dialog(self) -> StimulusResponseInputDialog:
+        if self.stimulus_response_dialog is None:
+            dialog = StimulusResponseInputDialog(self)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.accepted.connect(self._start_stimulus_response_from_dialog)
+            dialog.open_raster_button.clicked.connect(self._open_cached_stimulus_raster)
+            dialog.psth_button.clicked.connect(self._open_cached_stimulus_psth)
+            dialog.activation_curve_button.clicked.connect(self._open_cached_stimulus_activation_curve)
+            self.stimulus_response_dialog = dialog
+        return self.stimulus_response_dialog
+
+    def _start_stimulus_response_from_dialog(self):
+        if self.active_stimulus_worker is not None:
+            QMessageBox.information(self, "Stimulus Response", "Stimulus response analysis is already running.")
+            return
+        dialog = self._stimulus_response_analysis_dialog()
+        paths, pre_ms, response_ms, artifact_ms = dialog.values()
+        if not paths:
+            QMessageBox.information(self, "Stimulus Response", "Add at least one stimulus response file or folder.")
+            dialog.show()
+            return
+        self.pipeline_progress = self._start_progress("Stimulus response", "Starting stimulus response analysis...", 100)
+        worker = StimulusResponseWorker(paths, pre_ms=pre_ms, response_ms=response_ms, artifact_ms=artifact_ms)
+        self.pipeline_progress.canceled.connect(worker.cancel)
+        worker.signals.progress.connect(self._on_progress)
+        worker.signals.finished.connect(lambda payload, worker=worker: self._stimulus_response_finished(payload, worker))
+        worker.signals.failed.connect(lambda details, worker=worker: self._stimulus_response_failed(details, worker))
+        worker.signals.canceled.connect(lambda message, worker=worker: self._stimulus_response_canceled(message, worker))
+        self.active_stimulus_worker = worker
+        self.thread_pool.start(worker)
+
+    def _stimulus_response_finished(self, payload: dict, worker: StimulusResponseWorker):
+        if worker._is_cancelled():
+            self._stimulus_response_canceled("Stimulus response analysis cancelled", worker)
+            return
+        if self.active_stimulus_worker is worker:
+            self.active_stimulus_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        records = list(payload.get("records", []))
+        errors = list(payload.get("errors", []))
+        if not records:
+            details = "\n".join(errors[:12]) if errors else "No stimulus response files could be analyzed."
+            QMessageBox.warning(self, "Stimulus Response", details)
+            self._log("Stimulus response analysis produced no usable files")
+            self._return_to_stimulus_analysis_dialog()
+            return
+        self.stimulus_response_payload = payload
+        self._stimulus_response_analysis_dialog().set_cached_payload(payload)
+        self._open_stimulus_raster_window(payload)
+        self._log(f"Stimulus response analysis: {len(records)} files, {len(errors)} skipped")
+
+    def _stimulus_response_failed(self, details: str, worker: StimulusResponseWorker):
+        if self.active_stimulus_worker is worker:
+            self.active_stimulus_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self._log(details)
+        QMessageBox.critical(self, "Stimulus Response failed", details.splitlines()[-1] if details else "Unknown error")
+        self._return_to_stimulus_analysis_dialog()
+
+    def _stimulus_response_canceled(self, message: str, worker: StimulusResponseWorker):
+        if self.active_stimulus_worker is worker:
+            self.active_stimulus_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self._log(message or "Stimulus response analysis cancelled")
+        self._return_to_stimulus_analysis_dialog()
+
+    def _open_cached_stimulus_raster(self):
+        if not self.stimulus_response_payload:
+            QMessageBox.information(self, "Stimulus Response", "Run analysis before opening raster results.")
+            return
+        self._open_stimulus_raster_window(self.stimulus_response_payload)
+
+    def _open_cached_stimulus_psth(self):
+        if not self.stimulus_response_payload:
+            QMessageBox.information(self, "Stimulus Response", "Run analysis before opening PSTH.")
+            return
+        self._open_stimulus_psth_window(self.stimulus_response_payload)
+
+    def _open_cached_stimulus_activation_curve(self):
+        if not self.stimulus_response_payload:
+            QMessageBox.information(self, "Stimulus Response", "Run analysis before opening activation curve.")
+            return
+        self._open_stimulus_activation_curve_window(self.stimulus_response_payload)
+
+    def _open_stimulus_raster_window(self, payload: dict):
+        window = StimulusResponseWindow(payload, self, channel_map=self.channel_map)
+        self._show_stimulus_result_window(window)
+
+    def _open_stimulus_psth_window(self, payload: dict):
+        window = StimulusPSTHWindow(payload, self)
+        self._show_stimulus_result_window(window)
+
+    def _open_stimulus_activation_curve_window(self, payload: dict):
+        window = StimulusActivationCurveWindow(payload, self)
+        self._show_stimulus_result_window(window)
+
+    def _show_stimulus_result_window(self, window: QDialog):
+        dialog = self._stimulus_response_analysis_dialog()
+        dialog.hide()
+        window.finished.connect(lambda _result: self._return_to_stimulus_analysis_dialog())
+        self._show_child(window)
+
+    def _return_to_stimulus_analysis_dialog(self):
+        if self.stimulus_response_dialog is None:
+            return
+        self.stimulus_response_dialog.show()
+        self.stimulus_response_dialog.raise_()
+        self.stimulus_response_dialog.activateWindow()
 
     def open_data(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -6569,6 +11085,8 @@ class MainWindow(QMainWindow):
             return
 
         self.preview_button.setEnabled(False)
+        self.save_spike_train_button.setEnabled(False)
+        self.save_spike_train_action.setEnabled(False)
         self.run_button.setEnabled(False)
         self.results_button.setEnabled(False)
         self.temporal_button.setEnabled(False)
@@ -6605,6 +11123,9 @@ class MainWindow(QMainWindow):
         self.result = None
         self.file_label.setText(Path(path).name)
         self.preview_button.setEnabled(True)
+        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
+        self.save_spike_train_button.setEnabled(can_save_spike_train)
+        self.save_spike_train_action.setEnabled(can_save_spike_train)
         self.run_button.setEnabled(self.data_kind == "array")
         self.results_button.setEnabled(self.data_kind == "nev")
         self.temporal_button.setEnabled(self.data_kind == "nev")
@@ -6630,6 +11151,9 @@ class MainWindow(QMainWindow):
         self._finish_progress(self.pipeline_progress)
         self.pipeline_progress = None
         self.preview_button.setEnabled(self.raw_data is not None)
+        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
+        self.save_spike_train_button.setEnabled(can_save_spike_train)
+        self.save_spike_train_action.setEnabled(can_save_spike_train)
         self.run_button.setEnabled(self.data_kind == "array")
         self.results_button.setEnabled(self.data_kind == "nev")
         self.temporal_button.setEnabled(self.data_kind == "nev")
@@ -6641,6 +11165,9 @@ class MainWindow(QMainWindow):
         self._finish_progress(self.pipeline_progress)
         self.pipeline_progress = None
         self.preview_button.setEnabled(self.raw_data is not None)
+        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
+        self.save_spike_train_button.setEnabled(can_save_spike_train)
+        self.save_spike_train_action.setEnabled(can_save_spike_train)
         self.run_button.setEnabled(self.data_kind == "array")
         self.results_button.setEnabled(self.data_kind == "nev")
         self.temporal_button.setEnabled(self.data_kind == "nev")
@@ -6794,6 +11321,41 @@ class MainWindow(QMainWindow):
                     lines.append(f"Preview min/max: {float(np.nanmin(numeric)):.6g} / {float(np.nanmax(numeric)):.6g}")
                     lines.append(f"Preview mean: {float(np.nanmean(numeric)):.6g}")
         return "\n".join(lines)
+
+    def save_spike_train(self):
+        if not isinstance(self.raw_data, UnifiedMEAData):
+            QMessageBox.information(self, "Save Spike Train", "Load spike-event data before saving spike trains.")
+            return
+
+        default_name = "spike_train_data.npz"
+        if self.input_path:
+            default_name = f"{Path(self.input_path).stem}_spike_train.npz"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save spike train data",
+            default_name,
+            "Spike train data (*.npz);;All files (*)",
+        )
+        if not path:
+            return
+        if Path(path).suffix.lower() != ".npz":
+            path = f"{path}.npz"
+
+        progress = self._start_progress("Save Spike Train", "Saving spike train data...", 0)
+        try:
+            saved = save_spike_train_npz(self.raw_data, path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Spike Train failed", str(exc))
+            return
+        finally:
+            self._finish_progress(progress)
+
+        self._log(f"Saved spike train data: {saved}")
+        QMessageBox.information(
+            self,
+            "Save Spike Train",
+            f"Saved spike train data without waveform arrays:\n{saved}",
+        )
 
     def preview_raw(self):
         if self.raw_data is None:
