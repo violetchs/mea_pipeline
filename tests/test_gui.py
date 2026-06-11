@@ -1,9 +1,11 @@
 """Tests for GUI integration helpers."""
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 from src.gui.app import (
     AutoSortingDialog,
@@ -12,10 +14,14 @@ from src.gui.app import (
     SortingResultsWindow,
     SortingWorkspaceWindow,
     StimulusActivationCurveWindow,
+    MultiFileFactorAnalysisWindow,
     StimulusPSTHWindow,
     StimulusResponseWindow,
     TemporalCouplingWindow,
     BurstDelayWindow,
+    DataLoadWorker,
+    DataFilesInputDialog,
+    FileDatabaseLoadWorker,
     ElectrodeMapCanvas,
     _activity_heatmap_color,
     _available_channels_for_data,
@@ -24,6 +30,10 @@ from src.gui.app import (
     _burst_delay_first_spike_matrix,
     _burst_delay_pair_values,
     _burst_sequence_payload,
+    _burst_trajectory_analysis,
+    _aligned_weight_similarity,
+    _multi_file_factor_analysis_payload,
+    _non_overlapping_spike_windows,
     _source_interval_delay_values,
     _spike_train_delay_aligned_pairs,
     _detect_burst_intervals,
@@ -302,6 +312,313 @@ def test_burst_sequence_payload_saves_relative_spike_times_only():
     assert payload["relative_spike_times_s"][0, 0].tolist() == [0.01, 0.02]
     assert payload["relative_spike_times_s"][1, 1].tolist() == [0.040000000000000036]
     assert "waveforms" not in payload
+
+
+def test_burst_trajectory_analysis_returns_factor_analysis_latent_state_loadings_and_reconstruction():
+    spike_series = [
+        ("chan1", np.array([0.005, 0.018, 1.006, 1.019, 2.005, 2.018, 3.006, 3.020])),
+        ("chan2", np.array([0.012, 0.028, 1.013, 1.029, 2.030, 2.041, 3.014, 3.031])),
+        ("chan3", np.array([0.035, 1.034, 2.012, 3.040])),
+        ("chan4", np.array([0.022, 1.022, 2.026, 3.024])),
+        ("chan5", np.array([9.0])),
+    ]
+    intervals = [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05), (3.0, 3.05)]
+
+    analysis = _burst_trajectory_analysis(
+        spike_series,
+        intervals,
+        time_bin_ms=10.0,
+        window_ms=50.0,
+        normalization="channel_zscore",
+        latent_dim=3,
+        cluster_count=2,
+        min_total_activity=10.0,
+        min_active_bursts=2,
+        max_channels=4,
+    )
+
+    assert analysis["representation"] == "factor_analysis"
+    assert analysis["state_projection"] == "Factor Analysis 3D"
+    assert analysis["labels"] == ["chan1", "chan2", "chan3", "chan4", "chan5"]
+    assert analysis["selected_labels"] == ["chan1", "chan2", "chan3", "chan4"]
+    np.testing.assert_array_equal(analysis["selected_channel_indices"], np.array([0, 1, 2, 3]))
+    assert "chan5" not in analysis["selected_labels"]
+    assert analysis["observed_states"].shape == (4, 5, 4)
+    assert analysis["reconstructed_states"].shape == (4, 5, 4)
+    assert analysis["raw_observed_states"].shape == (4, 5, 4)
+    assert analysis["raw_reconstructed_states"].shape == (4, 5, 4)
+    assert np.max(analysis["raw_observed_states"]) > np.max(np.abs(analysis["observed_states"]))
+    assert analysis["latent_states"].shape == (4, 5, 3)
+    assert analysis["dispersion"].shape == (5,)
+    assert analysis["reconstruction_rmse"].shape == (5,)
+    assert np.isfinite(analysis["reconstruction_r2"])
+    params = analysis["latent_params"]
+    assert params["loadings"].shape == (3, 4)
+    assert params["mean"].shape == (4,)
+    assert params["noise_variance"].shape == (4,)
+    assert analysis["channel_filter"]["total_activity"].shape == (5,)
+    assert params["n_iter"] >= 0
+
+
+def test_burst_trajectory_can_use_non_overlapping_all_data_windows():
+    spike_series = [
+        ("chan1", np.array([0.00, 0.01, 0.31, 0.32, 0.61, 0.62])),
+        ("chan2", np.array([0.02, 0.33, 0.64])),
+    ]
+
+    windows = _non_overlapping_spike_windows(spike_series, 300.0)
+    analysis = _burst_trajectory_analysis(
+        spike_series,
+        windows,
+        time_bin_ms=100.0,
+        window_ms=300.0,
+        normalization="none",
+        latent_dim=1,
+        min_total_activity=0.0,
+        min_active_bursts=1,
+        analysis_scope="all_windows",
+    )
+
+    assert windows == [(0.0, 0.3), (0.3, 0.6), (0.6, 0.8999999999999999)]
+    assert analysis["analysis_scope"] == "all_windows"
+    assert analysis["raw_observed_states"].shape == (3, 3, 2)
+
+
+def test_burst_trajectory_window_is_factor_analysis_only():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = BurstTrajectoryWindow(
+        [
+            ("chan1", np.array([0.005, 0.018, 1.006, 1.019])),
+            ("chan2", np.array([0.012, 0.028, 1.013, 1.029])),
+            ("chan3", np.array([0.035, 1.034])),
+        ],
+        [(0.0, 0.05), (1.0, 1.05)],
+    )
+
+    assert hasattr(window, "raster_canvas")
+    assert hasattr(window, "latent_canvas")
+    assert hasattr(window, "psth_canvas")
+    assert hasattr(window, "weight_canvas")
+    assert hasattr(window, "display_value")
+    assert hasattr(window, "rmse_order")
+    assert hasattr(window, "reconstruction_metrics_button")
+    assert hasattr(window, "weight_metrics_button")
+    assert hasattr(window, "temporal_model_button")
+    assert hasattr(window, "trajectory_analysis_button")
+    assert not hasattr(window, "export_latent_button")
+    assert not hasattr(window, "latent_metrics_button")
+    assert window.bin_ms.value() == 10.0
+    assert window.window_ms.value() == 300
+    assert [window.rmse_order.itemData(index) for index in range(window.rmse_order.count())] == ["desc", "asc"]
+    assert [window.display_param.itemData(index) for index in range(window.display_param.count())] == ["burst"]
+    assert not hasattr(window, "trajectory_canvas")
+    assert not hasattr(window, "reducer")
+    assert not hasattr(window, "representation")
+    assert "Factor Analysis" in window.summary.text()
+    assert "Channels:" in window.summary.text()
+    assert window.raster_canvas.figure.axes[0].get_xlabel() == "Time from burst onset (ms)"
+    raster_image = window.raster_canvas.figure.axes[0].images[0]
+    assert raster_image.get_array().shape[0] == window.current["raw_observed_states"].shape[2] * 2
+    assert raster_image.get_extent()[1] == pytest.approx(window.window_ms.value())
+    assert "Latent state z(t)" in window.latent_canvas.figure.axes[0].get_title()
+    assert "Raw observed vs reconstructed PSTH" in window.psth_canvas.figure.axes[0].get_title()
+    assert window.psth_canvas.figure.axes[0].get_ylabel() == "Mean firing rate (Hz)"
+    assert "Factor loading matrix W" in window.weight_canvas.figure.axes[0].get_title()
+
+    window._show_reconstruction_metrics()
+    window._show_weight_metrics()
+    window._show_temporal_model()
+    window._show_trajectory_analysis()
+    assert len(window.metric_windows) == 4
+    assert all(metric_window.findChildren(FigureCanvas) for metric_window in window.metric_windows)
+    recon_canvas = window.metric_windows[0].findChildren(FigureCanvas)[0]
+    assert "Latent dim vs reconstruction" in recon_canvas.figure.axes[0].get_title()
+    weight_canvas = window.metric_windows[1].findChildren(FigureCanvas)[0]
+    assert "W subspace singular spectrum" in weight_canvas.figure.axes[0].get_title()
+    temporal_canvas = window.metric_windows[2].findChildren(FigureCanvas)[0]
+    assert "Raw data vs nonlinear temporal reconstruction" in temporal_canvas.figure.axes[0].get_title()
+    trajectory_canvas = window.metric_windows[3].findChildren(FigureCanvas)[0]
+    assert "Initial latent state clusters" in trajectory_canvas.figure.axes[0].get_title()
+
+
+def test_aligned_weight_similarity_compares_rotated_factor_loadings():
+    reference = np.array([[1.0, 0.2, -0.1], [0.0, 0.8, 0.3]])
+    theta = np.pi / 5.0
+    rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    rotated = rotation @ reference
+
+    similarity, aligned = _aligned_weight_similarity([reference, rotated])
+
+    assert similarity.shape == (2, 2)
+    assert similarity[0, 1] == pytest.approx(1.0, abs=1e-6)
+    assert aligned[1].shape == rotated.shape
+
+
+def test_multi_file_factor_analysis_removes_stimulus_tail_before_fitting(monkeypatch, tmp_path):
+    path = tmp_path / "el=1_amp=2.npz"
+    path.write_bytes(b"placeholder")
+    burst_offsets_a = np.array([0.0005, 0.010, 0.014, 0.018, 0.022, 0.026])
+    burst_offsets_b = np.array([0.0015, 0.012, 0.016, 0.020, 0.024, 0.028])
+    starts = np.array([0.0, 1.0, 2.0])
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.sort(np.concatenate([start + burst_offsets_a for start in starts])),
+            "chan2": np.sort(np.concatenate([start + burst_offsets_b for start in starts])),
+        },
+        stim_times=np.array([0.0, 1.0, 2.0]),
+        sr=20000.0,
+        meta={"source": "maxwell_h5"},
+    )
+    import src.gui.app as app_module
+
+    monkeypatch.setattr(app_module, "_stimulus_response_supported_files", lambda _paths: [path])
+    monkeypatch.setattr(app_module, "_load_spike_only_data", lambda _path, cancel_check=None: data)
+    monkeypatch.setattr(app_module, "_detect_burst_intervals", lambda *args, **kwargs: [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)])
+
+    payload = _multi_file_factor_analysis_payload(
+        [path],
+        time_bin_ms=10.0,
+        window_ms=40.0,
+        latent_dim=1,
+        min_total_activity=0.0,
+        min_active_bursts=1,
+        max_channels=2,
+        burst_bin_ms=5.0,
+        burst_smooth_ms=5.0,
+        burst_threshold_z=1.0,
+        artifact_ms=1.0,
+    )
+    unfiltered = _multi_file_factor_analysis_payload(
+        [path],
+        time_bin_ms=10.0,
+        window_ms=40.0,
+        latent_dim=1,
+        min_total_activity=0.0,
+        min_active_bursts=1,
+        max_channels=2,
+        burst_bin_ms=5.0,
+        burst_smooth_ms=5.0,
+        burst_threshold_z=1.0,
+        artifact_ms=0.0,
+    )
+
+    assert payload["artifact_ms"] == 1.0
+    assert payload["records"][0]["stim_count"] == 3
+    assert payload["records"][0]["artifact_removed_spikes"] == 3
+    raw = np.asarray(payload["records"][0]["analysis"]["raw_observed_states"], dtype=float)
+    unfiltered_raw = np.asarray(unfiltered["records"][0]["analysis"]["raw_observed_states"], dtype=float)
+    assert float(np.sum(unfiltered_raw) - np.sum(raw)) == pytest.approx(3.0 / 0.010)
+
+
+def test_multi_file_factor_analysis_uses_global_channel_order_and_selection(monkeypatch, tmp_path):
+    paths = [tmp_path / "segment_a.npz", tmp_path / "segment_b.npz"]
+    for path in paths:
+        path.write_bytes(b"placeholder")
+    intervals = [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)]
+    data_a = UnifiedMEAData(
+        spikes={
+            "chan2": np.array([0.012, 0.016, 1.012, 1.016, 2.012, 2.016]),
+            "chan1": np.array([0.010, 0.014, 1.010, 1.014, 2.010, 2.014]),
+        },
+        sr=20000.0,
+    )
+    data_b = UnifiedMEAData(
+        spikes={
+            "chan3": np.array([9.0]),
+            "chan1": np.array([0.011, 0.015, 1.011, 1.015, 2.011, 2.015]),
+            "chan2": np.array([0.013, 0.017, 1.013, 1.017, 2.013, 2.017]),
+        },
+        sr=20000.0,
+    )
+    data_by_name = {paths[0].name: data_a, paths[1].name: data_b}
+    import src.gui.app as app_module
+
+    monkeypatch.setattr(app_module, "_stimulus_response_supported_files", lambda _paths: paths)
+    monkeypatch.setattr(app_module, "_load_spike_only_data", lambda path, cancel_check=None: data_by_name[Path(path).name])
+    monkeypatch.setattr(app_module, "_detect_burst_intervals", lambda *args, **kwargs: intervals)
+
+    payload = _multi_file_factor_analysis_payload(
+        paths,
+        time_bin_ms=10.0,
+        window_ms=40.0,
+        analysis_scope="all_windows",
+        latent_dim=1,
+        min_total_activity=2.0,
+        min_active_bursts=2,
+        max_channels=2,
+        artifact_ms=0.0,
+    )
+
+    assert payload["analysis_scope"] == "all_windows"
+    assert payload["global_labels"] == ["chan1", "chan2", "chan3"]
+    assert payload["global_selected_labels"] == ["chan1", "chan2"]
+    assert len(payload["records"]) == 2
+    for record in payload["records"]:
+        assert record["analysis"]["selected_labels"] == payload["global_selected_labels"]
+        assert record["analysis"]["latent_params"]["loadings"].shape[1] == 2
+
+
+def test_multi_file_factor_analysis_window_visualizes_aligned_w_similarity():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    spike_series = [
+        ("chan1", np.array([0.005, 0.018, 1.006, 1.019, 2.005, 2.018])),
+        ("chan2", np.array([0.012, 0.028, 1.013, 1.029, 2.030, 2.041])),
+        ("chan3", np.array([0.035, 1.034, 2.012])),
+    ]
+    intervals = [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05)]
+    analysis_a = _burst_trajectory_analysis(spike_series, intervals, time_bin_ms=10.0, window_ms=50.0, latent_dim=2, max_channels=3)
+    analysis_b = _burst_trajectory_analysis(spike_series, intervals, time_bin_ms=10.0, window_ms=50.0, latent_dim=2, max_channels=3)
+    weights = [
+        np.asarray(analysis_a["latent_params"]["loadings"], dtype=float),
+        np.asarray(analysis_b["latent_params"]["loadings"], dtype=float),
+    ]
+    similarity, aligned = _aligned_weight_similarity(weights)
+    payload = {
+        "records": [
+            {
+                "condition": "amp=1",
+                "file": "a.npz",
+                "analysis": analysis_a,
+                "aligned_loadings": aligned[0],
+                "burst_count": len(intervals),
+                "selected_channel_count": len(analysis_a["selected_labels"]),
+                "reconstruction_r2": analysis_a["reconstruction_r2"],
+            },
+            {
+                "condition": "amp=2",
+                "file": "b.npz",
+                "analysis": analysis_b,
+                "aligned_loadings": aligned[1],
+                "burst_count": len(intervals),
+                "selected_channel_count": len(analysis_b["selected_labels"]),
+                "reconstruction_r2": analysis_b["reconstruction_r2"],
+            },
+        ],
+        "errors": [],
+        "w_similarity": similarity,
+        "window_ms": 50.0,
+    }
+
+    app = QApplication.instance() or QApplication([])
+    window = MultiFileFactorAnalysisWindow(payload)
+
+    assert "Files: 2" in window.summary.text()
+    assert "Aligned W correlation" in window.similarity_canvas.figure.axes[0].get_title()
+    assert "Selected aligned W" in window.weight_canvas.figure.axes[1].get_title()
+    assert "Mean z(t)" in window.latent_canvas.figure.axes[0].get_title()
+    assert "Reconstruction R2" in window.performance_canvas.figure.axes[0].get_title()
 
 
 def test_burst_delay_first_spike_matrix_uses_all_channels_by_default():
@@ -1321,6 +1638,62 @@ def test_stimulus_response_results_return_to_cached_analysis_dialog():
     window.close()
 
 
+def test_multi_file_factor_analysis_results_return_to_cached_dialog():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    main_window = MainWindow()
+    dialog = main_window._multi_file_fa_analysis_dialog()
+    dialog.show()
+    spike_series = [
+        ("chan1", np.array([0.005, 0.018, 1.006, 1.019, 2.005, 2.018])),
+        ("chan2", np.array([0.012, 0.028, 1.013, 1.029, 2.030, 2.041])),
+    ]
+    intervals = [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05)]
+    analysis = _burst_trajectory_analysis(spike_series, intervals, time_bin_ms=10.0, window_ms=50.0, latent_dim=1, max_channels=2)
+    loadings = np.asarray(analysis["latent_params"]["loadings"], dtype=float)
+    payload = {
+        "records": [
+            {
+                "condition": "file a",
+                "file": "a.npz",
+                "analysis": analysis,
+                "aligned_loadings": loadings,
+                "burst_count": len(intervals),
+                "selected_channel_count": len(analysis["selected_labels"]),
+                "reconstruction_r2": analysis["reconstruction_r2"],
+            }
+        ],
+        "errors": [],
+        "w_similarity": np.eye(1),
+        "window_ms": 50.0,
+    }
+    worker = type("Worker", (), {"_is_cancelled": lambda self: False})()
+
+    main_window._multi_file_fa_finished(payload, worker)
+    app.processEvents()
+
+    assert main_window.multi_file_fa_payload is payload
+    assert dialog.cached_payload is payload
+    assert dialog.open_result_button.isEnabled()
+    assert not dialog.isVisible()
+    assert any(isinstance(child, MultiFileFactorAnalysisWindow) for child in main_window.child_windows)
+
+    result_window = next(child for child in main_window.child_windows if isinstance(child, MultiFileFactorAnalysisWindow))
+    result_window.close()
+    app.processEvents()
+
+    assert dialog.isVisible()
+    for child in list(main_window.child_windows):
+        child.close()
+    dialog.close()
+    main_window.close()
+
+
 def test_default_maxwell_map_is_full_template_and_recording_is_file_specific():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1473,12 +1846,16 @@ def test_spike_raster_actions_are_selected_from_dropdown(monkeypatch):
     window = SpikeRasterWindow("Raster", [("chan1", np.array([0.0, 1.0]))])
     called = []
     monkeypatch.setattr(window, "_open_burst_delay_window", lambda: called.append("burst_delay"))
+    monkeypatch.setattr(window, "_open_burst_trajectory_window", lambda: called.append("burst_trajectory"))
 
     index = window.raster_action_combo.findData("burst_delay")
     window.raster_action_combo.setCurrentIndex(index)
     window._raster_action_selected(index)
+    trajectory_index = window.raster_action_combo.findData("burst_trajectory")
+    window.raster_action_combo.setCurrentIndex(trajectory_index)
+    window._raster_action_selected(trajectory_index)
 
-    assert called == ["burst_delay"]
+    assert called == ["burst_delay", "burst_trajectory"]
     assert window.raster_action_combo.currentIndex() == 0
 
 
@@ -1981,7 +2358,7 @@ def test_spinbox_hit_targets_are_fixed_across_dialogs():
 def test_main_window_replaces_pipeline_cards_with_data_preview():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication, QProgressBar
+        from PySide6.QtWidgets import QApplication, QProgressBar, QPushButton
     except ImportError:
         pytest.skip("PySide6 is not available")
 
@@ -1990,7 +2367,35 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
 
     assert not window.findChildren(QProgressBar)
     assert not hasattr(window, "cards")
+    assert not hasattr(window, "run_button")
+    assert not hasattr(window, "results_button")
+    assert not hasattr(window, "settings_button")
+    assert not hasattr(window, "temporal_button")
+    button_texts = [button.text() for button in window.findChildren(QPushButton)]
+    expected_button_order = [
+        "Open Data Files",
+        "Raw Data Raster",
+        "Save File",
+        "Channel Map",
+        "Sorting",
+        "Stimulus Response Analysis",
+        "Multi-file FA Analysis",
+    ]
+    assert button_texts[: len(expected_button_order)] == expected_button_order
+    assert "Run Full Pipeline" not in button_texts
+    assert "Open Results" not in button_texts
+    assert "Settings" not in button_texts
+    assert "Temporal Coupling" not in button_texts
+    menu_texts = [
+        action.text()
+        for menu_action in window.menuBar().actions()
+        for action in (menu_action.menu().actions() if menu_action.menu() is not None else [])
+    ]
+    assert "Results" not in menu_texts
+    assert "Settings" not in menu_texts
+    assert "Temporal Coupling" not in menu_texts
     assert "No data loaded" in window.data_preview.toPlainText()
+    assert window.database_table.columnCount() == 6
     assert window.stimulus_response_button.text() == "Stimulus Response Analysis"
 
     window.raw_data = UnifiedMEAData(
@@ -2005,9 +2410,223 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
 
     preview = window.data_preview.toPlainText()
     assert "Loaded data preview" not in preview
-    assert "Kind: nev" in preview
+    assert "Kind: blackrock_nev" in preview
     assert "Total spikes: 3" in preview
     assert "chan1: 2 spikes" in preview
+
+
+def test_main_window_file_database_selection_feeds_single_and_multi_file_actions(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first_path = tmp_path / "first.nev"
+    second_path = tmp_path / "second.raw.h5"
+    first_path.write_bytes(b"placeholder")
+    second_path.write_bytes(b"placeholder")
+    first = UnifiedMEAData(
+        spikes={"chan1": np.array([0.1, 0.2])},
+        sr=30000.0,
+        meta={"source": "blackrock_nev"},
+    )
+    second = UnifiedMEAData(
+        spikes={"chan2": np.array([0.3, 0.4, 0.5])},
+        sr=20000.0,
+        meta={"source": "maxwell_h5", "waveforms_deferred": True},
+    )
+    window.file_database = [
+        {"path": str(first_path), "raw_data": first, "data_kind": "nev"},
+        {"path": str(second_path), "raw_data": second, "data_kind": "nev"},
+    ]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(1)
+    app.processEvents()
+
+    assert window.input_path == str(second_path)
+    assert window.raw_data is second
+    assert "second.raw.h5" in window.data_preview.toPlainText()
+    assert "Kind: maxwell_h5" in window.data_preview.toPlainText()
+    assert "deferred for faster loading" in window.data_preview.toPlainText()
+    assert window.database_table.item(1, 1).text() == "maxwell_h5"
+
+    window.database_table.selectAll()
+    app.processEvents()
+    window.open_stimulus_response_analysis()
+    window.open_multi_file_factor_analysis()
+
+    stimulus_paths = window.stimulus_response_dialog.values()[0]
+    fa_paths = window.multi_file_fa_dialog.values()[0]
+    assert sorted(Path(path).name for path in stimulus_paths) == ["first.nev", "second.raw.h5"]
+    assert sorted(Path(path).name for path in fa_paths) == ["first.nev", "second.raw.h5"]
+    window.stimulus_response_dialog.close()
+    window.multi_file_fa_dialog.close()
+    window.close()
+
+
+def test_data_files_input_dialog_adds_folders_and_removes_selected(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "dataset"
+    folder.mkdir()
+    h5_path = folder / "a.raw.h5"
+    nev_path = folder / "b.nev"
+    ignored = folder / "notes.md"
+    h5_path.write_bytes(b"placeholder")
+    nev_path.write_bytes(b"placeholder")
+    ignored.write_text("ignore", encoding="utf-8")
+
+    dialog = DataFilesInputDialog()
+    dialog._add_paths([folder, h5_path])
+
+    assert sorted(Path(path).name for path in dialog.values()) == ["a.raw.h5", "b.nev"]
+    assert dialog.table.rowCount() == 2
+
+    dialog.table.selectRow(0)
+    dialog._remove_selected()
+
+    assert len(dialog.values()) == 1
+    assert Path(dialog.values()[0]).name in {"a.raw.h5", "b.nev"}
+    dialog.close()
+
+
+def test_data_load_worker_reads_maxwell_h5_spikes_without_waveforms(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "large.raw.h5"
+    path.write_bytes(b"placeholder")
+    calls = []
+
+    def fake_read_maxwell_h5(path_arg, *, cancel_check=None, extract_waveforms=True, **kwargs):
+        calls.append((Path(path_arg), bool(extract_waveforms)))
+        return UnifiedMEAData(
+            spikes={"well0_e1": np.array([0.1, 0.2])},
+            sr=20000.0,
+            meta={"source": "maxwell_h5", "extract_waveforms": bool(extract_waveforms)},
+        )
+
+    import src.gui.app as app_module
+
+    monkeypatch.setattr(app_module, "read_maxwell_h5", fake_read_maxwell_h5)
+    worker = DataLoadWorker(str(path))
+    finished = []
+    failed = []
+    worker.signals.finished.connect(finished.append)
+    worker.signals.failed.connect(failed.append)
+
+    worker.run()
+
+    assert not failed
+    assert calls == [(path, False)]
+    assert len(finished) == 1
+    assert finished[0]["data_kind"] == "nev"
+    assert finished[0]["raw_data"].waveforms == {}
+
+
+def test_file_database_worker_reads_multiple_maxwell_files_without_waveforms(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    paths = [tmp_path / "a.raw.h5", tmp_path / "b.raw.h5"]
+    for path in paths:
+        path.write_bytes(b"placeholder")
+    calls = []
+
+    def fake_read_maxwell_h5(path_arg, *, cancel_check=None, extract_waveforms=True, **kwargs):
+        calls.append((Path(path_arg).name, bool(extract_waveforms)))
+        return UnifiedMEAData(
+            spikes={"well0_e1": np.array([0.1])},
+            sr=20000.0,
+            meta={"source": "maxwell_h5", "extract_waveforms": bool(extract_waveforms)},
+        )
+
+    import src.gui.app as app_module
+
+    monkeypatch.setattr(app_module, "read_maxwell_h5", fake_read_maxwell_h5)
+    worker = FileDatabaseLoadWorker([str(path) for path in paths])
+    finished = []
+    failed = []
+    worker.signals.finished.connect(finished.append)
+    worker.signals.failed.connect(failed.append)
+
+    worker.run()
+
+    assert not failed
+    assert calls == [("a.raw.h5", False), ("b.raw.h5", False)]
+    assert len(finished) == 1
+    assert len(finished[0]["records"]) == 2
+    assert finished[0]["records"][0]["raw_data"].waveforms == {}
+
+
+def test_sorting_on_fast_loaded_maxwell_triggers_deferred_waveform_load(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.raw_data = UnifiedMEAData(
+        spikes={"well0_e1": np.array([0.1, 0.2])},
+        waveforms={},
+        sr=20000.0,
+        meta={"source": "maxwell_h5", "waveforms_deferred": True},
+    )
+    window.data_kind = "nev"
+    window.input_path = "large.raw.h5"
+    called = []
+    monkeypatch.setattr(window, "_load_maxwell_waveforms_for_sorting", lambda: called.append(True))
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+
+    window.open_sorting()
+
+    assert called == [True]
+    window.close()
+
+
+def test_sorting_on_fast_loaded_maxwell_can_skip_deferred_waveforms(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.raw_data = UnifiedMEAData(
+        spikes={"well0_e1": np.array([0.1, 0.2])},
+        waveforms={},
+        sr=20000.0,
+        meta={"source": "maxwell_h5", "waveforms_deferred": True},
+    )
+    window.data_kind = "nev"
+    window.input_path = "large.raw.h5"
+    called = []
+    monkeypatch.setattr(window, "_load_maxwell_waveforms_for_sorting", lambda: called.append(True))
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
+
+    window.open_sorting()
+
+    assert called == []
+    window.close()
 
 
 def test_sorting_results_window_constructs_with_embedding():
@@ -2113,6 +2732,55 @@ def test_sorting_workspace_lasso_assignment_updates_channel_labels():
     window._toggle_lasso_mode("noise", -1)
 
     assert window.lasso_mode is None
+
+
+def test_sorting_workspace_embedding_click_highlights_waveform_and_point():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    waveforms = np.array([
+        [0.0, -0.1, -0.3, -0.1, 0.0, 0.1, 0.0, 0.0],
+        [0.0, -0.2, -0.4, -0.1, 0.1, 0.1, 0.0, 0.0],
+        [0.0, 0.2, 0.4, 0.2, 0.0, -0.1, 0.0, 0.0],
+        [0.0, 0.1, 0.3, 0.1, -0.1, -0.1, 0.0, 0.0],
+    ])
+    data = UnifiedMEAData(
+        spikes={"chan1": np.array([0.0, 0.1, 0.2, 0.3])},
+        waveforms={"chan1": waveforms},
+        sr=30000.0,
+    )
+    window = SortingWorkspaceWindow(data)
+    window.current_embedding = np.array([[0.0, 0.0], [0.1, 0.0], [2.0, 2.0], [2.1, 2.0]], dtype=np.float32)
+    window.current_labels = np.array([0, 0, 1, 1], dtype=np.int32)
+    window._draw_all()
+    app.processEvents()
+
+    display_x, display_y = window.embedding_ax.transData.transform((2.0, 2.0))
+    event = type(
+        "ClickEvent",
+        (),
+        {
+            "inaxes": window.embedding_ax,
+            "button": 1,
+            "x": display_x,
+            "y": display_y,
+            "xdata": 2.0,
+            "ydata": 2.0,
+        },
+    )()
+
+    window._embedding_clicked(event)
+
+    assert window.selected_spike_index == 2
+    assert "Selected spike 3" in window.status.text()
+    waveform_ax = window.waveform_canvas.figure.axes[0]
+    assert any(line.get_linewidth() >= 2.5 for line in waveform_ax.lines)
+    embedding_ax = window.embedding_canvas.figure.axes[0]
+    assert len(embedding_ax.collections) >= 3
 
 
 def test_sorting_workspace_handles_zero_column_embedding():

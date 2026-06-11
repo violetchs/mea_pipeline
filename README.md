@@ -55,7 +55,7 @@ python -m pip install -U git+https://github.com/<owner>/<repo>.git
 Install a released wheel from GitHub Releases:
 
 ```powershell
-python -m pip install -U https://github.com/<owner>/<repo>/releases/download/v0.1.0/mea_pipeline-0.1.0-py3-none-any.whl
+python -m pip install -U https://github.com/<owner>/<repo>/releases/download/v0.2.0/mea_pipeline-0.2.0-py3-none-any.whl
 ```
 
 After installation, launch the GUI with either command:
@@ -130,7 +130,7 @@ python -m pytest
 ## Publishing
 
 For public version updates, push this repository to GitHub and create a version
-tag such as `v0.1.0`. The workflow in `.github/workflows/release.yml` builds the
+tag such as `v0.2.0`. The workflow in `.github/workflows/release.yml` builds the
 wheel/source package and attaches them to a GitHub Release. See
 `docs/PUBLISH.md` for the full release and user-installation workflow.
 

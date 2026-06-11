@@ -8,14 +8,14 @@ release path is GitHub Releases first, with optional PyPI publishing later.
 Use semantic versions in `setup.py`, for example:
 
 ```python
-version="0.1.1"
+version="0.2.0"
 ```
 
 Create a matching Git tag:
 
 ```powershell
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The GitHub Actions workflow `.github/workflows/release.yml` builds:
@@ -36,7 +36,7 @@ python -m pip install -U git+https://github.com/<owner>/<repo>.git
 Install a specific release wheel:
 
 ```powershell
-python -m pip install -U https://github.com/<owner>/<repo>/releases/download/v0.1.1/mea_pipeline-0.1.1-py3-none-any.whl
+python -m pip install -U https://github.com/<owner>/<repo>/releases/download/v0.2.0/mea_pipeline-0.2.0-py3-none-any.whl
 ```
 
 Launch the GUI after installation:
@@ -64,7 +64,7 @@ python -m twine check dist/*
 Install the generated wheel locally:
 
 ```powershell
-python -m pip install -U dist\mea_pipeline-0.1.1-py3-none-any.whl
+python -m pip install -U dist\mea_pipeline-0.2.0-py3-none-any.whl
 ```
 
 ## Optional PyPI Publishing

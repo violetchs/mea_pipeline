@@ -68,6 +68,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.optimize import curve_fit
 from scipy.spatial.distance import squareform
 from sklearn.cluster import KMeans as SkKMeans
+from sklearn.decomposition import FactorAnalysis as SkFactorAnalysis
 from sklearn.decomposition import PCA as SkPCA
 from sklearn.manifold import TSNE
 
@@ -84,6 +85,7 @@ try:
     )
     from ..mea_io import (
         MEAReader,
+        MEAWriter,
         UnifiedMEAData,
         filter_unified_by_wells,
         list_axion_spk_wells,
@@ -110,6 +112,7 @@ except ImportError:
     )
     from mea_io import (
         MEAReader,
+        MEAWriter,
         UnifiedMEAData,
         filter_unified_by_wells,
         list_axion_spk_wells,
@@ -1331,6 +1334,25 @@ def _burst_activity_matrix(spike_series, burst_intervals, time_bin_ms: float = 5
     return labels, intervals, matrix
 
 
+def _non_overlapping_spike_windows(spike_series, window_ms: float) -> list[tuple[float, float]]:
+    window_s = max(0.001, float(window_ms) / 1000.0)
+    chunks = []
+    for _label, times in spike_series:
+        values = np.asarray(times, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size:
+            chunks.append(values)
+    if not chunks:
+        return []
+    all_times = np.sort(np.concatenate(chunks))
+    start_s = float(all_times[0])
+    stop_s = float(all_times[-1])
+    if stop_s <= start_s:
+        return [(start_s, start_s + window_s)]
+    count = max(1, int(np.ceil((stop_s - start_s) / window_s)))
+    return [(start_s + index * window_s, start_s + (index + 1) * window_s) for index in range(count)]
+
+
 def _burst_correlation_analysis(
     spike_series,
     burst_intervals,
@@ -1497,6 +1519,571 @@ def _burst_embedding(features: np.ndarray, embedding_method: str) -> np.ndarray:
         return TSNE(n_components=2, perplexity=perplexity, random_state=7, init="pca", learning_rate="auto").fit_transform(features)
     except Exception:
         return _burst_embedding(features, "pca")
+
+
+def _burst_trajectory_feature_transform(activity: np.ndarray, normalization: str) -> tuple[np.ndarray, dict]:
+    values = np.nan_to_num(np.asarray(activity, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.ndim != 3:
+        return np.zeros((0, 0, 0), dtype=float), {"mode": str(normalization or "none").lower()}
+    vectors = np.transpose(values, (0, 2, 1))
+    mode = str(normalization or "channel_zscore").lower()
+    params = {"mode": mode}
+    if mode == "log_channel_zscore":
+        vectors = np.log1p(np.maximum(vectors, 0.0))
+    if mode == "per_time_total":
+        totals = np.sum(np.abs(vectors), axis=2, keepdims=True)
+        params["totals"] = totals
+        return np.divide(vectors, totals, out=np.zeros_like(vectors), where=totals > 1e-12), params
+    if mode in {"channel_zscore", "log_channel_zscore"}:
+        flat = vectors.reshape((-1, vectors.shape[2]))
+        means = np.mean(flat, axis=0, keepdims=True)
+        stds = np.std(flat, axis=0, keepdims=True)
+        scaled = np.divide(flat - means, stds, out=np.zeros_like(flat), where=stds > 1e-12)
+        params["mean"] = means.reshape((1, 1, -1))
+        params["std"] = stds.reshape((1, 1, -1))
+        return scaled.reshape(vectors.shape), params
+    return vectors, params
+
+
+def _burst_trajectory_inverse_features(states: np.ndarray, params: dict) -> np.ndarray:
+    values = np.nan_to_num(np.asarray(states, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.ndim != 3:
+        return np.zeros((0, 0, 0), dtype=float)
+    mode = str((params or {}).get("mode", "none")).lower()
+    if mode in {"channel_zscore", "log_channel_zscore"}:
+        mean = np.asarray((params or {}).get("mean", 0.0), dtype=float)
+        std = np.asarray((params or {}).get("std", 1.0), dtype=float)
+        values = values * std + mean
+        if mode == "log_channel_zscore":
+            values = np.expm1(values)
+        return np.maximum(values, 0.0)
+    if mode == "per_time_total":
+        totals = np.asarray((params or {}).get("totals", 1.0), dtype=float)
+        return np.maximum(values * totals, 0.0)
+    return values
+
+
+def _burst_trajectory_features(activity: np.ndarray, normalization: str) -> np.ndarray:
+    features, _params = _burst_trajectory_feature_transform(activity, normalization)
+    return features
+
+
+def _trajectory_dispersion(trajectories: np.ndarray) -> np.ndarray:
+    points = np.nan_to_num(np.asarray(trajectories, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    if points.ndim != 3 or points.shape[0] == 0:
+        return np.zeros(0, dtype=float)
+    centroids = np.mean(points, axis=0, keepdims=True)
+    distances = np.linalg.norm(points - centroids, axis=2)
+    return np.mean(distances, axis=0)
+
+
+def _factor_analysis_latent_states(
+    features_by_time: np.ndarray,
+    latent_dim: int = 16,
+    max_iter: int = 1000,
+) -> tuple[np.ndarray, dict]:
+    values = np.nan_to_num(np.asarray(features_by_time, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.ndim != 3:
+        return np.zeros((0, 0, 0), dtype=float), {}
+    burst_count, bin_count, channel_count = values.shape
+    if burst_count == 0 or bin_count == 0 or channel_count == 0:
+        return np.zeros((burst_count, bin_count, 0), dtype=float), {}
+    flat = values.reshape((burst_count * bin_count, channel_count))
+    sample_count = flat.shape[0]
+    components = min(max(1, int(latent_dim)), channel_count, sample_count)
+    if sample_count < 2 or np.allclose(flat, flat[0]):
+        latent = np.zeros((burst_count, bin_count, components), dtype=float)
+        params = {
+            "method": "factor_analysis",
+            "latent_dim": components,
+            "loadings": np.zeros((components, channel_count), dtype=float),
+            "mean": np.mean(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float),
+            "noise_variance": np.zeros(channel_count, dtype=float),
+            "log_likelihood": np.zeros(0, dtype=float),
+            "n_iter": 0,
+        }
+        return latent, params
+    model = SkFactorAnalysis(n_components=components, random_state=7, max_iter=max(10, int(max_iter)))
+    latent_flat = model.fit_transform(flat)
+    latent = np.nan_to_num(latent_flat.reshape((burst_count, bin_count, components)), nan=0.0, posinf=0.0, neginf=0.0)
+    params = {
+        "method": "factor_analysis",
+        "latent_dim": components,
+        "loadings": np.nan_to_num(np.asarray(model.components_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        "mean": np.nan_to_num(np.asarray(model.mean_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        "noise_variance": np.nan_to_num(np.asarray(model.noise_variance_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        "log_likelihood": np.nan_to_num(np.asarray(getattr(model, "loglike_", []), dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        "n_iter": int(getattr(model, "n_iter_", 0)),
+    }
+    return latent, params
+
+
+def _select_factor_analysis_channels(
+    activity: np.ndarray,
+    labels,
+    min_total_activity: float = 1.0,
+    min_active_bursts: int = 1,
+    min_variance: float = 0.0,
+    max_channels: int = 256,
+) -> tuple[np.ndarray, list[str], dict]:
+    values = np.nan_to_num(np.asarray(activity, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    channel_count = values.shape[1] if values.ndim == 3 else 0
+    all_labels = [str(label) for label in labels]
+    if channel_count == 0:
+        return np.zeros(0, dtype=int), [], {
+            "total_activity": np.zeros(0, dtype=float),
+            "active_bursts": np.zeros(0, dtype=int),
+            "variance": np.zeros(0, dtype=float),
+            "score": np.zeros(0, dtype=float),
+        }
+    flat = np.transpose(values, (0, 2, 1)).reshape((-1, channel_count))
+    total_activity = np.sum(np.maximum(values, 0.0), axis=(0, 2))
+    active_bursts = np.count_nonzero(np.sum(np.maximum(values, 0.0), axis=2) > 0.0, axis=0)
+    variance = np.var(flat, axis=0)
+    score = total_activity * np.sqrt(np.maximum(variance, 0.0) + 1e-12)
+    mask = (
+        (total_activity >= max(0.0, float(min_total_activity)))
+        & (active_bursts >= max(0, int(min_active_bursts)))
+        & (variance >= max(0.0, float(min_variance)))
+    )
+    selected = np.flatnonzero(mask)
+    if selected.size == 0:
+        fallback_count = min(channel_count, max(1, int(max_channels)))
+        selected = np.argsort(score)[::-1][:fallback_count]
+    else:
+        max_channels = max(1, int(max_channels))
+        if selected.size > max_channels:
+            selected = selected[np.argsort(score[selected])[::-1][:max_channels]]
+        else:
+            selected = selected[np.argsort(score[selected])[::-1]]
+    selected = np.asarray(selected, dtype=int)
+    selected_labels = [all_labels[index] if index < len(all_labels) else f"channel{index + 1}" for index in selected]
+    metrics = {
+        "total_activity": total_activity,
+        "active_bursts": active_bursts.astype(int),
+        "variance": variance,
+        "score": score,
+        "selected_indices": selected,
+    }
+    return selected, selected_labels, metrics
+
+
+def _burst_trajectory_analysis(
+    spike_series,
+    burst_intervals,
+    time_bin_ms: float = 5.0,
+    window_ms: float = 100.0,
+    normalization: str = "channel_zscore",
+    cluster_count: int = 3,
+    early_bins: int = 3,
+    latent_dim: int = 16,
+    min_total_activity: float = 1.0,
+    min_active_bursts: int = 1,
+    min_variance: float = 0.0,
+    max_channels: int = 256,
+    selected_channel_indices: np.ndarray | None = None,
+    analysis_scope: str = "burst",
+) -> dict:
+    labels, intervals, activity = _burst_activity_matrix(spike_series, burst_intervals, time_bin_ms, window_ms)
+    burst_count = int(activity.shape[0]) if activity.ndim == 3 else 0
+    bin_count = int(activity.shape[2]) if activity.ndim == 3 else 0
+    centers_ms = (np.arange(bin_count, dtype=float) + 0.5) * max(0.001, float(time_bin_ms))
+    if burst_count == 0 or bin_count == 0:
+        return {
+            "labels": labels,
+            "intervals": intervals,
+            "activity": activity,
+            "features": np.zeros((burst_count, bin_count, len(labels)), dtype=float),
+            "observed_states": np.zeros((burst_count, bin_count, len(labels)), dtype=float),
+            "reconstructed_states": np.zeros((burst_count, bin_count, len(labels)), dtype=float),
+            "raw_observed_states": np.zeros((burst_count, bin_count, len(labels)), dtype=float),
+            "raw_reconstructed_states": np.zeros((burst_count, bin_count, len(labels)), dtype=float),
+            "centers_ms": centers_ms,
+            "groups": np.ones(burst_count, dtype=int),
+            "dispersion": np.zeros(bin_count, dtype=float),
+            "reconstruction_rmse": np.zeros(bin_count, dtype=float),
+            "reconstruction_r2": 0.0,
+            "early_mean_dispersion": 0.0,
+            "late_mean_dispersion": 0.0,
+            "latent_states": np.zeros((burst_count, bin_count, 0), dtype=float),
+            "latent_params": {},
+            "representation": "factor_analysis",
+            "state_projection": "Factor Analysis 0D",
+            "analysis_scope": str(analysis_scope or "burst"),
+            "selected_channel_indices": np.zeros(0, dtype=int),
+            "selected_labels": [],
+            "channel_filter": {},
+        }
+
+    if selected_channel_indices is None:
+        selected_indices, selected_labels, channel_filter = _select_factor_analysis_channels(
+            activity,
+            labels,
+            min_total_activity=min_total_activity,
+            min_active_bursts=min_active_bursts,
+            min_variance=min_variance,
+            max_channels=max_channels,
+        )
+    else:
+        channel_count = activity.shape[1] if activity.ndim == 3 else 0
+        selected_indices = np.asarray(selected_channel_indices, dtype=int)
+        selected_indices = selected_indices[(selected_indices >= 0) & (selected_indices < channel_count)]
+        selected_labels = [str(labels[int(index)]) for index in selected_indices]
+        flat = np.transpose(np.nan_to_num(activity, nan=0.0, posinf=0.0, neginf=0.0), (0, 2, 1)).reshape((-1, channel_count)) if channel_count else np.zeros((0, 0), dtype=float)
+        total_activity = np.sum(np.maximum(activity, 0.0), axis=(0, 2)) if channel_count else np.zeros(0, dtype=float)
+        active_bursts = np.count_nonzero(np.sum(np.maximum(activity, 0.0), axis=2) > 0.0, axis=0) if channel_count else np.zeros(0, dtype=int)
+        variance = np.var(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float)
+        channel_filter = {
+            "total_activity": total_activity,
+            "active_bursts": active_bursts.astype(int),
+            "variance": variance,
+            "score": total_activity * np.sqrt(np.maximum(variance, 0.0) + 1e-12),
+            "selected_indices": selected_indices,
+        }
+    filtered_activity = activity[:, selected_indices, :] if selected_indices.size else activity[:, :0, :]
+    raw_observed_states = np.transpose(np.nan_to_num(filtered_activity, nan=0.0, posinf=0.0, neginf=0.0), (0, 2, 1))
+    observed_states, norm_params = _burst_trajectory_feature_transform(filtered_activity, normalization)
+    latent_states, latent_params = _factor_analysis_latent_states(observed_states, latent_dim)
+    loadings = np.asarray(latent_params.get("loadings", []), dtype=float)
+    mean = np.asarray(latent_params.get("mean", []), dtype=float)
+    if latent_states.size and loadings.ndim == 2 and mean.ndim == 1:
+        reconstructed_flat = latent_states.reshape((-1, latent_states.shape[2])) @ loadings + mean
+        reconstructed_states = reconstructed_flat.reshape(observed_states.shape)
+    else:
+        reconstructed_states = np.zeros_like(observed_states)
+    raw_reconstructed_states = _burst_trajectory_inverse_features(reconstructed_states, norm_params)
+    residual = observed_states - reconstructed_states
+    per_sample_rmse = np.sqrt(np.mean(residual ** 2, axis=2)) if residual.ndim == 3 and residual.shape[2] else np.zeros((burst_count, bin_count), dtype=float)
+    reconstruction_rmse = np.mean(per_sample_rmse, axis=0) if per_sample_rmse.size else np.zeros(bin_count, dtype=float)
+    sse = float(np.sum(residual ** 2))
+    centered_observed = observed_states - np.mean(observed_states, axis=(0, 1), keepdims=True)
+    sst = float(np.sum(centered_observed ** 2))
+    reconstruction_r2 = 1.0 - sse / max(sst, 1e-12)
+
+    trajectory_bins = latent_states.shape[1]
+    early_count = max(1, min(int(early_bins), max(1, trajectory_bins)))
+    start_features = np.mean(latent_states[:, :early_count, :], axis=1)
+    groups = _kmeans_groups(start_features, int(cluster_count))
+    dispersion = _trajectory_dispersion(latent_states)
+    late_start = min(max(0, trajectory_bins - 1), max(early_count, int(np.floor(max(1, trajectory_bins) * 0.5))))
+    early_mean = float(np.mean(dispersion[:early_count])) if dispersion.size else 0.0
+    late_mean = float(np.mean(dispersion[late_start:])) if dispersion.size else 0.0
+    state_projection = f"Factor Analysis {latent_states.shape[2]}D"
+    return {
+        "labels": labels,
+        "selected_labels": selected_labels,
+        "selected_channel_indices": selected_indices,
+        "channel_filter": channel_filter,
+        "intervals": intervals,
+        "activity": activity,
+        "features": observed_states,
+        "observed_states": observed_states,
+        "reconstructed_states": reconstructed_states,
+        "raw_observed_states": raw_observed_states,
+        "raw_reconstructed_states": raw_reconstructed_states,
+        "normalization_params": norm_params,
+        "centers_ms": centers_ms,
+        "groups": groups,
+        "dispersion": dispersion,
+        "reconstruction_rmse": reconstruction_rmse,
+        "reconstruction_r2": float(reconstruction_r2),
+        "early_mean_dispersion": early_mean,
+        "late_mean_dispersion": late_mean,
+        "early_bins": early_count,
+        "time_bin_ms": float(time_bin_ms),
+        "window_ms": float(window_ms),
+        "representation": "factor_analysis",
+        "analysis_scope": str(analysis_scope or "burst"),
+        "state_projection": state_projection,
+        "latent_states": latent_states,
+        "latent_params": latent_params,
+    }
+
+
+def _aligned_weight_similarity(weight_matrices: list[np.ndarray]) -> tuple[np.ndarray, list[np.ndarray]]:
+    matrices = [np.nan_to_num(np.asarray(matrix, dtype=float), nan=0.0, posinf=0.0, neginf=0.0) for matrix in weight_matrices]
+    count = len(matrices)
+    similarity = np.eye(count, dtype=float)
+    aligned = [matrix.copy() for matrix in matrices]
+    if count == 0:
+        return np.zeros((0, 0), dtype=float), []
+    reference = matrices[0]
+    if reference.ndim != 2 or reference.size == 0:
+        return similarity, aligned
+    for index in range(1, count):
+        matrix = matrices[index]
+        if matrix.ndim != 2 or matrix.size == 0:
+            continue
+        dims = min(reference.shape[0], matrix.shape[0])
+        channels = min(reference.shape[1], matrix.shape[1])
+        if dims < 1 or channels < 1:
+            continue
+        ref_block = reference[:dims, :channels]
+        matrix_block = matrix[:dims, :channels]
+        try:
+            u, _s, vt = np.linalg.svd(matrix_block @ ref_block.T, full_matrices=False)
+            rotation = vt.T @ u.T
+            aligned_block = rotation @ matrix_block
+            aligned[index] = matrix.copy()
+            aligned[index][:dims, :channels] = aligned_block
+        except np.linalg.LinAlgError:
+            aligned[index] = matrix.copy()
+    for row in range(count):
+        for col in range(row + 1, count):
+            a = aligned[row]
+            b = aligned[col]
+            if a.ndim != 2 or b.ndim != 2 or a.size == 0 or b.size == 0:
+                value = 0.0
+            else:
+                dims = min(a.shape[0], b.shape[0])
+                channels = min(a.shape[1], b.shape[1])
+                va = a[:dims, :channels].reshape(-1)
+                vb = b[:dims, :channels].reshape(-1)
+                va = va - np.mean(va)
+                vb = vb - np.mean(vb)
+                denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+                value = float(np.dot(va, vb) / denom) if denom > 1e-12 else 0.0
+            similarity[row, col] = value
+            similarity[col, row] = value
+    return similarity, aligned
+
+
+def _multi_file_factor_analysis_payload(
+    paths,
+    *,
+    time_bin_ms: float = 10.0,
+    window_ms: float = 300.0,
+    normalization: str = "channel_zscore",
+    latent_dim: int = 16,
+    min_total_activity: float = 1.0,
+    min_active_bursts: int = 1,
+    min_variance: float = 0.0,
+    max_channels: int = 256,
+    burst_bin_ms: float = 10.0,
+    burst_smooth_ms: float = 50.0,
+    burst_threshold_z: float = 4.0,
+    artifact_ms: float = 1.0,
+    analysis_scope: str = "burst",
+    cancel_check=None,
+    progress=None,
+) -> dict:
+    files = _stimulus_response_supported_files(paths)
+    prepared_records = []
+    errors = []
+    total = max(1, len(files))
+    for index, path in enumerate(files):
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Multi-file factor analysis cancelled")
+        if progress is not None:
+            progress(5 + int(82 * index / total), f"Reading {path.name}...")
+        try:
+            data = _load_spike_only_data(path, cancel_check=cancel_check)
+            spike_series = _spike_series_from_unified(data)
+            stim_times = np.asarray(getattr(data, "stim_times", []), dtype=float)
+            stim_times = np.sort(stim_times[np.isfinite(stim_times)])
+            artifact_ms = max(0.0, float(artifact_ms))
+            artifact_removed = 0
+            if artifact_ms > 0.0 and stim_times.size:
+                spike_series, _artifact_masks, artifact_removed = _filter_spike_series_stim_tail(
+                    spike_series,
+                    stim_times,
+                    artifact_ms,
+                )
+            if not spike_series:
+                raise ValueError("No spike trains found")
+            scope = str(analysis_scope or "burst")
+            if scope == "all_windows":
+                intervals = _non_overlapping_spike_windows(spike_series, window_ms)
+            else:
+                intervals = _detect_burst_intervals(
+                    spike_series,
+                    bin_ms=burst_bin_ms,
+                    smooth_ms=burst_smooth_ms,
+                    threshold_z=burst_threshold_z,
+                    cancel_check=cancel_check,
+                )
+            if not intervals:
+                raise ValueError("No analysis windows available" if scope == "all_windows" else "No bursts detected")
+            labels, activity_intervals, activity = _burst_activity_matrix(spike_series, intervals, time_bin_ms, window_ms)
+            params = _extract_stimulus_parameters(path)
+            prepared_records.append(
+                {
+                    "path": str(path),
+                    "file": Path(path).name,
+                    "condition": _stimulus_parameter_label(params, path),
+                    "parameters": params,
+                    "spike_series": spike_series,
+                    "intervals": activity_intervals,
+                    "labels": [str(label) for label in labels],
+                    "activity": activity,
+                    "burst_count": len(activity_intervals),
+                    "channel_count": len(spike_series),
+                    "stim_count": int(stim_times.size),
+                    "artifact_ms": float(artifact_ms),
+                    "artifact_removed_spikes": int(artifact_removed),
+                }
+            )
+        except Exception as exc:
+            errors.append(f"{Path(path).name}: {exc}")
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Multi-file factor analysis cancelled")
+    if progress is not None:
+        progress(88, "Selecting global channel set...")
+    all_labels = sorted(
+        {str(label) for record in prepared_records for label in record.get("labels", [])},
+        key=_channel_sort_key,
+    )
+    global_index = {label: index for index, label in enumerate(all_labels)}
+    bin_count = 0
+    if prepared_records:
+        first_activity = np.asarray(prepared_records[0].get("activity", []), dtype=float)
+        bin_count = int(first_activity.shape[2]) if first_activity.ndim == 3 else 0
+    global_chunks = []
+    for record in prepared_records:
+        activity = np.asarray(record.get("activity", []), dtype=float)
+        labels = [str(label) for label in record.get("labels", [])]
+        if activity.ndim != 3:
+            continue
+        aligned_activity = np.zeros((activity.shape[0], len(all_labels), activity.shape[2]), dtype=float)
+        for local_index, label in enumerate(labels):
+            target_index = global_index.get(label)
+            if target_index is not None:
+                aligned_activity[:, target_index, :] = activity[:, local_index, :]
+        record["global_activity"] = aligned_activity
+        if aligned_activity.size:
+            global_chunks.append(aligned_activity)
+    if global_chunks:
+        global_activity = np.concatenate(global_chunks, axis=0)
+        selected_indices, selected_labels, global_channel_filter = _select_factor_analysis_channels(
+            global_activity,
+            all_labels,
+            min_total_activity=min_total_activity,
+            min_active_bursts=min_active_bursts,
+            min_variance=min_variance,
+            max_channels=max_channels,
+        )
+        selected_indices = np.asarray(sorted(int(index) for index in selected_indices), dtype=int)
+        selected_labels = [all_labels[int(index)] for index in selected_indices]
+        global_channel_filter = dict(global_channel_filter)
+        global_channel_filter["selected_indices"] = selected_indices
+    else:
+        global_channel_filter = {}
+        selected_indices = np.zeros(0, dtype=int)
+        selected_labels = []
+
+    if progress is not None:
+        progress(92, "Fitting aligned factor models...")
+    records = []
+    selected_set = set(int(index) for index in selected_indices)
+    for record in prepared_records:
+        global_activity = np.asarray(record.get("global_activity", []), dtype=float)
+        if global_activity.ndim != 3 or global_activity.shape[0] == 0 or not selected_set:
+            errors.append(f"{record.get('file', 'unknown')}: no global selected channels available")
+            continue
+        fixed_series = []
+        for index, label in enumerate(all_labels):
+            fixed_series.append((label, np.array([], dtype=float)))
+        analysis = _burst_trajectory_analysis(
+            fixed_series,
+            record.get("intervals", []),
+            time_bin_ms=time_bin_ms,
+            window_ms=window_ms,
+            normalization=normalization,
+            latent_dim=latent_dim,
+            min_total_activity=min_total_activity,
+            min_active_bursts=min_active_bursts,
+            min_variance=min_variance,
+            max_channels=max_channels,
+            selected_channel_indices=selected_indices,
+            analysis_scope=str(analysis_scope or "burst"),
+        )
+        analysis["activity"] = global_activity
+        filtered_activity = global_activity[:, selected_indices, :] if selected_indices.size else global_activity[:, :0, :]
+        raw_observed_states = np.transpose(np.nan_to_num(filtered_activity, nan=0.0, posinf=0.0, neginf=0.0), (0, 2, 1))
+        observed_states, norm_params = _burst_trajectory_feature_transform(filtered_activity, normalization)
+        latent_states, latent_params = _factor_analysis_latent_states(observed_states, latent_dim)
+        loadings = np.asarray(latent_params.get("loadings", []), dtype=float)
+        mean = np.asarray(latent_params.get("mean", []), dtype=float)
+        if latent_states.size and loadings.ndim == 2 and mean.ndim == 1:
+            reconstructed_flat = latent_states.reshape((-1, latent_states.shape[2])) @ loadings + mean
+            reconstructed_states = reconstructed_flat.reshape(observed_states.shape)
+        else:
+            reconstructed_states = np.zeros_like(observed_states)
+        raw_reconstructed_states = _burst_trajectory_inverse_features(reconstructed_states, norm_params)
+        residual = observed_states - reconstructed_states
+        per_sample_rmse = np.sqrt(np.mean(residual ** 2, axis=2)) if residual.ndim == 3 and residual.shape[2] else np.zeros((observed_states.shape[0], observed_states.shape[1]), dtype=float)
+        reconstruction_rmse = np.mean(per_sample_rmse, axis=0) if per_sample_rmse.size else np.zeros(bin_count, dtype=float)
+        centered_observed = observed_states - np.mean(observed_states, axis=(0, 1), keepdims=True) if observed_states.size else observed_states
+        sse = float(np.sum(residual ** 2))
+        sst = float(np.sum(centered_observed ** 2))
+        reconstruction_r2 = 1.0 - sse / max(sst, 1e-12)
+        dispersion = _trajectory_dispersion(latent_states)
+        early_count = max(1, min(3, max(1, latent_states.shape[1] if latent_states.ndim == 3 else 1)))
+        early_mean = float(np.mean(dispersion[:early_count])) if dispersion.size else 0.0
+        late_start = min(max(0, dispersion.size - 1), max(early_count, int(np.floor(max(1, dispersion.size) * 0.5)))) if dispersion.size else 0
+        late_mean = float(np.mean(dispersion[late_start:])) if dispersion.size else 0.0
+        analysis.update(
+            {
+                "labels": all_labels,
+                "selected_labels": selected_labels,
+                "selected_channel_indices": selected_indices,
+                "channel_filter": global_channel_filter,
+                "features": observed_states,
+                "observed_states": observed_states,
+                "reconstructed_states": reconstructed_states,
+                "raw_observed_states": raw_observed_states,
+                "raw_reconstructed_states": raw_reconstructed_states,
+                "normalization_params": norm_params,
+                "latent_states": latent_states,
+                "latent_params": latent_params,
+                "reconstruction_rmse": reconstruction_rmse,
+                "reconstruction_r2": float(reconstruction_r2),
+                "dispersion": dispersion,
+                "early_mean_dispersion": early_mean,
+                "late_mean_dispersion": late_mean,
+                "state_projection": f"Factor Analysis {latent_states.shape[2] if latent_states.ndim == 3 else 0}D",
+                "analysis_scope": str(analysis_scope or "burst"),
+            }
+        )
+        record = dict(record)
+        record.pop("spike_series", None)
+        record.pop("activity", None)
+        record.pop("global_activity", None)
+        record["analysis"] = analysis
+        record["selected_channel_count"] = len(selected_labels)
+        record["latent_dim"] = int(latent_states.shape[2]) if latent_states.ndim == 3 else 0
+        record["reconstruction_r2"] = float(reconstruction_r2)
+        records.append(record)
+
+    if progress is not None:
+        progress(96, "Aligning factor loading matrices...")
+    weights = [np.asarray((record.get("analysis", {}).get("latent_params", {}) or {}).get("loadings", []), dtype=float) for record in records]
+    similarity, aligned_weights = _aligned_weight_similarity(weights)
+    for record, aligned_weight in zip(records, aligned_weights):
+        record["aligned_loadings"] = aligned_weight
+    return {
+        "records": records,
+        "errors": errors,
+        "paths": [str(path) for path in files],
+        "w_similarity": similarity,
+        "global_labels": all_labels,
+        "global_selected_labels": selected_labels,
+        "global_selected_channel_indices": selected_indices,
+        "global_channel_filter": global_channel_filter,
+        "time_bin_ms": float(time_bin_ms),
+        "window_ms": float(window_ms),
+        "normalization": str(normalization),
+        "latent_dim": int(latent_dim),
+        "min_total_activity": float(min_total_activity),
+        "min_active_bursts": int(min_active_bursts),
+        "min_variance": float(min_variance),
+        "max_channels": int(max_channels),
+        "burst_bin_ms": float(burst_bin_ms),
+        "burst_smooth_ms": float(burst_smooth_ms),
+        "burst_threshold_z": float(burst_threshold_z),
+        "artifact_ms": float(artifact_ms),
+        "analysis_scope": str(analysis_scope or "burst"),
+    }
 
 
 def _burst_global_stat_features(spike_series, intervals, bin_ms: float) -> np.ndarray:
@@ -1771,10 +2358,11 @@ def _temporal_coupling_pairs(
     return sorted(results, key=lambda item: (item["strength"], item["peak_count"]), reverse=True)
 
 
+DATA_FILE_EXTENSIONS = {".npy", ".npz", ".csv", ".txt", ".tsv", ".nev", ".spk", ".h5", ".hdf5"}
 STIMULUS_RESPONSE_EXTENSIONS = {".nev", ".spk", ".h5", ".hdf5", ".npz"}
 
 
-def _stimulus_response_supported_files(paths) -> list[Path]:
+def _supported_files(paths, extensions: set[str]) -> list[Path]:
     files = []
     seen = set()
     for raw_path in paths:
@@ -1783,9 +2371,9 @@ def _stimulus_response_supported_files(paths) -> list[Path]:
             candidates = [
                 child
                 for child in path.rglob("*")
-                if child.is_file() and child.suffix.lower() in STIMULUS_RESPONSE_EXTENSIONS
+                if child.is_file() and child.suffix.lower() in extensions
             ]
-        elif path.is_file() and path.suffix.lower() in STIMULUS_RESPONSE_EXTENSIONS:
+        elif path.is_file() and path.suffix.lower() in extensions:
             candidates = [path]
         else:
             candidates = []
@@ -1796,6 +2384,14 @@ def _stimulus_response_supported_files(paths) -> list[Path]:
             seen.add(resolved)
             files.append(candidate)
     return sorted(files, key=lambda item: str(item).lower())
+
+
+def _data_file_supported_files(paths) -> list[Path]:
+    return _supported_files(paths, DATA_FILE_EXTENSIONS)
+
+
+def _stimulus_response_supported_files(paths) -> list[Path]:
+    return _supported_files(paths, STIMULUS_RESPONSE_EXTENSIONS)
 
 
 def _normalize_stimulus_parameter_key(key: str, unit: str = "") -> str:
@@ -2767,8 +3363,8 @@ class DataLoadWorker(QRunnable):
                 data_kind = "nev"
             elif suffix in {".h5", ".hdf5"}:
                 self.signals.progress.emit(18, "Reading Maxwell H5 metadata...")
-                self.signals.progress.emit(25, "Extracting spikes and waveforms...")
-                raw_data = read_maxwell_h5(self.path, cancel_check=self._is_cancelled)
+                self.signals.progress.emit(25, "Extracting Maxwell spikes...")
+                raw_data = read_maxwell_h5(self.path, cancel_check=self._is_cancelled, extract_waveforms=False)
                 data_kind = "nev"
             else:
                 self.signals.progress.emit(20, "Reading data file...")
@@ -2780,6 +3376,124 @@ class DataLoadWorker(QRunnable):
             self.signals.finished.emit({"path": self.path, "raw_data": raw_data, "data_kind": data_kind})
         except InterruptedError as exc:
             self.signals.canceled.emit(str(exc) or "Data loading cancelled")
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+
+def _load_gui_data_file(path: str | Path, *, selected_wells=None, cancel_check=None):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Data loading cancelled")
+    if suffix == ".nev":
+        raw_data = read_blackrock_nev(path, cancel_check=cancel_check)
+        data_kind = "nev"
+    elif suffix == ".spk":
+        raw_data = read_axion_spk(path, wells=selected_wells)
+        data_kind = "nev"
+    elif suffix in {".h5", ".hdf5"}:
+        raw_data = read_maxwell_h5(path, cancel_check=cancel_check, extract_waveforms=False)
+        data_kind = "nev"
+    else:
+        raw_data = MEAReader(path).load_data()
+        data_kind = "nev" if isinstance(raw_data, UnifiedMEAData) else "array"
+    return raw_data, data_kind
+
+
+def _loaded_data_kind_label(data, data_kind: str = "") -> str:
+    if isinstance(data, UnifiedMEAData) and isinstance(data.meta, dict):
+        source = str(data.meta.get("source", "") or "")
+        if source:
+            return source
+    return str(data_kind or type(data).__name__)
+
+
+def _loaded_data_stats(data) -> tuple[int, int, int]:
+    if isinstance(data, UnifiedMEAData):
+        channels = len(data.channels())
+        spikes = int(sum(np.asarray(values).size for values in data.spikes.values()))
+        waveforms = len(data.waveforms)
+        return channels, spikes, waveforms
+    array = np.asarray(data) if data is not None else np.asarray([])
+    channels = int(array.shape[0]) if array.ndim >= 1 else 0
+    return channels, int(array.size), 0
+
+
+class FileDatabaseLoadWorker(QRunnable):
+    def __init__(self, paths, *, selected_wells_by_path=None):
+        super().__init__()
+        self.paths = [str(path) for path in paths]
+        self.selected_wells_by_path = dict(selected_wells_by_path or {})
+        self.signals = WorkerSignals()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    @Slot()
+    def run(self):
+        records = []
+        errors = []
+        total = max(1, len(self.paths))
+        try:
+            for index, path_text in enumerate(self.paths):
+                if self._is_cancelled():
+                    raise InterruptedError("Data loading cancelled")
+                path = Path(path_text)
+                self.signals.progress.emit(
+                    5 + int(87 * index / total),
+                    f"Reading {path.name} ({index + 1}/{len(self.paths)})...",
+                )
+                try:
+                    raw_data, data_kind = _load_gui_data_file(
+                        path,
+                        selected_wells=self.selected_wells_by_path.get(str(path)),
+                        cancel_check=self._is_cancelled,
+                    )
+                    records.append({"path": str(path), "raw_data": raw_data, "data_kind": data_kind})
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    errors.append(f"{path.name}: {exc}")
+            if self._is_cancelled():
+                raise InterruptedError("Data loading cancelled")
+            self.signals.progress.emit(95, "Preparing file database...")
+            self.signals.finished.emit({"records": records, "errors": errors})
+        except InterruptedError as exc:
+            self.signals.canceled.emit(str(exc) or "Data loading cancelled")
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+
+class MaxwellWaveformLoadWorker(QRunnable):
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+        self.signals = WorkerSignals()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    @Slot()
+    def run(self):
+        try:
+            if self._is_cancelled():
+                raise InterruptedError("Waveform loading cancelled")
+            self.signals.progress.emit(10, "Opening Maxwell raw data...")
+            data = read_maxwell_h5(self.path, cancel_check=self._is_cancelled, extract_waveforms=True)
+            if self._is_cancelled():
+                raise InterruptedError("Waveform loading cancelled")
+            self.signals.progress.emit(95, "Preparing waveforms...")
+            self.signals.finished.emit(data)
+        except InterruptedError as exc:
+            self.signals.canceled.emit(str(exc) or "Waveform loading cancelled")
         except Exception:
             self.signals.failed.emit(traceback.format_exc())
 
@@ -2839,6 +3553,354 @@ class StimulusResponseWorker(QRunnable):
             self.signals.canceled.emit(str(exc) or "Stimulus response analysis cancelled")
         except Exception:
             self.signals.failed.emit(traceback.format_exc())
+
+
+class MultiFileFactorAnalysisWorker(QRunnable):
+    def __init__(self, paths, parameters: dict):
+        super().__init__()
+        self.paths = [str(path) for path in paths]
+        self.parameters = dict(parameters or {})
+        self.signals = WorkerSignals()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    @Slot()
+    def run(self):
+        try:
+            payload = _multi_file_factor_analysis_payload(
+                self.paths,
+                cancel_check=self._is_cancelled,
+                progress=self.signals.progress.emit,
+                **self.parameters,
+            )
+            if self._is_cancelled():
+                raise InterruptedError("Multi-file factor analysis cancelled")
+            self.signals.finished.emit(payload)
+        except InterruptedError as exc:
+            self.signals.canceled.emit(str(exc) or "Multi-file factor analysis cancelled")
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+
+class DataFilesInputDialog(QDialog):
+    def __init__(self, parent=None, initial_paths=None):
+        super().__init__(parent)
+        self.setWindowTitle("Open Data Files")
+        self.resize(860, 520)
+        self.paths: list[str] = []
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Type", "Folder"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+
+        add_files = QPushButton("Add Files")
+        add_files.clicked.connect(self._add_files)
+        add_folder = QPushButton("Add Folder")
+        add_folder.clicked.connect(self._add_folder)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_selected)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        load = QPushButton("Load")
+        load.setObjectName("PrimaryButton")
+        load.clicked.connect(self.accept)
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        controls.addWidget(add_files)
+        controls.addWidget(add_folder)
+        controls.addWidget(remove)
+        controls.addWidget(cancel)
+        controls.addWidget(load)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Add data files directly, or add folders recursively. Maxwell H5 files load spikes first; waveforms are loaded later for sorting."))
+        layout.addWidget(self.table, 1)
+        layout.addLayout(controls)
+
+        if initial_paths:
+            self._add_paths(initial_paths)
+
+    def _add_paths(self, paths) -> None:
+        files = _data_file_supported_files(paths)
+        existing = set(self.paths)
+        for path in files:
+            path_text = str(path)
+            if path_text not in existing:
+                self.paths.append(path_text)
+                existing.add(path_text)
+        self.paths.sort(key=str.lower)
+        self._refresh_table()
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add data files",
+            "data",
+            "Data files (*.npy *.npz *.csv *.txt *.tsv *.nev *.spk *.h5 *.hdf5);;Array files (*.npy *.npz *.csv *.txt *.tsv);;Spike files (*.nev *.spk *.h5 *.hdf5 *.npz);;All files (*)",
+        )
+        self._add_paths(paths)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Add data folder", "data")
+        if path:
+            self._add_paths([path])
+
+    def _remove_selected(self) -> None:
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in selected_rows:
+            if 0 <= row < len(self.paths):
+                self.paths.pop(row)
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self.paths))
+        for row, path_text in enumerate(self.paths):
+            path = Path(path_text)
+            values = [path.name, path.suffix.lower().lstrip(".") or "file", str(path.parent)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, path_text)
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+
+    def values(self) -> list[str]:
+        return list(self.paths)
+
+
+class _DatabaseAnalysisDialogBase(QDialog):
+    def _setup_database_table(self):
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["File", "Kind", "Channels", "Spikes", "Folder"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+
+    def _set_records(self, records) -> None:
+        self.records = list(records or [])
+        self.table.setRowCount(len(self.records))
+        for row, record in enumerate(self.records):
+            path = Path(str(record.get("path", "")))
+            data = record.get("raw_data")
+            channels, spikes, _waveforms = _loaded_data_stats(data)
+            values = [
+                path.name,
+                _loaded_data_kind_label(data, str(record.get("data_kind", ""))),
+                str(channels),
+                str(spikes),
+                str(path.parent),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+        if self.records:
+            self.table.selectAll()
+
+    def _selected_paths(self) -> list[str]:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not rows:
+            rows = list(range(len(self.records)))
+        return [
+            str(self.records[row].get("path", ""))
+            for row in rows
+            if 0 <= row < len(self.records) and self.records[row].get("path")
+        ]
+
+
+class StimulusDatabaseAnalysisDialog(_DatabaseAnalysisDialogBase):
+    def __init__(self, records, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stimulus Response Database")
+        self.resize(900, 560)
+        self.cached_payload: dict | None = None
+
+        self.pre_ms = QDoubleSpinBox()
+        self.pre_ms.setRange(0.0, 10000.0)
+        self.pre_ms.setDecimals(1)
+        self.pre_ms.setValue(200.0)
+        self.pre_ms.setSuffix(" ms")
+        self.response_ms = QDoubleSpinBox()
+        self.response_ms.setRange(1.0, 60000.0)
+        self.response_ms.setDecimals(1)
+        self.response_ms.setValue(1000.0)
+        self.response_ms.setSuffix(" ms")
+        self.artifact_ms = QDoubleSpinBox()
+        self.artifact_ms.setRange(0.0, 1000.0)
+        self.artifact_ms.setDecimals(1)
+        self.artifact_ms.setSingleStep(0.5)
+        self.artifact_ms.setValue(1.0)
+        self.artifact_ms.setSuffix(" ms")
+        self._setup_database_table()
+        self._set_records(records)
+
+        analyze = QPushButton("Analyze")
+        analyze.setObjectName("PrimaryButton")
+        analyze.clicked.connect(self.accept)
+        self.open_raster_button = QPushButton("Open Raster")
+        self.open_raster_button.setEnabled(False)
+        self.psth_button = QPushButton("PSTH")
+        self.psth_button.setEnabled(False)
+        self.activation_curve_button = QPushButton("Activation curve")
+        self.activation_curve_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Pre"))
+        controls.addWidget(self.pre_ms)
+        controls.addWidget(QLabel("Response"))
+        controls.addWidget(self.response_ms)
+        controls.addWidget(QLabel("Remove tail +/-"))
+        controls.addWidget(self.artifact_ms)
+        controls.addStretch(1)
+        controls.addWidget(self.open_raster_button)
+        controls.addWidget(self.psth_button)
+        controls.addWidget(self.activation_curve_button)
+        controls.addWidget(cancel)
+        controls.addWidget(analyze)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select files from the loaded database for stimulus response analysis."))
+        layout.addWidget(self.table, 1)
+        layout.addLayout(controls)
+        _fix_spinbox_hit_targets(self)
+
+    def values(self) -> tuple[list[str], float, float, float]:
+        return self._selected_paths(), float(self.pre_ms.value()), float(self.response_ms.value()), float(self.artifact_ms.value())
+
+    def set_cached_payload(self, payload: dict | None) -> None:
+        self.cached_payload = payload if isinstance(payload, dict) else None
+        has_records = bool(self.cached_payload and self.cached_payload.get("records"))
+        self.open_raster_button.setEnabled(has_records)
+        self.psth_button.setEnabled(has_records)
+        self.activation_curve_button.setEnabled(has_records)
+
+
+class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
+    def __init__(self, records, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Multi-file FA Database")
+        self.resize(980, 600)
+        self.cached_payload: dict | None = None
+
+        self.bin_ms = QDoubleSpinBox()
+        self.bin_ms.setRange(0.5, 200.0)
+        self.bin_ms.setDecimals(1)
+        self.bin_ms.setValue(10.0)
+        self.bin_ms.setSuffix(" ms")
+        self.window_ms = QDoubleSpinBox()
+        self.window_ms.setRange(5.0, 60000.0)
+        self.window_ms.setDecimals(1)
+        self.window_ms.setValue(300.0)
+        self.window_ms.setSuffix(" ms")
+        self.analysis_scope = QComboBox()
+        self.analysis_scope.addItem("Bursts", "burst")
+        self.analysis_scope.addItem("All data windows", "all_windows")
+        self.normalize = QComboBox()
+        self.normalize.addItem("Channel z-score", "channel_zscore")
+        self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
+        self.normalize.addItem("Per time total", "per_time_total")
+        self.normalize.addItem("None", "none")
+        self.latent_dim = QSpinBox()
+        self.latent_dim.setRange(1, 128)
+        self.latent_dim.setValue(16)
+        self.min_activity = QDoubleSpinBox()
+        self.min_activity.setRange(0.0, 1_000_000.0)
+        self.min_activity.setDecimals(2)
+        self.min_activity.setValue(1.0)
+        self.min_bursts = QSpinBox()
+        self.min_bursts.setRange(0, 100000)
+        self.min_bursts.setValue(1)
+        self.min_var = QDoubleSpinBox()
+        self.min_var.setRange(0.0, 1_000_000.0)
+        self.min_var.setDecimals(6)
+        self.min_var.setValue(0.0)
+        self.max_channels = QSpinBox()
+        self.max_channels.setRange(1, 20000)
+        self.max_channels.setValue(256)
+        self.burst_threshold = QDoubleSpinBox()
+        self.burst_threshold.setRange(0.5, 20.0)
+        self.burst_threshold.setDecimals(1)
+        self.burst_threshold.setValue(4.0)
+        self.artifact_ms = QDoubleSpinBox()
+        self.artifact_ms.setRange(0.0, 1000.0)
+        self.artifact_ms.setDecimals(1)
+        self.artifact_ms.setSingleStep(0.5)
+        self.artifact_ms.setValue(1.0)
+        self.artifact_ms.setSuffix(" ms")
+        self._setup_database_table()
+        self._set_records(records)
+
+        params = QGridLayout()
+        params.addWidget(QLabel("Bin"), 0, 0)
+        params.addWidget(self.bin_ms, 0, 1)
+        params.addWidget(QLabel("Window"), 0, 2)
+        params.addWidget(self.window_ms, 0, 3)
+        params.addWidget(QLabel("Scope"), 0, 4)
+        params.addWidget(self.analysis_scope, 0, 5)
+        params.addWidget(QLabel("Normalize"), 0, 6)
+        params.addWidget(self.normalize, 0, 7)
+        params.addWidget(QLabel("Latent dim"), 0, 8)
+        params.addWidget(self.latent_dim, 0, 9)
+        params.addWidget(QLabel("Min activity"), 1, 0)
+        params.addWidget(self.min_activity, 1, 1)
+        params.addWidget(QLabel("Min bursts"), 1, 2)
+        params.addWidget(self.min_bursts, 1, 3)
+        params.addWidget(QLabel("Min var"), 1, 4)
+        params.addWidget(self.min_var, 1, 5)
+        params.addWidget(QLabel("Max fit ch"), 1, 6)
+        params.addWidget(self.max_channels, 1, 7)
+        params.addWidget(QLabel("Burst z"), 2, 0)
+        params.addWidget(self.burst_threshold, 2, 1)
+        params.addWidget(QLabel("Remove tail +/-"), 2, 2)
+        params.addWidget(self.artifact_ms, 2, 3)
+
+        analyze = QPushButton("Analyze")
+        analyze.setObjectName("PrimaryButton")
+        analyze.clicked.connect(self.accept)
+        self.open_result_button = QPushButton("Open Result")
+        self.open_result_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.open_result_button)
+        buttons.addWidget(cancel)
+        buttons.addWidget(analyze)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select files from the loaded database for multi-file Factor Analysis."))
+        layout.addLayout(params)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(buttons)
+        _fix_spinbox_hit_targets(self)
+
+    def values(self) -> tuple[list[str], dict]:
+        return self._selected_paths(), {
+            "time_bin_ms": float(self.bin_ms.value()),
+            "window_ms": float(self.window_ms.value()),
+            "analysis_scope": str(self.analysis_scope.currentData() or "burst"),
+            "normalization": str(self.normalize.currentData()),
+            "latent_dim": int(self.latent_dim.value()),
+            "min_total_activity": float(self.min_activity.value()),
+            "min_active_bursts": int(self.min_bursts.value()),
+            "min_variance": float(self.min_var.value()),
+            "max_channels": int(self.max_channels.value()),
+            "burst_threshold_z": float(self.burst_threshold.value()),
+            "artifact_ms": float(self.artifact_ms.value()),
+        }
+
+    def set_cached_payload(self, payload: dict | None) -> None:
+        self.cached_payload = payload if isinstance(payload, dict) else None
+        self.open_result_button.setEnabled(bool(self.cached_payload and self.cached_payload.get("records")))
 
 
 class StimulusResponseInputDialog(QDialog):
@@ -2966,6 +4028,185 @@ class StimulusResponseInputDialog(QDialog):
         self.open_raster_button.setEnabled(has_records)
         self.psth_button.setEnabled(has_records)
         self.activation_curve_button.setEnabled(has_records)
+
+
+class MultiFileFactorAnalysisInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Multi-file Factor Analysis")
+        self.resize(940, 560)
+        self.paths: list[str] = []
+        self.cached_payload: dict | None = None
+
+        self.bin_ms = QDoubleSpinBox()
+        self.bin_ms.setRange(0.5, 200.0)
+        self.bin_ms.setDecimals(1)
+        self.bin_ms.setValue(10.0)
+        self.bin_ms.setSuffix(" ms")
+        self.window_ms = QDoubleSpinBox()
+        self.window_ms.setRange(5.0, 60000.0)
+        self.window_ms.setDecimals(1)
+        self.window_ms.setValue(300.0)
+        self.window_ms.setSuffix(" ms")
+        self.analysis_scope = QComboBox()
+        self.analysis_scope.addItem("Bursts", "burst")
+        self.analysis_scope.addItem("All data windows", "all_windows")
+        self.analysis_scope.setToolTip("Use detected bursts, or split each file into non-overlapping windows.")
+        self.normalize = QComboBox()
+        self.normalize.addItem("Channel z-score", "channel_zscore")
+        self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
+        self.normalize.addItem("Per time total", "per_time_total")
+        self.normalize.addItem("None", "none")
+        self.latent_dim = QSpinBox()
+        self.latent_dim.setRange(1, 128)
+        self.latent_dim.setValue(16)
+        self.min_activity = QDoubleSpinBox()
+        self.min_activity.setRange(0.0, 1_000_000.0)
+        self.min_activity.setDecimals(2)
+        self.min_activity.setValue(1.0)
+        self.min_bursts = QSpinBox()
+        self.min_bursts.setRange(0, 100000)
+        self.min_bursts.setValue(1)
+        self.min_var = QDoubleSpinBox()
+        self.min_var.setRange(0.0, 1_000_000.0)
+        self.min_var.setDecimals(6)
+        self.min_var.setValue(0.0)
+        self.max_channels = QSpinBox()
+        self.max_channels.setRange(1, 20000)
+        self.max_channels.setValue(256)
+        self.burst_threshold = QDoubleSpinBox()
+        self.burst_threshold.setRange(0.5, 20.0)
+        self.burst_threshold.setDecimals(1)
+        self.burst_threshold.setValue(4.0)
+        self.artifact_ms = QDoubleSpinBox()
+        self.artifact_ms.setRange(0.0, 1000.0)
+        self.artifact_ms.setDecimals(1)
+        self.artifact_ms.setSingleStep(0.5)
+        self.artifact_ms.setValue(1.0)
+        self.artifact_ms.setSuffix(" ms")
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File", "Condition", "Folder"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+
+        add_files = QPushButton("Add Files")
+        add_files.clicked.connect(self._add_files)
+        add_folder = QPushButton("Add Folder")
+        add_folder.clicked.connect(self._add_folder)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_selected)
+        analyze = QPushButton("Analyze")
+        analyze.setObjectName("PrimaryButton")
+        analyze.clicked.connect(self.accept)
+        self.open_result_button = QPushButton("Open Result")
+        self.open_result_button.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        params = QGridLayout()
+        params.addWidget(QLabel("Bin"), 0, 0)
+        params.addWidget(self.bin_ms, 0, 1)
+        params.addWidget(QLabel("Window"), 0, 2)
+        params.addWidget(self.window_ms, 0, 3)
+        params.addWidget(QLabel("Scope"), 0, 4)
+        params.addWidget(self.analysis_scope, 0, 5)
+        params.addWidget(QLabel("Normalize"), 0, 6)
+        params.addWidget(self.normalize, 0, 7)
+        params.addWidget(QLabel("Latent dim"), 0, 8)
+        params.addWidget(self.latent_dim, 0, 9)
+        params.addWidget(QLabel("Min activity"), 1, 0)
+        params.addWidget(self.min_activity, 1, 1)
+        params.addWidget(QLabel("Min bursts"), 1, 2)
+        params.addWidget(self.min_bursts, 1, 3)
+        params.addWidget(QLabel("Min var"), 1, 4)
+        params.addWidget(self.min_var, 1, 5)
+        params.addWidget(QLabel("Max fit ch"), 1, 6)
+        params.addWidget(self.max_channels, 1, 7)
+        params.addWidget(QLabel("Burst z"), 2, 0)
+        params.addWidget(self.burst_threshold, 2, 1)
+        params.addWidget(QLabel("Remove tail +/-"), 2, 2)
+        params.addWidget(self.artifact_ms, 2, 3)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(add_files)
+        buttons.addWidget(add_folder)
+        buttons.addWidget(remove)
+        buttons.addWidget(self.open_result_button)
+        buttons.addWidget(cancel)
+        buttons.addWidget(analyze)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Add multiple spike-event files or folders. Each file is fit independently with Factor Analysis, then W is aligned to compare loading similarity."))
+        layout.addLayout(params)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(buttons)
+        _fix_spinbox_hit_targets(self)
+
+    def _add_paths(self, paths) -> None:
+        files = _stimulus_response_supported_files(paths)
+        existing = set(self.paths)
+        for path in files:
+            path_text = str(path)
+            if path_text not in existing:
+                self.paths.append(path_text)
+                existing.add(path_text)
+        self.paths.sort(key=str.lower)
+        self._refresh_table()
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add multi-file FA data",
+            "data",
+            "Spike files (*.nev *.spk *.h5 *.hdf5 *.npz);;All files (*)",
+        )
+        self._add_paths(paths)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Add multi-file FA folder", "data")
+        if path:
+            self._add_paths([path])
+
+    def _remove_selected(self) -> None:
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in selected_rows:
+            if 0 <= row < len(self.paths):
+                self.paths.pop(row)
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self.paths))
+        for row, path_text in enumerate(self.paths):
+            path = Path(path_text)
+            params = _extract_stimulus_parameters(path)
+            values = [path.name, _stimulus_parameter_label(params, path), str(path.parent)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, path_text)
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+
+    def values(self) -> tuple[list[str], dict]:
+        return list(self.paths), {
+            "time_bin_ms": float(self.bin_ms.value()),
+            "window_ms": float(self.window_ms.value()),
+            "analysis_scope": str(self.analysis_scope.currentData() or "burst"),
+            "normalization": str(self.normalize.currentData()),
+            "latent_dim": int(self.latent_dim.value()),
+            "min_total_activity": float(self.min_activity.value()),
+            "min_active_bursts": int(self.min_bursts.value()),
+            "min_variance": float(self.min_var.value()),
+            "max_channels": int(self.max_channels.value()),
+            "burst_threshold_z": float(self.burst_threshold.value()),
+            "artifact_ms": float(self.artifact_ms.value()),
+        }
+
+    def set_cached_payload(self, payload: dict | None) -> None:
+        self.cached_payload = payload if isinstance(payload, dict) else None
+        self.open_result_button.setEnabled(bool(self.cached_payload and self.cached_payload.get("records")))
 
 
 class StimulusChannelMapWindow(QDialog):
@@ -7655,6 +8896,1209 @@ class BurstDelayWindow(QDialog):
         ax.set_xlim((-max_lag, max_lag) if self.delay_mode == "burst_first" else (0.0, max_lag))
         self.hist_canvas.draw_idle()
 
+class BurstTrajectoryWindow(QDialog):
+    def __init__(self, spike_series, burst_intervals, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Burst Trajectory")
+        self.resize(1280, 760)
+        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
+        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
+        self.current = None
+        self.metric_windows = []
+
+        self.bin_ms = QDoubleSpinBox()
+        self.bin_ms.setRange(0.5, 200.0)
+        self.bin_ms.setDecimals(1)
+        self.bin_ms.setSingleStep(1.0)
+        self.bin_ms.setValue(10.0)
+        self.bin_ms.setSuffix(" ms")
+
+        self.window_ms = QSpinBox()
+        self.window_ms.setRange(5, 60000)
+        self.window_ms.setSingleStep(10)
+        self.window_ms.setValue(300)
+        self.window_ms.setSuffix(" ms")
+
+        self.analysis_scope = QComboBox()
+        self.analysis_scope.addItem("Bursts", "burst")
+        self.analysis_scope.addItem("All data windows", "all_windows")
+        self.analysis_scope.setToolTip("Use detected bursts, or split the whole recording into non-overlapping windows.")
+
+        self.normalize = QComboBox()
+        self.normalize.addItem("Channel z-score", "channel_zscore")
+        self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
+        self.normalize.addItem("Per time total", "per_time_total")
+        self.normalize.addItem("None", "none")
+
+        self.latent_dim = QSpinBox()
+        self.latent_dim.setRange(1, 128)
+        self.latent_dim.setValue(16)
+
+        self.filter_values = {
+            "min_activity": 1.0,
+            "min_bursts": 1.0,
+            "min_var": 0.0,
+            "max_channels": 256.0,
+        }
+        self.filter_param = QComboBox()
+        self.filter_param.addItem("Min activity", "min_activity")
+        self.filter_param.addItem("Min bursts", "min_bursts")
+        self.filter_param.addItem("Min variance", "min_var")
+        self.filter_param.addItem("Max fit channels", "max_channels")
+        self.filter_param.setToolTip("Select which channel pre-screening parameter the numeric field edits.")
+        self.filter_value = QDoubleSpinBox()
+        self.filter_value.valueChanged.connect(self._filter_value_changed)
+        self.filter_param.currentIndexChanged.connect(self._filter_param_changed)
+        self._filter_param_changed()
+
+        self.selected_burst_value = 1
+        self.display_param = QComboBox()
+        self.display_param.addItem("Burst", "burst")
+        self.display_param.setToolTip("Select which burst the comparison views show.")
+        self.display_value = QSpinBox()
+        self.display_value.valueChanged.connect(self._display_value_changed)
+        self.display_param.currentIndexChanged.connect(self._display_param_changed)
+        self._display_param_changed()
+
+        self.rmse_order = QComboBox()
+        self.rmse_order.addItem("RMSE high to low", "desc")
+        self.rmse_order.addItem("RMSE low to high", "asc")
+        self.rmse_order.currentIndexChanged.connect(self._draw_all_views)
+
+        self.analyze_button = QPushButton("Analyze")
+        self.analyze_button.clicked.connect(self._draw)
+        self.reconstruction_metrics_button = QPushButton("Recon Metrics")
+        self.reconstruction_metrics_button.clicked.connect(self._show_reconstruction_metrics)
+        self.weight_metrics_button = QPushButton("W Metrics")
+        self.weight_metrics_button.clicked.connect(self._show_weight_metrics)
+        self.temporal_model_button = QPushButton("Temporal Model")
+        self.temporal_model_button.clicked.connect(self._show_temporal_model)
+        self.trajectory_analysis_button = QPushButton("Trajectory")
+        self.trajectory_analysis_button.clicked.connect(self._show_trajectory_analysis)
+        self.summary = QLabel("Ready")
+        self.summary.setObjectName("MutedText")
+        self.raster_canvas = FigureCanvas(Figure(figsize=(9, 5.8), tight_layout=True))
+        self.latent_canvas = FigureCanvas(Figure(figsize=(9, 3.2), tight_layout=True))
+        self.psth_canvas = FigureCanvas(Figure(figsize=(4.2, 2.7), tight_layout=True))
+        self.weight_canvas = FigureCanvas(Figure(figsize=(4.2, 3.2), tight_layout=True))
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Bin"))
+        controls.addWidget(self.bin_ms)
+        controls.addWidget(QLabel("Window"))
+        controls.addWidget(self.window_ms)
+        controls.addWidget(QLabel("Scope"))
+        controls.addWidget(self.analysis_scope)
+        controls.addWidget(QLabel("Normalize"))
+        controls.addWidget(self.normalize)
+        controls.addWidget(QLabel("Latent dim"))
+        controls.addWidget(self.latent_dim)
+        controls.addWidget(QLabel("Filter"))
+        controls.addWidget(self.filter_param)
+        controls.addWidget(self.filter_value)
+        controls.addWidget(QLabel("Burst"))
+        controls.addWidget(self.display_param)
+        controls.addWidget(self.display_value)
+        controls.addWidget(self.rmse_order)
+        controls.addWidget(self.analyze_button)
+        controls.addWidget(self.reconstruction_metrics_button)
+        controls.addWidget(self.weight_metrics_button)
+        controls.addWidget(self.temporal_model_button)
+        controls.addWidget(self.trajectory_analysis_button)
+        controls.addStretch(1)
+
+        left_plots = QVBoxLayout()
+        left_plots.addWidget(self.raster_canvas, 3)
+        left_plots.addWidget(self.latent_canvas, 2)
+
+        right_plots = QVBoxLayout()
+        right_plots.addWidget(self.psth_canvas, 1)
+        right_plots.addWidget(self.weight_canvas, 1)
+
+        plots = QHBoxLayout()
+        plots.addLayout(left_plots, 3)
+        plots.addLayout(right_plots, 1)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self.summary)
+        layout.addLayout(plots, 1)
+        self._draw()
+        _fix_spinbox_hit_targets(self)
+        self.showMaximized()
+
+    def _draw(self):
+        try:
+            scope = str(self.analysis_scope.currentData() or "burst")
+            intervals = (
+                _non_overlapping_spike_windows(self.spike_series, float(self.window_ms.value()))
+                if scope == "all_windows"
+                else self.burst_intervals
+            )
+            self.current = _burst_trajectory_analysis(
+                self.spike_series,
+                intervals,
+                time_bin_ms=float(self.bin_ms.value()),
+                window_ms=float(self.window_ms.value()),
+                normalization=str(self.normalize.currentData()),
+                cluster_count=3,
+                early_bins=3,
+                latent_dim=int(self.latent_dim.value()),
+                min_total_activity=float(self.filter_values["min_activity"]),
+                min_active_bursts=int(round(self.filter_values["min_bursts"])),
+                min_variance=float(self.filter_values["min_var"]),
+                max_channels=int(round(self.filter_values["max_channels"])),
+                analysis_scope=scope,
+            )
+        except Exception as exc:
+            self.current = None
+            self._draw_error(str(exc))
+            self.summary.setText(f"Burst trajectory failed: {str(exc).splitlines()[-1] if str(exc) else type(exc).__name__}")
+            return
+        self._refresh_compare_ranges()
+        self._draw_all_views()
+        self._update_summary()
+
+    def _draw_all_views(self):
+        self._draw_raster_comparison()
+        self._draw_latent_heatmap()
+        self._draw_psth_comparison()
+        self._draw_weight_matrix()
+
+    def _selected_burst_index(self, sample_count: int) -> int:
+        return min(max(0, int(self.selected_burst_value) - 1), max(0, int(sample_count) - 1))
+
+    def _filter_param_changed(self):
+        key = str(self.filter_param.currentData() or "min_activity")
+        if key == "min_bursts":
+            self.filter_value.setRange(0.0, 100000.0)
+            self.filter_value.setDecimals(0)
+            self.filter_value.setSingleStep(1.0)
+        elif key == "max_channels":
+            self.filter_value.setRange(1.0, 20000.0)
+            self.filter_value.setDecimals(0)
+            self.filter_value.setSingleStep(1.0)
+        elif key == "min_var":
+            self.filter_value.setRange(0.0, 1_000_000.0)
+            self.filter_value.setDecimals(6)
+            self.filter_value.setSingleStep(0.001)
+        else:
+            self.filter_value.setRange(0.0, 1_000_000.0)
+            self.filter_value.setDecimals(2)
+            self.filter_value.setSingleStep(1.0)
+        self.filter_value.blockSignals(True)
+        self.filter_value.setValue(float(self.filter_values.get(key, 0.0)))
+        self.filter_value.blockSignals(False)
+
+    def _filter_value_changed(self, value: float):
+        key = str(self.filter_param.currentData() or "min_activity")
+        self.filter_values[key] = float(value)
+
+    def _display_param_changed(self):
+        self.display_value.blockSignals(True)
+        self.display_value.setRange(1, max(1, self.display_value.maximum()))
+        self.display_value.setValue(int(self.selected_burst_value))
+        self.display_value.blockSignals(False)
+
+    def _display_value_changed(self, value: int):
+        self.selected_burst_value = int(value)
+        self._draw_all_views()
+
+    def _refresh_compare_ranges(self):
+        if not self.current:
+            return
+        observed = np.asarray(self.current.get("observed_states", []), dtype=float)
+        burst_count = int(observed.shape[0]) if observed.ndim == 3 else 1
+        self.selected_burst_value = min(max(1, int(self.selected_burst_value)), max(1, burst_count))
+        self.display_value.blockSignals(True)
+        self.display_value.setRange(1, max(1, burst_count))
+        self.display_value.setValue(self.selected_burst_value)
+        self.display_value.blockSignals(False)
+
+    def _draw_error(self, message: str):
+        for canvas in (self.raster_canvas, self.latent_canvas, self.psth_canvas, self.weight_canvas):
+            figure = canvas.figure
+            figure.clear()
+            ax = figure.add_subplot(111)
+            ax.text(0.5, 0.5, message or "Burst trajectory failed", ha="center", va="center", wrap=True)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            canvas.draw_idle()
+
+    def _channel_rmse_order(self, observed: np.ndarray, reconstructed: np.ndarray, burst_index: int) -> tuple[np.ndarray, np.ndarray]:
+        channel_count = observed.shape[2] if observed.ndim == 3 else 0
+        residual = observed[burst_index] - reconstructed[burst_index] if channel_count else np.zeros((0, 0), dtype=float)
+        channel_rmse = np.sqrt(np.mean(residual ** 2, axis=0)) if residual.size else np.zeros(channel_count, dtype=float)
+        if self.rmse_order.currentData() == "asc":
+            order = np.argsort(channel_rmse)
+        else:
+            order = np.argsort(channel_rmse)[::-1]
+        return order, channel_rmse
+
+    def _draw_raster_comparison(self):
+        figure = self.raster_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        analysis = self.current or {}
+        raw_observed = np.asarray(analysis.get("raw_observed_states", []), dtype=float)
+        raw_reconstructed = np.asarray(analysis.get("raw_reconstructed_states", []), dtype=float)
+        observed = np.asarray(analysis.get("observed_states", []), dtype=float)
+        reconstructed = np.asarray(analysis.get("reconstructed_states", []), dtype=float)
+        labels = [str(label) for label in analysis.get("selected_labels", [])]
+        if raw_observed.ndim != 3 or raw_reconstructed.shape != raw_observed.shape or raw_observed.shape[0] < 1 or raw_observed.shape[1] < 1:
+            ax.text(0.5, 0.5, "No factor analysis reconstruction", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            burst_index = self._selected_burst_index(raw_observed.shape[0])
+            window_ms = float(analysis.get("window_ms", self.window_ms.value()))
+            if not np.isfinite(window_ms) or window_ms <= 0:
+                window_ms = float(raw_observed.shape[1])
+            if observed.ndim == 3 and reconstructed.shape == observed.shape:
+                order, channel_rmse = self._channel_rmse_order(observed, reconstructed, burst_index)
+            else:
+                order = np.arange(raw_observed.shape[2], dtype=int)
+                channel_rmse = np.zeros(raw_observed.shape[2], dtype=float)
+            true_block = raw_observed[burst_index][:, order].T
+            recon_block = raw_reconstructed[burst_index][:, order].T
+            heatmap = np.vstack([true_block, recon_block])
+            vmax = float(np.nanpercentile(heatmap, 98.0)) if heatmap.size else 1.0
+            vmax = max(vmax, 1e-9)
+            image = ax.imshow(
+                heatmap,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=vmax,
+                extent=[0.0, window_ms, heatmap.shape[0], 0.0],
+            )
+            ax.axhline(true_block.shape[0] - 0.5, color="#111827", linewidth=1.0)
+            ax.text(window_ms * 0.01, max(0.8, true_block.shape[0] * 0.05), "Observed", color="white", fontsize=8, va="top")
+            ax.text(window_ms * 0.01, true_block.shape[0] + max(0.8, recon_block.shape[0] * 0.05), "Reconstructed", color="white", fontsize=8, va="top")
+            ax.set_title(f"Raw burst activity vs FA reconstruction | burst {burst_index + 1}")
+            ax.set_ylabel("All selected channels")
+            ax.set_xlim(0.0, window_ms)
+            ax.set_xticks(np.linspace(0.0, window_ms, min(7, max(2, raw_observed.shape[1] + 1))))
+            ax.set_xlabel("Time from burst onset (ms)")
+            if labels and len(labels) == raw_observed.shape[2]:
+                y_tick_indices = _display_indices(order.size, min(12, max(1, order.size)))
+                y_ticks = np.r_[y_tick_indices + 0.5, y_tick_indices + len(order) + 0.5]
+                y_labels = [f"{labels[int(order[index])]} ({channel_rmse[int(order[index])]:.3g})" for index in y_tick_indices]
+                ax.set_yticks(y_ticks)
+                ax.set_yticklabels(y_labels + y_labels, fontsize=7)
+            figure.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+        self.raster_canvas.draw_idle()
+
+    def _draw_latent_heatmap(self):
+        figure = self.latent_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        analysis = self.current or {}
+        latent_states = np.asarray(analysis.get("latent_states", []), dtype=float)
+        centers_ms = np.asarray(analysis.get("centers_ms", []), dtype=float)
+        if latent_states.ndim == 3 and latent_states.shape[0]:
+            burst_index = self._selected_burst_index(latent_states.shape[0])
+            latent_block = latent_states[burst_index].T
+            window_ms = float(analysis.get("window_ms", self.window_ms.value()))
+            if not np.isfinite(window_ms) or window_ms <= 0:
+                window_ms = float(latent_block.shape[1])
+            vmax = float(np.nanpercentile(np.abs(latent_block), 98.0)) if latent_block.size else 1.0
+            vmax = max(vmax, 1e-9)
+            image = ax.imshow(
+                latent_block,
+                aspect="auto",
+                interpolation="nearest",
+                cmap="coolwarm",
+                vmin=-vmax,
+                vmax=vmax,
+                extent=[0.0, window_ms, latent_block.shape[0], 0.0],
+            )
+            ax.set_title(f"Latent state z(t) | burst {burst_index + 1}")
+            ax.set_ylabel("Latent dim")
+            ax.set_xlim(0.0, window_ms)
+            ax.set_xticks(np.linspace(0.0, window_ms, min(7, max(2, latent_states.shape[1] + 1))))
+            ax.set_xlabel("Time from burst onset (ms)")
+            ax.set_yticks(np.arange(latent_block.shape[0]) + 0.5)
+            ax.set_yticklabels([str(index + 1) for index in range(latent_block.shape[0])], fontsize=7)
+            figure.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+        else:
+            ax.text(0.5, 0.5, "No latent state", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self.latent_canvas.draw_idle()
+
+    def _draw_psth_comparison(self):
+        figure = self.psth_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        analysis = self.current or {}
+        observed = np.asarray(analysis.get("raw_observed_states", []), dtype=float)
+        reconstructed = np.asarray(analysis.get("raw_reconstructed_states", []), dtype=float)
+        centers_ms = np.asarray(analysis.get("centers_ms", []), dtype=float)
+        if observed.ndim != 3 or reconstructed.shape != observed.shape or observed.shape[0] == 0:
+            ax.text(0.5, 0.5, "No PSTH data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            burst_index = self._selected_burst_index(observed.shape[0])
+            observed_psth = np.mean(observed[burst_index], axis=1)
+            reconstructed_psth = np.mean(reconstructed[burst_index], axis=1)
+            if centers_ms.size != observed_psth.size:
+                centers_ms = np.arange(observed_psth.size, dtype=float)
+            ax.plot(centers_ms, observed_psth, color="#1d4ed8", linewidth=1.7, label="Observed PSTH")
+            ax.plot(centers_ms, reconstructed_psth, color="#dc2626", linewidth=1.7, alpha=0.9, label="Reconstructed PSTH")
+            ax.set_title(f"Raw observed vs reconstructed PSTH | burst {burst_index + 1}")
+            ax.set_xlabel("Time from burst onset (ms)")
+            ax.set_ylabel("Mean firing rate (Hz)")
+            window_ms = float(analysis.get("window_ms", self.window_ms.value()))
+            if np.isfinite(window_ms) and window_ms > 0:
+                ax.set_xlim(0.0, window_ms)
+            ax.legend(loc="best", fontsize=8)
+        self.psth_canvas.draw_idle()
+
+    def _draw_weight_matrix(self):
+        figure = self.weight_canvas.figure
+        figure.clear()
+        weight_ax = figure.add_subplot(111)
+        analysis = self.current or {}
+        params = analysis.get("latent_params", {}) or {}
+        loadings = np.asarray(params.get("loadings", []), dtype=float)
+        labels = [str(label) for label in analysis.get("selected_labels", [])]
+        if loadings.ndim != 2 or loadings.size == 0:
+            weight_ax.text(0.5, 0.5, "No FA loading matrix", ha="center", va="center")
+            weight_ax.set_xticks([])
+            weight_ax.set_yticks([])
+        else:
+            vmax = float(np.nanpercentile(np.abs(loadings), 98.0)) if loadings.size else 1.0
+            vmax = max(vmax, 1e-9)
+            image = weight_ax.imshow(loadings, aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            weight_ax.set_title("Factor loading matrix W")
+            weight_ax.set_ylabel("Latent dim")
+            weight_ax.set_xlabel("Selected channel")
+            if labels and len(labels) == loadings.shape[1]:
+                tick_indices = _display_indices(loadings.shape[1], 8)
+                weight_ax.set_xticks(tick_indices)
+                weight_ax.set_xticklabels([labels[int(index)] for index in tick_indices], rotation=45, ha="right", fontsize=7)
+            weight_ax.set_yticks(np.arange(loadings.shape[0]))
+            weight_ax.set_yticklabels([str(index + 1) for index in range(loadings.shape[0])], fontsize=8)
+            figure.colorbar(image, ax=weight_ax, fraction=0.025, pad=0.02)
+        self.weight_canvas.draw_idle()
+
+    def _show_metric_text(self, title: str, text: str):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(text)
+        layout.addWidget(viewer)
+        button = QPushButton("Close")
+        button.clicked.connect(dialog.accept)
+        layout.addWidget(button)
+        dialog.exec()
+
+    def _show_metric_figure(self, title: str, summary: str, draw_callback):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(1040, 760)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        layout = QVBoxLayout(dialog)
+        summary_label = QLabel(summary)
+        summary_label.setObjectName("MutedText")
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+        canvas = FigureCanvas(Figure(figsize=(10, 6.5), tight_layout=True))
+        layout.addWidget(canvas, 1)
+        button = QPushButton("Close")
+        button.clicked.connect(dialog.close)
+        layout.addWidget(button)
+        draw_callback(canvas.figure)
+        canvas.draw_idle()
+        self.metric_windows.append(dialog)
+
+        def _forget_window(_obj=None, window=dialog):
+            if window in self.metric_windows:
+                self.metric_windows.remove(window)
+
+        dialog.destroyed.connect(_forget_window)
+        dialog.show()
+        return dialog
+
+    def _show_reconstruction_metrics(self):
+        if not self.current:
+            QMessageBox.information(self, "Reconstruction metrics", "Run factor analysis first.")
+            return
+        observed = np.asarray(self.current.get("observed_states", []), dtype=float)
+        reconstructed = np.asarray(self.current.get("reconstructed_states", []), dtype=float)
+        rmse = np.asarray(self.current.get("reconstruction_rmse", []), dtype=float)
+        r2 = float(self.current.get("reconstruction_r2", 0.0))
+        if observed.ndim != 3 or reconstructed.shape != observed.shape:
+            QMessageBox.information(self, "Reconstruction metrics", "No reconstruction data is available.")
+            return
+        residual = observed - reconstructed
+        channel_rmse = np.sqrt(np.mean(residual ** 2, axis=(0, 1))) if residual.size else np.zeros(0, dtype=float)
+        labels = [str(label) for label in self.current.get("selected_labels", [])]
+        order = np.argsort(channel_rmse)[::-1]
+        latent_dim_curve = self._latent_dim_reconstruction_curve(observed)
+        summary = " | ".join([
+            f"Global R2: {r2:.6g}",
+            f"Mean time-bin RMSE: {float(np.mean(rmse)):.6g}" if rmse.size else "Mean time-bin RMSE: n/a",
+            f"Median channel RMSE: {float(np.median(channel_rmse)):.6g}" if channel_rmse.size else "Median channel RMSE: n/a",
+            f"Max channel RMSE: {float(np.max(channel_rmse)):.6g}" if channel_rmse.size else "Max channel RMSE: n/a",
+        ])
+
+        def _draw(figure):
+            figure.clear()
+            centers_ms = np.asarray(self.current.get("centers_ms", []), dtype=float)
+            if centers_ms.size != rmse.size:
+                centers_ms = np.arange(rmse.size, dtype=float)
+            axes = figure.subplots(2, 3)
+            ax = axes[0, 0]
+            dims = np.asarray(latent_dim_curve.get("dims", []), dtype=int)
+            r2_values = np.asarray(latent_dim_curve.get("r2", []), dtype=float)
+            rmse_values = np.asarray(latent_dim_curve.get("mean_rmse", []), dtype=float)
+            if dims.size:
+                ax.plot(dims, r2_values, color="#1d4ed8", marker="o", linewidth=1.8, label="R2")
+                ax.set_ylabel("R2", color="#1d4ed8")
+                ax.tick_params(axis="y", labelcolor="#1d4ed8")
+                ax.set_ylim(min(0.0, float(np.nanmin(r2_values)) - 0.02), min(1.02, max(0.05, float(np.nanmax(r2_values)) + 0.02)))
+                rmse_ax = ax.twinx()
+                rmse_ax.plot(dims, rmse_values, color="#dc2626", marker="s", linewidth=1.4, label="Mean RMSE")
+                rmse_ax.set_ylabel("Mean RMSE", color="#dc2626")
+                rmse_ax.tick_params(axis="y", labelcolor="#dc2626")
+                ax.set_xticks(dims)
+                ax.tick_params(axis="x", labelrotation=45)
+            else:
+                ax.text(0.5, 0.5, "No latent dimension scan", ha="center", va="center")
+                ax.set_xticks([])
+                ax.set_yticks([])
+            ax.set_title("Latent dim vs reconstruction")
+            ax.set_xlabel("Latent dim")
+
+            ax = axes[0, 1]
+            ax.plot(centers_ms, rmse, color="#1d4ed8", linewidth=1.8)
+            ax.set_title("Time-bin reconstruction RMSE")
+            ax.set_xlabel("Time from burst onset (ms)")
+            ax.set_ylabel("RMSE")
+            window_ms = float(self.current.get("window_ms", self.window_ms.value()))
+            if np.isfinite(window_ms) and window_ms > 0:
+                ax.set_xlim(0.0, window_ms)
+
+            ax = axes[0, 2]
+            top_order = order[: min(30, order.size)]
+            top_labels = [labels[int(index)] if int(index) < len(labels) else f"ch{int(index) + 1}" for index in top_order]
+            ax.bar(np.arange(top_order.size), channel_rmse[top_order], color="#dc2626", alpha=0.82)
+            ax.set_title("Channel RMSE")
+            ax.set_ylabel("RMSE")
+            ax.set_xticks(np.arange(top_order.size))
+            ax.set_xticklabels(top_labels, rotation=60, ha="right", fontsize=7)
+
+            ax = axes[1, 0]
+            residual_flat = residual.reshape(-1)
+            if residual_flat.size:
+                ax.hist(residual_flat, bins=60, color="#475569", alpha=0.78)
+            ax.axvline(0.0, color="#111827", linewidth=1.0)
+            ax.set_title("Residual distribution")
+            ax.set_xlabel("Observed - reconstructed")
+            ax.set_ylabel("Count")
+
+            ax = axes[1, 1]
+            observed_flat = observed.reshape(-1)
+            reconstructed_flat = reconstructed.reshape(-1)
+            if observed_flat.size:
+                sample_count = min(12000, observed_flat.size)
+                sample_indices = np.linspace(0, observed_flat.size - 1, sample_count, dtype=int)
+                ax.scatter(observed_flat[sample_indices], reconstructed_flat[sample_indices], s=6, color="#2563eb", alpha=0.25, linewidths=0)
+                limits = np.asarray([observed_flat[sample_indices], reconstructed_flat[sample_indices]], dtype=float)
+                low = float(np.nanpercentile(limits, 1.0))
+                high = float(np.nanpercentile(limits, 99.0))
+                if np.isfinite(low) and np.isfinite(high) and high > low:
+                    ax.plot([low, high], [low, high], color="#dc2626", linewidth=1.2)
+                    ax.set_xlim(low, high)
+                    ax.set_ylim(low, high)
+            ax.set_title("Observed vs reconstructed state")
+            ax.set_xlabel("Observed")
+            ax.set_ylabel("Reconstructed")
+
+            ax = axes[1, 2]
+            if dims.size:
+                best_index = int(np.nanargmax(r2_values))
+                lowest_rmse_index = int(np.nanargmin(rmse_values))
+                lines = [
+                    f"Scan range: {int(dims[0])}-{int(dims[-1])}",
+                    f"Best R2 dim: {int(dims[best_index])}",
+                    f"Best R2: {float(r2_values[best_index]):.6g}",
+                    f"Lowest RMSE dim: {int(dims[lowest_rmse_index])}",
+                    f"Lowest RMSE: {float(rmse_values[lowest_rmse_index]):.6g}",
+                    f"Current dim: {int(self.latent_dim.value())}",
+                ]
+                ax.text(0.02, 0.98, "\n".join(lines), ha="left", va="top", transform=ax.transAxes)
+            else:
+                ax.text(0.5, 0.5, "No scan summary", ha="center", va="center")
+            ax.set_title("Dimension scan summary")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        self._show_metric_figure("Reconstruction metrics", summary, _draw)
+
+    def _latent_dim_reconstruction_curve(self, observed: np.ndarray) -> dict:
+        values = np.nan_to_num(np.asarray(observed, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        if values.ndim != 3 or values.shape[0] == 0 or values.shape[1] == 0 or values.shape[2] == 0:
+            return {"dims": np.zeros(0, dtype=int), "r2": np.zeros(0, dtype=float), "mean_rmse": np.zeros(0, dtype=float)}
+        sample_count = int(values.shape[0] * values.shape[1])
+        channel_count = int(values.shape[2])
+        max_dim = min(96, sample_count, channel_count)
+        if max_dim < 1:
+            return {"dims": np.zeros(0, dtype=int), "r2": np.zeros(0, dtype=float), "mean_rmse": np.zeros(0, dtype=float)}
+        if max_dim < 4:
+            dims = np.arange(1, max_dim + 1, dtype=int)
+        else:
+            dims = np.arange(4, max_dim + 1, 4, dtype=int)
+            if dims.size == 0 or int(dims[-1]) != max_dim:
+                dims = np.r_[dims, max_dim]
+            current_dim = min(max_dim, max(1, int(self.latent_dim.value())))
+            if current_dim not in set(int(value) for value in dims):
+                dims = np.sort(np.r_[dims, current_dim]).astype(int)
+        r2_values = []
+        rmse_values = []
+        centered = values - np.mean(values, axis=(0, 1), keepdims=True)
+        sst = float(np.sum(centered ** 2))
+        for dim in dims:
+            latent, params = _factor_analysis_latent_states(values, int(dim), max_iter=500)
+            loadings = np.asarray(params.get("loadings", []), dtype=float)
+            mean = np.asarray(params.get("mean", []), dtype=float)
+            if latent.size and loadings.ndim == 2 and mean.ndim == 1:
+                reconstructed_flat = latent.reshape((-1, latent.shape[2])) @ loadings + mean
+                reconstructed = reconstructed_flat.reshape(values.shape)
+            else:
+                reconstructed = np.zeros_like(values)
+            residual = values - reconstructed
+            r2_values.append(float(1.0 - float(np.sum(residual ** 2)) / max(sst, 1e-12)))
+            rmse_values.append(float(np.sqrt(np.mean(residual ** 2))) if residual.size else 0.0)
+        return {
+            "dims": np.asarray(dims, dtype=int),
+            "r2": np.asarray(r2_values, dtype=float),
+            "mean_rmse": np.asarray(rmse_values, dtype=float),
+        }
+
+    def _show_weight_metrics(self):
+        if not self.current:
+            QMessageBox.information(self, "Weight matrix metrics", "Run factor analysis first.")
+            return
+        params = self.current.get("latent_params", {}) or {}
+        loadings = np.asarray(params.get("loadings", []), dtype=float)
+        labels = [str(label) for label in self.current.get("selected_labels", [])]
+        if loadings.ndim != 2 or loadings.size == 0:
+            QMessageBox.information(self, "Weight matrix metrics", "No loading matrix is available.")
+            return
+        try:
+            _u, singular_values, vt = np.linalg.svd(loadings, full_matrices=False)
+        except np.linalg.LinAlgError:
+            QMessageBox.information(self, "Weight matrix metrics", "SVD failed for the loading matrix.")
+            return
+        energy = singular_values ** 2
+        total_energy = float(np.sum(energy))
+        cumulative = np.cumsum(energy) / max(total_energy, 1e-12)
+        rank = int(np.count_nonzero(singular_values > max(singular_values[0] if singular_values.size else 0.0, 1.0) * 1e-9))
+        if total_energy > 1e-12:
+            weights = energy / total_energy
+            effective_rank = float(np.exp(-np.sum(weights * np.log(np.maximum(weights, 1e-12)))))
+        else:
+            effective_rank = 0.0
+        factor_gram = loadings @ loadings.T
+        factor_norms = np.sqrt(np.maximum(np.diag(factor_gram), 0.0))
+        factor_overlap = np.divide(
+            factor_gram,
+            np.outer(factor_norms, factor_norms),
+            out=np.zeros_like(factor_gram),
+            where=np.outer(factor_norms, factor_norms) > 1e-12,
+        )
+        if rank > 0 and vt.size:
+            row_basis = vt[:rank, :]
+            channel_projection = row_basis.T @ row_basis
+        else:
+            row_basis = np.zeros((0, loadings.shape[1]), dtype=float)
+            channel_projection = np.zeros((loadings.shape[1], loadings.shape[1]), dtype=float)
+        summary = " | ".join([
+            f"W shape: {loadings.shape[0]} x {loadings.shape[1]}",
+            f"Rank: {rank}",
+            f"Effective rank: {effective_rank:.4g}",
+            f"Energy@min(3): {float(cumulative[min(2, cumulative.size - 1)]):.4g}" if cumulative.size else "Energy@min(3): n/a",
+        ])
+
+        def _draw(figure):
+            figure.clear()
+            axes = figure.subplots(2, 2)
+            ax = axes[0, 0]
+            if singular_values.size:
+                x = np.arange(1, singular_values.size + 1)
+                ax.plot(x, singular_values, marker="o", color="#1d4ed8", linewidth=1.8, label="singular value")
+                ax.set_ylabel("Singular value", color="#1d4ed8")
+                ax.tick_params(axis="y", labelcolor="#1d4ed8")
+                energy_ax = ax.twinx()
+                energy_ax.plot(x, cumulative, marker="s", color="#dc2626", linewidth=1.4, label="cumulative energy")
+                energy_ax.set_ylabel("Cumulative energy", color="#dc2626")
+                energy_ax.tick_params(axis="y", labelcolor="#dc2626")
+                energy_ax.set_ylim(0.0, 1.02)
+            ax.set_title("W subspace singular spectrum")
+            ax.set_xlabel("Component")
+
+            ax = axes[0, 1]
+            image = ax.imshow(factor_overlap, aspect="auto", interpolation="nearest", cmap="seismic", vmin=-1.0, vmax=1.0)
+            ax.set_title("Latent-factor overlap from W W^T")
+            ax.set_xlabel("Latent factor")
+            ax.set_ylabel("Latent factor")
+            figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+            ax = axes[1, 0]
+            if row_basis.size:
+                vmax = float(np.nanpercentile(np.abs(row_basis), 98.0)) if row_basis.size else 1.0
+                vmax = max(vmax, 1e-9)
+                image = ax.imshow(row_basis, aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title("Orthonormal channel subspace basis V")
+            ax.set_xlabel("Selected channel")
+            ax.set_ylabel("Subspace axis")
+            if labels and row_basis.shape[1] == len(labels):
+                tick_indices = _display_indices(len(labels), 10)
+                ax.set_xticks(tick_indices)
+                ax.set_xticklabels([labels[int(index)] for index in tick_indices], rotation=45, ha="right", fontsize=7)
+
+            ax = axes[1, 1]
+            image = ax.imshow(channel_projection, aspect="auto", interpolation="nearest", cmap="magma", vmin=0.0, vmax=1.0)
+            ax.set_title("Channel-space projection P = V^T V")
+            ax.set_xlabel("Selected channel")
+            ax.set_ylabel("Selected channel")
+            if labels and channel_projection.shape[0] == len(labels):
+                tick_indices = _display_indices(len(labels), 8)
+                ax.set_xticks(tick_indices)
+                ax.set_yticks(tick_indices)
+                ax.set_xticklabels([labels[int(index)] for index in tick_indices], rotation=45, ha="right", fontsize=7)
+                ax.set_yticklabels([labels[int(index)] for index in tick_indices], fontsize=7)
+            figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+        self._show_metric_figure("W subspace metrics", summary, _draw)
+
+    def _temporal_latent_model(self) -> dict:
+        analysis = self.current or {}
+        latent = np.asarray(analysis.get("latent_states", []), dtype=float)
+        observed = np.asarray(analysis.get("observed_states", []), dtype=float)
+        params = analysis.get("latent_params", {}) or {}
+        loadings = np.asarray(params.get("loadings", []), dtype=float)
+        mean = np.asarray(params.get("mean", []), dtype=float)
+        if latent.ndim != 3 or latent.shape[0] == 0 or latent.shape[1] < 2 or latent.shape[2] == 0:
+            return {}
+        if observed.ndim != 3 or observed.shape[:2] != latent.shape[:2] or loadings.ndim != 2 or mean.ndim != 1:
+            return {}
+
+        source = latent[:, :-1, :].reshape((-1, latent.shape[2]))
+        target = latent[:, 1:, :].reshape((-1, latent.shape[2]))
+        design = np.column_stack([source, np.ones(source.shape[0], dtype=float)])
+        try:
+            coef, *_ = np.linalg.lstsq(design, target, rcond=None)
+        except np.linalg.LinAlgError:
+            return {}
+        dynamics = coef[:-1, :].T
+        intercept = coef[-1, :]
+
+        linear_predicted = np.zeros_like(latent)
+        linear_predicted[:, 0, :] = latent[:, 0, :]
+        for time_index in range(1, latent.shape[1]):
+            linear_predicted[:, time_index, :] = linear_predicted[:, time_index - 1, :] @ dynamics.T + intercept
+
+        max_train = min(3000, source.shape[0])
+        train_indices = np.linspace(0, source.shape[0] - 1, max_train, dtype=int) if source.shape[0] > max_train else np.arange(source.shape[0], dtype=int)
+        train_source = source[train_indices]
+        train_target = target[train_indices]
+        nonlinear_predicted = linear_predicted.copy()
+        kernel_alpha = np.zeros((0, latent.shape[2]), dtype=float)
+        gamma = 1.0 / max(1, latent.shape[2])
+        if train_source.shape[0] >= 2:
+            diffs = train_source[: min(512, train_source.shape[0])]
+            pairwise = np.sum((diffs[:, None, :] - diffs[None, :, :]) ** 2, axis=2)
+            positive_distances = pairwise[pairwise > 1e-12]
+            if positive_distances.size:
+                gamma = 1.0 / max(float(np.median(positive_distances)), 1e-12)
+            train_sq = np.sum(train_source ** 2, axis=1, keepdims=True)
+            kernel = np.exp(-gamma * np.maximum(train_sq + train_sq.T - 2.0 * train_source @ train_source.T, 0.0))
+            ridge = 1e-3 * max(1.0, float(np.trace(kernel)) / max(1, kernel.shape[0]))
+            try:
+                kernel_alpha = np.linalg.solve(kernel + ridge * np.eye(kernel.shape[0]), train_target)
+                nonlinear_predicted = np.zeros_like(latent)
+                nonlinear_predicted[:, 0, :] = latent[:, 0, :]
+                for time_index in range(1, latent.shape[1]):
+                    query = nonlinear_predicted[:, time_index - 1, :]
+                    query_sq = np.sum(query ** 2, axis=1, keepdims=True)
+                    train_sq_flat = train_sq.T
+                    query_kernel = np.exp(-gamma * np.maximum(query_sq + train_sq_flat - 2.0 * query @ train_source.T, 0.0))
+                    nonlinear_predicted[:, time_index, :] = query_kernel @ kernel_alpha
+            except np.linalg.LinAlgError:
+                kernel_alpha = np.zeros((0, latent.shape[2]), dtype=float)
+                nonlinear_predicted = linear_predicted.copy()
+
+        predicted = nonlinear_predicted
+        reconstructed_flat = predicted.reshape((-1, predicted.shape[2])) @ loadings + mean
+        reconstructed = reconstructed_flat.reshape(observed.shape)
+        raw_reconstructed = _burst_trajectory_inverse_features(reconstructed, analysis.get("normalization_params", {}) or {})
+        residual = observed - reconstructed
+        centered = observed - np.mean(observed, axis=(0, 1), keepdims=True)
+        r2 = 1.0 - float(np.sum(residual ** 2)) / max(float(np.sum(centered ** 2)), 1e-12)
+        time_rmse = np.sqrt(np.mean(residual ** 2, axis=(0, 2))) if residual.size else np.zeros(latent.shape[1], dtype=float)
+        linear_reconstructed_flat = linear_predicted.reshape((-1, linear_predicted.shape[2])) @ loadings + mean
+        linear_reconstructed = linear_reconstructed_flat.reshape(observed.shape)
+        linear_residual = observed - linear_reconstructed
+        linear_time_rmse = np.sqrt(np.mean(linear_residual ** 2, axis=(0, 2))) if linear_residual.size else np.zeros(latent.shape[1], dtype=float)
+        linear_r2 = 1.0 - float(np.sum(linear_residual ** 2)) / max(float(np.sum(centered ** 2)), 1e-12)
+        linear_latent_residual = latent[:, 1:, :] - (latent[:, :-1, :] @ dynamics.T + intercept)
+        linear_latent_rmse = float(np.sqrt(np.mean(linear_latent_residual ** 2))) if linear_latent_residual.size else 0.0
+        nonlinear_one_step_rmse = linear_latent_rmse
+        if kernel_alpha.size:
+            source_sq = np.sum(source ** 2, axis=1, keepdims=True)
+            train_sq = np.sum(train_source ** 2, axis=1, keepdims=True)
+            kernel = np.exp(-gamma * np.maximum(source_sq + train_sq.T - 2.0 * source @ train_source.T, 0.0))
+            nonlinear_one_step = kernel @ kernel_alpha
+            nonlinear_one_step_rmse = float(np.sqrt(np.mean((target - nonlinear_one_step) ** 2)))
+        return {
+            "predicted_latent": predicted,
+            "linear_predicted_latent": linear_predicted,
+            "reconstructed_states": reconstructed,
+            "raw_reconstructed_states": raw_reconstructed,
+            "dynamics": dynamics,
+            "intercept": intercept,
+            "gamma": float(gamma),
+            "kernel_train_count": int(train_source.shape[0]) if kernel_alpha.size else 0,
+            "r2": float(r2),
+            "linear_r2": float(linear_r2),
+            "time_rmse": time_rmse,
+            "linear_time_rmse": linear_time_rmse,
+            "latent_rmse": float(nonlinear_one_step_rmse),
+            "linear_latent_rmse": linear_latent_rmse,
+        }
+
+    def _show_temporal_model(self):
+        if not self.current:
+            QMessageBox.information(self, "Temporal model", "Run factor analysis first.")
+            return
+        model = self._temporal_latent_model()
+        if not model:
+            QMessageBox.information(self, "Temporal model", "At least two time bins and valid FA states are required.")
+            return
+        analysis = self.current or {}
+        raw_observed = np.asarray(analysis.get("raw_observed_states", []), dtype=float)
+        raw_reconstructed = np.asarray(model.get("raw_reconstructed_states", []), dtype=float)
+        latent = np.asarray(analysis.get("latent_states", []), dtype=float)
+        predicted_latent = np.asarray(model.get("predicted_latent", []), dtype=float)
+        burst_index = self._selected_burst_index(raw_observed.shape[0] if raw_observed.ndim == 3 else 1)
+        summary = " | ".join([
+            "Nonlinear latent dynamics: RBF kernel ridge z[t+1] = f(z[t])",
+            f"nonlinear R2: {float(model.get('r2', 0.0)):.6g}",
+            f"linear R2: {float(model.get('linear_r2', 0.0)):.6g}",
+            f"nonlinear one-step z RMSE: {float(model.get('latent_rmse', 0.0)):.6g}",
+            f"kernel train n: {int(model.get('kernel_train_count', 0))}",
+        ])
+
+        def _draw(figure):
+            figure.clear()
+            axes = figure.subplots(2, 2)
+            window_ms = float(analysis.get("window_ms", self.window_ms.value()))
+            centers_ms = np.asarray(analysis.get("centers_ms", []), dtype=float)
+            if raw_observed.ndim == 3 and raw_reconstructed.shape == raw_observed.shape:
+                true_block = raw_observed[burst_index].T
+                recon_block = raw_reconstructed[burst_index].T
+                heatmap = np.vstack([true_block, recon_block])
+                vmax = max(float(np.nanpercentile(heatmap, 98.0)) if heatmap.size else 1.0, 1e-9)
+                ax = axes[0, 0]
+                image = ax.imshow(heatmap, aspect="auto", interpolation="nearest", cmap="viridis", vmin=0.0, vmax=vmax, extent=[0.0, window_ms, heatmap.shape[0], 0.0])
+                ax.axhline(true_block.shape[0] - 0.5, color="#111827", linewidth=1.0)
+                ax.set_title(f"Raw data vs nonlinear temporal reconstruction | sample {burst_index + 1}")
+                ax.set_xlabel("Time (ms)")
+                ax.set_ylabel("Observed / temporal recon channels")
+                figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+                ax = axes[0, 1]
+                observed_psth = np.mean(raw_observed[burst_index], axis=1)
+                reconstructed_psth = np.mean(raw_reconstructed[burst_index], axis=1)
+                if centers_ms.size != observed_psth.size:
+                    centers_ms = np.linspace(0.0, window_ms, observed_psth.size, endpoint=False)
+                ax.plot(centers_ms, observed_psth, color="#1d4ed8", linewidth=1.8, label="Observed")
+                ax.plot(centers_ms, reconstructed_psth, color="#dc2626", linewidth=1.5, label="Nonlinear temporal recon")
+                ax.set_title("Raw PSTH reconstruction")
+                ax.set_xlabel("Time (ms)")
+                ax.set_ylabel("Mean firing rate (Hz)")
+                ax.legend(loc="best", fontsize=8)
+            else:
+                for ax in axes[0, :]:
+                    ax.text(0.5, 0.5, "No raw reconstruction", ha="center", va="center")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+
+            ax = axes[1, 0]
+            if latent.ndim == 3 and predicted_latent.shape == latent.shape:
+                show_dims = min(4, latent.shape[2])
+                for dim in range(show_dims):
+                    ax.plot(latent[burst_index, :, dim], linewidth=1.5, label=f"z{dim + 1}")
+                    ax.plot(predicted_latent[burst_index, :, dim], linewidth=1.0, linestyle="--", label=f"pred z{dim + 1}")
+                ax.set_title("Observed vs nonlinear predicted z")
+                ax.set_xlabel("Time bin")
+                ax.set_ylabel("Latent value")
+                ax.legend(loc="best", fontsize=7, ncol=2)
+            else:
+                ax.text(0.5, 0.5, "No latent prediction", ha="center", va="center")
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            ax = axes[1, 1]
+            time_rmse = np.asarray(model.get("time_rmse", []), dtype=float)
+            linear_time_rmse = np.asarray(model.get("linear_time_rmse", []), dtype=float)
+            if time_rmse.size:
+                x = centers_ms if centers_ms.size == time_rmse.size else np.arange(time_rmse.size)
+                ax.plot(x, time_rmse, color="#7c3aed", marker="o", linewidth=1.6, label="Nonlinear")
+                if linear_time_rmse.size == time_rmse.size:
+                    ax.plot(x, linear_time_rmse, color="#64748b", marker="s", linewidth=1.2, linestyle="--", label="Linear")
+                    ax.legend(loc="best", fontsize=8)
+            ax.set_title("Temporal reconstruction RMSE over time")
+            ax.set_xlabel("Time (ms)" if centers_ms.size == time_rmse.size else "Time bin")
+            ax.set_ylabel("RMSE")
+
+        self._show_metric_figure("Temporal latent model", summary, _draw)
+
+    def _trajectory_analysis(self) -> dict:
+        latent = np.asarray((self.current or {}).get("latent_states", []), dtype=float)
+        if latent.ndim != 3 or latent.shape[0] < 1 or latent.shape[1] < 1 or latent.shape[2] < 1:
+            return {}
+        cluster_count = max(1, min(4, latent.shape[0]))
+        initial = latent[:, 0, :]
+        groups = _kmeans_groups(initial, cluster_count)
+        if initial.shape[1] >= 2 and initial.shape[0] >= 2 and not np.allclose(initial, initial[0]):
+            components = min(2, initial.shape[1], initial.shape[0])
+            projection = SkPCA(n_components=components, random_state=7).fit_transform(initial)
+            if projection.shape[1] == 1:
+                projection = np.column_stack([projection[:, 0], np.zeros(projection.shape[0])])
+        else:
+            projection = np.column_stack([initial[:, 0], np.zeros(initial.shape[0])])
+        unique_groups = sorted(int(value) for value in np.unique(groups))
+        mean_trajectories = {}
+        distance_curves = {}
+        sizes = {}
+        for group in unique_groups:
+            mask = groups == group
+            sizes[group] = int(np.count_nonzero(mask))
+            group_latent = latent[mask]
+            centroid = np.mean(group_latent, axis=0)
+            mean_trajectories[group] = centroid
+            distance_curves[group] = np.mean(np.linalg.norm(group_latent - centroid[None, :, :], axis=2), axis=0)
+        return {
+            "groups": groups,
+            "projection": projection,
+            "mean_trajectories": mean_trajectories,
+            "distance_curves": distance_curves,
+            "sizes": sizes,
+        }
+
+    def _show_trajectory_analysis(self):
+        if not self.current:
+            QMessageBox.information(self, "Trajectory analysis", "Run factor analysis first.")
+            return
+        result = self._trajectory_analysis()
+        if not result:
+            QMessageBox.information(self, "Trajectory analysis", "No latent trajectories are available.")
+            return
+        latent = np.asarray(self.current.get("latent_states", []), dtype=float)
+        centers_ms = np.asarray(self.current.get("centers_ms", []), dtype=float)
+        groups = np.asarray(result.get("groups", []), dtype=int)
+        unique_groups = sorted(int(value) for value in np.unique(groups))
+        summary = " | ".join([
+            f"Samples: {latent.shape[0]}",
+            f"Time bins: {latent.shape[1]}",
+            f"Latent dims: {latent.shape[2]}",
+            f"Initial-state clusters: {len(unique_groups)}",
+        ])
+
+        def _draw(figure):
+            figure.clear()
+            axes = figure.subplots(2, 2)
+            projection = np.asarray(result.get("projection", []), dtype=float)
+            ax = axes[0, 0]
+            for group in unique_groups:
+                mask = groups == group
+                color = f"C{(group - 1) % 10}"
+                ax.scatter(projection[mask, 0], projection[mask, 1], s=26, alpha=0.85, color=color, label=f"cluster {group}")
+            ax.set_title("Initial latent state clusters")
+            ax.set_xlabel("Initial-state PC1")
+            ax.set_ylabel("Initial-state PC2")
+            ax.legend(loc="best", fontsize=8)
+
+            ax = axes[0, 1]
+            for group, trajectory in result.get("mean_trajectories", {}).items():
+                trajectory = np.asarray(trajectory, dtype=float)
+                color = f"C{(int(group) - 1) % 10}"
+                if trajectory.shape[1] >= 2:
+                    ax.plot(trajectory[:, 0], trajectory[:, 1], color=color, linewidth=1.8, label=f"cluster {group}")
+                    ax.scatter(trajectory[0, 0], trajectory[0, 1], color=color, s=28)
+                else:
+                    ax.plot(np.arange(trajectory.shape[0]), trajectory[:, 0], color=color, linewidth=1.8, label=f"cluster {group}")
+            ax.set_title("Class mean latent trajectories")
+            ax.set_xlabel("z1" if latent.shape[2] >= 2 else "Time bin")
+            ax.set_ylabel("z2" if latent.shape[2] >= 2 else "z1")
+            ax.legend(loc="best", fontsize=8)
+
+            ax = axes[1, 0]
+            x = centers_ms if centers_ms.size == latent.shape[1] else np.arange(latent.shape[1])
+            for group, distances in result.get("distance_curves", {}).items():
+                ax.plot(x, np.asarray(distances, dtype=float), linewidth=1.8, label=f"cluster {group}")
+            ax.set_title("Within-cluster trajectory distance over time")
+            ax.set_xlabel("Time from sample onset (ms)" if centers_ms.size == latent.shape[1] else "Time bin")
+            ax.set_ylabel("Mean distance to class trajectory")
+            ax.legend(loc="best", fontsize=8)
+
+            ax = axes[1, 1]
+            sizes = result.get("sizes", {})
+            ax.bar([str(group) for group in unique_groups], [sizes.get(group, 0) for group in unique_groups], color="#2563eb", alpha=0.82)
+            ax.set_title("Cluster sizes")
+            ax.set_xlabel("Initial-state cluster")
+            ax.set_ylabel("Samples")
+
+        self._show_metric_figure("Latent trajectory analysis", summary, _draw)
+
+    def _update_summary(self):
+        if not self.current:
+            self.summary.setText("No burst trajectory result")
+            return
+        latent_states = np.asarray(self.current.get("latent_states", []), dtype=float)
+        burst_count = int(latent_states.shape[0]) if latent_states.ndim == 3 else 0
+        bin_count = int(latent_states.shape[1]) if latent_states.ndim == 3 else 0
+        selected_count = int(latent_states.shape[2]) if latent_states.ndim == 3 else 0
+        total_count = len(self.current.get("labels", []))
+        groups = np.asarray(self.current.get("groups", []), dtype=int)
+        group_count = len(set(int(value) for value in groups)) if groups.size else 0
+        early_mean = float(self.current.get("early_mean_dispersion", 0.0))
+        late_mean = float(self.current.get("late_mean_dispersion", 0.0))
+        ratio = late_mean / max(early_mean, 1e-12)
+        projection = str(self.current.get("state_projection", ""))
+        latent_params = self.current.get("latent_params", {}) or {}
+        loading_shape = np.asarray(latent_params.get("loadings", []), dtype=float).shape
+        if len(loading_shape) == 2:
+            projection = f"{projection} | W {loading_shape[0]}x{loading_shape[1]} | EM {int(latent_params.get('n_iter', 0))}"
+        r2 = float(self.current.get("reconstruction_r2", 0.0))
+        scope = "All windows" if str(self.current.get("analysis_scope", "burst")) == "all_windows" else "Bursts"
+        self.summary.setText(
+            f"Factor Analysis | {projection} | Scope: {scope} | Channels: {selected_count}/{total_count} | Samples: {burst_count} | Bins: {bin_count} | Start groups: {group_count} | "
+            f"R2: {r2:.4g} | Early dispersion: {early_mean:.4g} | Late dispersion: {late_mean:.4g} | Late/Early: {ratio:.3g}"
+        )
+
+
+class MultiFileFactorAnalysisWindow(QDialog):
+    def __init__(self, payload: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Multi-file Factor Analysis")
+        self.resize(1280, 820)
+        self.payload = payload if isinstance(payload, dict) else {}
+        self.records = list(self.payload.get("records", []))
+
+        self.file_combo = QComboBox()
+        for index, record in enumerate(self.records):
+            label = f"{index + 1}. {record.get('condition') or record.get('file')}"
+            self.file_combo.addItem(label, index)
+        self.file_combo.currentIndexChanged.connect(self._draw)
+        self.summary = QLabel("")
+        self.summary.setObjectName("MutedText")
+        self.summary.setWordWrap(True)
+        self.similarity_canvas = FigureCanvas(Figure(figsize=(5.8, 4.0), tight_layout=True))
+        self.weight_canvas = FigureCanvas(Figure(figsize=(5.8, 4.0), tight_layout=True))
+        self.latent_canvas = FigureCanvas(Figure(figsize=(6.6, 4.0), tight_layout=True))
+        self.performance_canvas = FigureCanvas(Figure(figsize=(6.6, 3.0), tight_layout=True))
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("File"))
+        controls.addWidget(self.file_combo, 1)
+        controls.addStretch(1)
+
+        left = QVBoxLayout()
+        left.addWidget(self.latent_canvas, 3)
+        left.addWidget(self.performance_canvas, 2)
+        right = QVBoxLayout()
+        right.addWidget(self.similarity_canvas, 1)
+        right.addWidget(self.weight_canvas, 1)
+        plots = QHBoxLayout()
+        plots.addLayout(left, 1)
+        plots.addLayout(right, 1)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self.summary)
+        layout.addLayout(plots, 1)
+        self._draw()
+
+    def _selected_record_index(self) -> int:
+        value = self.file_combo.currentData()
+        try:
+            return min(max(0, int(value)), max(0, len(self.records) - 1))
+        except Exception:
+            return 0
+
+    def _record_labels(self) -> list[str]:
+        labels = []
+        for index, record in enumerate(self.records):
+            text = str(record.get("condition") or record.get("file") or f"file {index + 1}")
+            labels.append(text if len(text) <= 28 else text[:25] + "...")
+        return labels
+
+    def _draw(self):
+        self._update_summary()
+        self._draw_similarity()
+        self._draw_weight_comparison()
+        self._draw_latent_overview()
+        self._draw_performance()
+
+    def _update_summary(self):
+        if not self.records:
+            self.summary.setText("No multi-file factor analysis records.")
+            return
+        errors = list(self.payload.get("errors", []))
+        r2_values = np.asarray([float(record.get("reconstruction_r2", 0.0)) for record in self.records], dtype=float)
+        selected_counts = [int(record.get("selected_channel_count", 0)) for record in self.records]
+        removed = sum(int(record.get("artifact_removed_spikes", 0)) for record in self.records)
+        stim_total = sum(int(record.get("stim_count", 0)) for record in self.records)
+        scope = "All windows" if str(self.payload.get("analysis_scope", "burst")) == "all_windows" else "Bursts"
+        self.summary.setText(
+            f"Files: {len(self.records)} | scope: {scope} | skipped: {len(errors)} | mean R2: {float(np.mean(r2_values)):.4g} | "
+            f"selected channels: {min(selected_counts) if selected_counts else 0}-{max(selected_counts) if selected_counts else 0} | "
+            f"stim events: {stim_total} | tail +/-{float(self.payload.get('artifact_ms', 0.0)):g} ms removed spikes: {removed} | "
+            f"W aligned to file 1 for Pearson correlation"
+        )
+
+    def _draw_similarity(self):
+        figure = self.similarity_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        similarity = np.asarray(self.payload.get("w_similarity", []), dtype=float)
+        labels = self._record_labels()
+        if similarity.ndim != 2 or similarity.size == 0:
+            ax.text(0.5, 0.5, "No W similarity", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            finite = similarity[np.isfinite(similarity)]
+            if similarity.shape[0] > 1:
+                off_diag = similarity[~np.eye(similarity.shape[0], dtype=bool)]
+                display_values = off_diag[np.isfinite(off_diag)]
+            else:
+                display_values = finite
+            if display_values.size:
+                vmin = float(np.nanpercentile(display_values, 2.0))
+                vmax = float(np.nanpercentile(display_values, 98.0))
+            elif finite.size:
+                vmin = float(np.nanmin(finite))
+                vmax = float(np.nanmax(finite))
+            else:
+                vmin, vmax = -1.0, 1.0
+            if not np.isfinite(vmin) or not np.isfinite(vmax):
+                vmin, vmax = -1.0, 1.0
+            if vmax - vmin < 0.05:
+                center = 0.5 * (vmin + vmax)
+                vmin = center - 0.025
+                vmax = center + 0.025
+            vmin = max(-1.0, vmin)
+            vmax = min(1.0, vmax)
+            if vmax <= vmin:
+                vmax = min(1.0, vmin + 0.05)
+                vmin = max(-1.0, vmax - 0.05)
+            image = ax.imshow(similarity, aspect="auto", interpolation="nearest", cmap="turbo", vmin=vmin, vmax=vmax)
+            ax.set_title("Aligned W correlation")
+            indices = np.arange(len(labels))
+            ax.set_xticks(indices)
+            ax.set_yticks(indices)
+            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+            ax.set_yticklabels(labels, fontsize=7)
+            figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        self.similarity_canvas.draw_idle()
+
+    def _draw_weight_comparison(self):
+        figure = self.weight_canvas.figure
+        figure.clear()
+        axes = figure.subplots(1, 2)
+        if not self.records:
+            for ax in axes:
+                ax.text(0.5, 0.5, "No W", ha="center", va="center")
+                ax.set_xticks([])
+                ax.set_yticks([])
+            self.weight_canvas.draw_idle()
+            return
+        selected = self._selected_record_index()
+        reference = np.asarray(self.records[0].get("aligned_loadings", []), dtype=float)
+        current = np.asarray(self.records[selected].get("aligned_loadings", []), dtype=float)
+        vmax = max(
+            float(np.nanpercentile(np.abs(reference), 98.0)) if reference.size else 0.0,
+            float(np.nanpercentile(np.abs(current), 98.0)) if current.size else 0.0,
+            1e-9,
+        )
+        for ax, matrix, title in zip(axes, [reference, current], ["Reference aligned W", f"Selected aligned W | {selected + 1}"]):
+            if matrix.ndim != 2 or matrix.size == 0:
+                ax.text(0.5, 0.5, "No W", ha="center", va="center")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                continue
+            image = ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            ax.set_title(title)
+            ax.set_xlabel("Channel")
+            ax.set_ylabel("Latent dim")
+            figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        self.weight_canvas.draw_idle()
+
+    def _draw_latent_overview(self):
+        figure = self.latent_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        if not self.records:
+            ax.text(0.5, 0.5, "No latent states", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.latent_canvas.draw_idle()
+            return
+        selected = self._selected_record_index()
+        analysis = self.records[selected].get("analysis", {}) or {}
+        latent = np.asarray(analysis.get("latent_states", []), dtype=float)
+        if latent.ndim != 3 or latent.size == 0:
+            ax.text(0.5, 0.5, "No latent states", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            mean_time = np.mean(latent, axis=0).T
+            vmax = float(np.nanpercentile(np.abs(mean_time), 98.0)) if mean_time.size else 1.0
+            vmax = max(vmax, 1e-9)
+            window_ms = float(analysis.get("window_ms", self.payload.get("window_ms", 300.0)))
+            image = ax.imshow(mean_time, aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-vmax, vmax=vmax, extent=[0.0, window_ms, mean_time.shape[0], 0.0])
+            ax.set_title(f"Mean z(t) across bursts | {self.records[selected].get('condition') or self.records[selected].get('file')}")
+            ax.set_xlabel("Time from burst onset (ms)")
+            ax.set_ylabel("Latent dim")
+            figure.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+        self.latent_canvas.draw_idle()
+
+    def _draw_performance(self):
+        figure = self.performance_canvas.figure
+        figure.clear()
+        axes = figure.subplots(1, 2)
+        labels = self._record_labels()
+        r2 = np.asarray([float(record.get("reconstruction_r2", 0.0)) for record in self.records], dtype=float)
+        bursts = np.asarray([int(record.get("burst_count", 0)) for record in self.records], dtype=float)
+        selected_channels = np.asarray([int(record.get("selected_channel_count", 0)) for record in self.records], dtype=float)
+        x = np.arange(len(self.records))
+        axes[0].bar(x, r2, color="#2563eb", alpha=0.82)
+        axes[0].set_title("Reconstruction R2")
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        axes[0].set_ylabel("R2")
+        axes[1].bar(x - 0.18, bursts, width=0.36, color="#16a34a", alpha=0.78, label="Bursts")
+        axes[1].bar(x + 0.18, selected_channels, width=0.36, color="#f59e0b", alpha=0.78, label="Selected ch")
+        axes[1].set_title("Data size")
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        axes[1].legend(loc="best", fontsize=8)
+        self.performance_canvas.draw_idle()
+
+
 class BurstClusteringWindow(QDialog):
     def __init__(self, spike_series, burst_intervals, parent=None):
         super().__init__(parent)
@@ -8624,6 +11068,7 @@ class SpikeRasterWindow(QDialog):
         self.raster_action_combo.addItem("ISI", "isi")
         self.raster_action_combo.addItem("Burst correlation", "burst_corr")
         self.raster_action_combo.addItem("Burst delay", "burst_delay")
+        self.raster_action_combo.addItem("Burst trajectory", "burst_trajectory")
         self.raster_action_combo.addItem("Burst clustering", "burst_cluster")
         self.raster_action_combo.addItem("Save bursts", "save_bursts")
         self.raster_action_combo.addItem("Export heatmap GIF", "export_heatmap_gif")
@@ -8826,6 +11271,7 @@ class SpikeRasterWindow(QDialog):
             "isi": self._open_isi_window,
             "burst_corr": self._open_burst_correlation_window,
             "burst_delay": self._open_burst_delay_window,
+            "burst_trajectory": self._open_burst_trajectory_window,
             "burst_cluster": self._open_burst_clustering_window,
             "save_bursts": self._save_bursts,
             "export_heatmap_gif": self._export_heatmap_gif,
@@ -9254,6 +11700,14 @@ class SpikeRasterWindow(QDialog):
         progress = self._start_progress("Burst clustering", "Preparing burst clustering...", 0)
         try:
             window = BurstClusteringWindow(self.spike_series, self.burst_intervals, self)
+        finally:
+            self._finish_progress(progress)
+        return self._show_analysis_window(window)
+
+    def _open_burst_trajectory_window(self):
+        progress = self._start_progress("Burst trajectory", "Preparing burst trajectory analysis...", 0)
+        try:
+            window = BurstTrajectoryWindow(self.spike_series, self.burst_intervals, self)
         finally:
             self._finish_progress(progress)
         return self._show_analysis_window(window)
@@ -9937,6 +12391,7 @@ class SortingWorkspaceWindow(QDialog):
         self.lasso = None
         self.lasso_mode = None
         self.embedding_view_limits = None
+        self.selected_spike_index = None
         self.analysis_windows = []
         self.dirty = False
 
@@ -9989,6 +12444,7 @@ class SortingWorkspaceWindow(QDialog):
         self.waveform_canvas = FigureCanvas(Figure(figsize=(6, 5), tight_layout=True))
         self.embedding_canvas = FigureCanvas(Figure(figsize=(6, 5), tight_layout=True))
         self.embedding_canvas.mpl_connect("scroll_event", self._embedding_scroll_zoom)
+        self.embedding_canvas.mpl_connect("button_press_event", self._embedding_clicked)
         self.embedding_ax = None
 
         controls = QHBoxLayout()
@@ -10049,6 +12505,7 @@ class SortingWorkspaceWindow(QDialog):
         if self.lasso_mode is not None:
             self._stop_lasso_mode("Assignment mode off")
         self.embedding_view_limits = None
+        self.selected_spike_index = None
         channel = self._channel()
         self.undo_button.setEnabled(bool(self.undo_stack.get(channel)))
         payload = self.data.sorting.get(channel, {}) if isinstance(self.data.sorting, dict) else {}
@@ -10261,6 +12718,7 @@ class SortingWorkspaceWindow(QDialog):
         if waveforms.ndim != 2 or waveforms.shape[0] == 0:
             self.current_embedding = np.zeros((0, 0), dtype=np.float32)
             self.current_labels = np.zeros(0, dtype=np.int32)
+            self.selected_spike_index = None
             return
         progress = self._start_progress("Embedding", f"Computing embedding for {channel}...", 0) if update_status else None
         try:
@@ -10276,6 +12734,8 @@ class SortingWorkspaceWindow(QDialog):
         self.embedding_view_limits = None
         if self.current_labels.size != waveforms.shape[0]:
             self.current_labels = np.zeros(waveforms.shape[0], dtype=np.int32)
+        if self.selected_spike_index is not None and not (0 <= int(self.selected_spike_index) < waveforms.shape[0]):
+            self.selected_spike_index = None
         self._save_current_channel()
         if update_status:
             self.status.setText(f"Embedding updated for {channel}")
@@ -10439,6 +12899,60 @@ class SortingWorkspaceWindow(QDialog):
         self.embedding_view_limits = (new_xlim, new_ylim)
         self.embedding_canvas.draw_idle()
 
+    def _embedding_clicked(self, event):
+        if self.lasso_mode is not None:
+            return
+        if self.embedding_ax is None or event.inaxes is not self.embedding_ax:
+            return
+        if getattr(event, "button", None) not in (1, None):
+            return
+        selected = self._nearest_visible_embedding_index(event)
+        if selected is None:
+            self.selected_spike_index = None
+            self.status.setText("No spike selected")
+        else:
+            self.selected_spike_index = int(selected)
+            label = int(self.current_labels[selected]) if self.current_labels.size > selected else 0
+            label_text = "noise" if label == -1 else f"cluster {label}"
+            self.status.setText(f"Selected spike {selected + 1} ({label_text})")
+        self._draw_all()
+
+    def _nearest_visible_embedding_index(self, event):
+        if self.current_embedding.ndim != 2 or self.current_embedding.shape[0] == 0:
+            return None
+        points = self._embedding_xy()
+        if points.size == 0:
+            return None
+        labels = self.current_labels if self.current_labels.size == points.shape[0] else np.zeros(points.shape[0], dtype=int)
+        visible_mask = self._visible_label_mask(labels) & np.isfinite(points).all(axis=1)
+        visible_indices = np.flatnonzero(visible_mask)
+        if visible_indices.size == 0:
+            return None
+        visible_points = points[visible_indices]
+        if getattr(event, "x", None) is not None and getattr(event, "y", None) is not None and self.embedding_ax is not None:
+            display_points = self.embedding_ax.transData.transform(visible_points)
+            event_xy = np.array([float(event.x), float(event.y)], dtype=float)
+            distances = np.linalg.norm(display_points - event_xy, axis=1)
+            nearest_pos = int(np.argmin(distances))
+            if float(distances[nearest_pos]) <= 18.0:
+                return int(visible_indices[nearest_pos])
+            return None
+        if event.xdata is None or event.ydata is None:
+            return None
+        data_xy = np.array([float(event.xdata), float(event.ydata)], dtype=float)
+        spans = np.array(
+            [
+                max(abs(self.embedding_ax.get_xlim()[1] - self.embedding_ax.get_xlim()[0]), 1e-9),
+                max(abs(self.embedding_ax.get_ylim()[1] - self.embedding_ax.get_ylim()[0]), 1e-9),
+            ],
+            dtype=float,
+        )
+        distances = np.linalg.norm((visible_points - data_xy) / spans, axis=1)
+        nearest_pos = int(np.argmin(distances))
+        if float(distances[nearest_pos]) <= 0.035:
+            return int(visible_indices[nearest_pos])
+        return None
+
     def _draw_all(self):
         self._draw_waveforms()
         self._draw_embedding()
@@ -10468,6 +12982,30 @@ class SortingWorkspaceWindow(QDialog):
                     ax.plot(x, waveform, color=color, alpha=0.10, linewidth=0.7)
                 legend_label = "noise" if label == -1 else f"cluster {label}"
                 ax.plot(x, np.mean(cluster_waveforms, axis=0), color=color, linewidth=2.0, label=legend_label)
+            selected = self.selected_spike_index
+            if selected is not None and 0 <= int(selected) < waveforms.shape[0] and visible_mask[int(selected)]:
+                selected = int(selected)
+                label = int(labels[selected]) if labels.size > selected else 0
+                selected_color = "#f97316"
+                ax.plot(
+                    x,
+                    waveforms[selected],
+                    color=selected_color,
+                    linewidth=2.6,
+                    alpha=0.98,
+                    label=f"selected spike {selected + 1}",
+                    zorder=8,
+                )
+                ax.text(
+                    0.98,
+                    0.95,
+                    f"spike {selected + 1}\n{'noise' if label == -1 else f'cluster {label}'}",
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=9,
+                    bbox={"facecolor": "white", "edgecolor": selected_color, "alpha": 0.92},
+                )
             ax.set_xlabel("Time (ms)" if self.data.sr else "Time (sample index)")
             ax.set_ylabel("Voltage (uV)")
             ax.set_title(f"{channel} waveforms")
@@ -10510,6 +13048,27 @@ class SortingWorkspaceWindow(QDialog):
                 ax.legend(loc="best", fontsize=8)
             else:
                 ax.text(0.5, 0.5, "No spikes match the current cluster filter", ha="center", va="center")
+            selected = self.selected_spike_index
+            if selected is not None and 0 <= int(selected) < points.shape[0] and visible_mask[int(selected)]:
+                selected = int(selected)
+                ax.scatter(
+                    [points[selected, 0]],
+                    [points[selected, 1]],
+                    s=120,
+                    facecolors="none",
+                    edgecolors="#111827",
+                    linewidths=2.2,
+                    zorder=9,
+                )
+                ax.scatter(
+                    [points[selected, 0]],
+                    [points[selected, 1]],
+                    s=34,
+                    color="#f97316",
+                    edgecolors="#111827",
+                    linewidths=0.9,
+                    zorder=10,
+                )
             ax.set_xlabel("Component 1")
             ax.set_ylabel("Component 2")
             ax.set_title(f"{self._channel()} reduction space")
@@ -10795,11 +13354,17 @@ class MainWindow(QMainWindow):
         self.result = None
         self.channel_map = _default_maxwell_channel_map() or default_channel_map()
         self.child_windows = []
+        self.file_database: list[dict] = []
         self.pipeline_progress = None
         self.active_load_worker = None
+        self.active_maxwell_waveform_worker = None
+        self.maxwell_waveform_progress = None
         self.active_stimulus_worker = None
+        self.active_multi_file_fa_worker = None
         self.stimulus_response_dialog = None
         self.stimulus_response_payload = None
+        self.multi_file_fa_dialog = None
+        self.multi_file_fa_payload = None
 
         self._build_ui()
         self._build_menu()
@@ -10822,49 +13387,36 @@ class MainWindow(QMainWindow):
         title.setFont(QFont("Segoe UI", 22, QFont.Bold))
         side_layout.addWidget(title)
 
-        self.file_label = QLabel("No data file selected")
+        self.file_label = QLabel("No data files loaded")
         self.file_label.setWordWrap(True)
         self.file_label.setObjectName("MutedText")
         side_layout.addWidget(self.file_label)
 
-        self.open_button = QPushButton("Open Data")
+        self.open_button = QPushButton("Open Data Files")
         self.open_button.clicked.connect(self.open_data)
-        self.stimulus_response_button = QPushButton("Stimulus Response Analysis")
-        self.stimulus_response_button.clicked.connect(self.open_stimulus_response_analysis)
         self.preview_button = QPushButton("Raw Data Raster")
         self.preview_button.clicked.connect(self.preview_raw)
         self.preview_button.setEnabled(False)
-        self.save_spike_train_button = QPushButton("Save Spike Train")
+        self.save_spike_train_button = QPushButton("Save File")
         self.save_spike_train_button.clicked.connect(self.save_spike_train)
         self.save_spike_train_button.setEnabled(False)
-        self.settings_button = QPushButton("Settings")
-        self.settings_button.clicked.connect(self.open_settings)
         self.channel_map_button = QPushButton("Channel Map")
         self.channel_map_button.clicked.connect(self.open_channel_map)
         self.sorting_button = QPushButton("Sorting")
         self.sorting_button.clicked.connect(self.open_sorting)
-        self.temporal_button = QPushButton("Temporal Coupling")
-        self.temporal_button.clicked.connect(self.open_temporal_coupling)
-        self.temporal_button.setEnabled(False)
-        self.run_button = QPushButton("Run Full Pipeline")
-        self.run_button.setObjectName("PrimaryButton")
-        self.run_button.clicked.connect(self.run_pipeline)
-        self.run_button.setEnabled(False)
-        self.results_button = QPushButton("Open Results")
-        self.results_button.clicked.connect(self.open_results)
-        self.results_button.setEnabled(False)
+        self.stimulus_response_button = QPushButton("Stimulus Response Analysis")
+        self.stimulus_response_button.clicked.connect(self.open_stimulus_response_analysis)
+        self.multi_file_fa_button = QPushButton("Multi-file FA Analysis")
+        self.multi_file_fa_button.clicked.connect(self.open_multi_file_factor_analysis)
 
         for button in [
-            self.stimulus_response_button,
             self.open_button,
             self.preview_button,
             self.save_spike_train_button,
-            self.settings_button,
             self.channel_map_button,
             self.sorting_button,
-            self.temporal_button,
-            self.run_button,
-            self.results_button,
+            self.stimulus_response_button,
+            self.multi_file_fa_button,
         ]:
             button.setMinimumHeight(40)
             side_layout.addWidget(button)
@@ -10876,15 +13428,23 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.setSpacing(16)
 
-        header = QLabel("Loaded data preview")
+        header = QLabel("Loaded file database")
         header.setObjectName("Header")
         header.setFont(QFont("Segoe UI", 20, QFont.Bold))
         content_layout.addWidget(header)
 
+        self.database_table = QTableWidget(0, 6)
+        self.database_table.setHorizontalHeaderLabels(["File", "Kind", "Channels", "Spikes", "Waveforms", "Folder"])
+        self.database_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.database_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.database_table.setMinimumHeight(150)
+        self.database_table.itemSelectionChanged.connect(self._database_selection_changed)
+        content_layout.addWidget(self.database_table, 1)
+
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setMinimumHeight(260)
-        self.data_preview.setPlaceholderText("Open a data file to show a summary.")
+        self.data_preview.setMinimumHeight(220)
+        self.data_preview.setPlaceholderText("Open data files to build a database, then select one row to show a summary.")
         content_layout.addWidget(self.data_preview, 2)
 
         self.log = QTextEdit()
@@ -10900,10 +13460,10 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
-        open_action = QAction("Open Data", self)
+        open_action = QAction("Open Data Files", self)
         open_action.triggered.connect(self.open_data)
         file_menu.addAction(open_action)
-        self.save_spike_train_action = QAction("Save Spike Train", self)
+        self.save_spike_train_action = QAction("Save File", self)
         self.save_spike_train_action.triggered.connect(self.save_spike_train)
         self.save_spike_train_action.setEnabled(False)
         file_menu.addAction(self.save_spike_train_action)
@@ -10911,11 +13471,6 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
-
-        view_menu = self.menuBar().addMenu("View")
-        results_action = QAction("Results", self)
-        results_action.triggered.connect(self.open_results)
-        view_menu.addAction(results_action)
 
         tools_menu = self.menuBar().addMenu("Tools")
         channel_map_action = QAction("Channel Map", self)
@@ -10925,12 +13480,13 @@ class MainWindow(QMainWindow):
         sorting_action = QAction("Sorting", self)
         sorting_action.triggered.connect(self.open_sorting)
         tools_menu.addAction(sorting_action)
-        temporal_action = QAction("Temporal Coupling", self)
-        temporal_action.triggered.connect(self.open_temporal_coupling)
-        tools_menu.addAction(temporal_action)
+        tools_menu.addSeparator()
         stimulus_action = QAction("Stimulus Response Analysis", self)
         stimulus_action.triggered.connect(self.open_stimulus_response_analysis)
         tools_menu.addAction(stimulus_action)
+        multi_file_fa_action = QAction("Multi-file FA Analysis", self)
+        multi_file_fa_action.triggered.connect(self.open_multi_file_factor_analysis)
+        tools_menu.addAction(multi_file_fa_action)
 
     def _start_progress(self, title: str, message: str, maximum: int = 0) -> QProgressDialog:
         return _create_progress_dialog(self, title, message, maximum)
@@ -10945,20 +13501,25 @@ class MainWindow(QMainWindow):
         if self.active_stimulus_worker is not None:
             QMessageBox.information(self, "Stimulus Response", "Stimulus response analysis is already running.")
             return
+        if not self.file_database:
+            QMessageBox.information(self, "Stimulus Response", "Load files into the database before stimulus response analysis.")
+            return
         dialog = self._stimulus_response_analysis_dialog()
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
 
-    def _stimulus_response_analysis_dialog(self) -> StimulusResponseInputDialog:
+    def _stimulus_response_analysis_dialog(self):
         if self.stimulus_response_dialog is None:
-            dialog = StimulusResponseInputDialog(self)
+            dialog = StimulusDatabaseAnalysisDialog(self.file_database, self)
             dialog.setWindowModality(Qt.WindowModality.NonModal)
             dialog.accepted.connect(self._start_stimulus_response_from_dialog)
             dialog.open_raster_button.clicked.connect(self._open_cached_stimulus_raster)
             dialog.psth_button.clicked.connect(self._open_cached_stimulus_psth)
             dialog.activation_curve_button.clicked.connect(self._open_cached_stimulus_activation_curve)
             self.stimulus_response_dialog = dialog
+        elif hasattr(self.stimulus_response_dialog, "_set_records"):
+            self.stimulus_response_dialog._set_records(self.file_database)
         return self.stimulus_response_dialog
 
     def _start_stimulus_response_from_dialog(self):
@@ -10968,7 +13529,7 @@ class MainWindow(QMainWindow):
         dialog = self._stimulus_response_analysis_dialog()
         paths, pre_ms, response_ms, artifact_ms = dialog.values()
         if not paths:
-            QMessageBox.information(self, "Stimulus Response", "Add at least one stimulus response file or folder.")
+            QMessageBox.information(self, "Stimulus Response", "Select at least one database file.")
             dialog.show()
             return
         self.pipeline_progress = self._start_progress("Stimulus response", "Starting stimulus response analysis...", 100)
@@ -11062,24 +13623,126 @@ class MainWindow(QMainWindow):
         self.stimulus_response_dialog.raise_()
         self.stimulus_response_dialog.activateWindow()
 
-    def open_data(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open MEA data",
-            "data",
-            "Data files (*.npy *.npz *.csv *.txt *.tsv *.nev *.spk *.h5 *.hdf5);;Array files (*.npy *.npz *.csv *.txt *.tsv);;Blackrock NEV (*.nev);;Axion SPK (*.spk);;Maxwell H5 (*.h5 *.hdf5);;All files (*)",
-        )
-        if not path:
+    def open_multi_file_factor_analysis(self):
+        if self.active_multi_file_fa_worker is not None:
+            QMessageBox.information(self, "Multi-file FA", "Multi-file factor analysis is already running.")
             return
-        selected_wells = None
+        if not self.file_database:
+            QMessageBox.information(self, "Multi-file FA", "Load files into the database before multi-file factor analysis.")
+            return
+        dialog = self._multi_file_fa_analysis_dialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _multi_file_fa_analysis_dialog(self):
+        if self.multi_file_fa_dialog is None:
+            dialog = FactorAnalysisDatabaseDialog(self.file_database, self)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.accepted.connect(self._start_multi_file_fa_from_dialog)
+            dialog.open_result_button.clicked.connect(self._open_cached_multi_file_fa)
+            self.multi_file_fa_dialog = dialog
+        elif hasattr(self.multi_file_fa_dialog, "_set_records"):
+            self.multi_file_fa_dialog._set_records(self.file_database)
+        return self.multi_file_fa_dialog
+
+    def _start_multi_file_fa_from_dialog(self):
+        if self.active_multi_file_fa_worker is not None:
+            QMessageBox.information(self, "Multi-file FA", "Multi-file factor analysis is already running.")
+            return
+        dialog = self._multi_file_fa_analysis_dialog()
+        paths, parameters = dialog.values()
+        if not paths:
+            QMessageBox.information(self, "Multi-file FA", "Select at least one database file.")
+            dialog.show()
+            return
+        self.pipeline_progress = self._start_progress("Multi-file FA", "Starting multi-file factor analysis...", 100)
+        worker = MultiFileFactorAnalysisWorker(paths, parameters)
+        self.pipeline_progress.canceled.connect(worker.cancel)
+        worker.signals.progress.connect(self._on_progress)
+        worker.signals.finished.connect(lambda payload, worker=worker: self._multi_file_fa_finished(payload, worker))
+        worker.signals.failed.connect(lambda details, worker=worker: self._multi_file_fa_failed(details, worker))
+        worker.signals.canceled.connect(lambda message, worker=worker: self._multi_file_fa_canceled(message, worker))
+        self.active_multi_file_fa_worker = worker
+        self.thread_pool.start(worker)
+
+    def _multi_file_fa_finished(self, payload: dict, worker: MultiFileFactorAnalysisWorker):
+        if worker._is_cancelled():
+            self._multi_file_fa_canceled("Multi-file factor analysis cancelled", worker)
+            return
+        if self.active_multi_file_fa_worker is worker:
+            self.active_multi_file_fa_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        records = list(payload.get("records", []))
+        errors = list(payload.get("errors", []))
+        if not records:
+            details = "\n".join(errors[:12]) if errors else "No files could be analyzed."
+            QMessageBox.warning(self, "Multi-file FA", details)
+            self._log("Multi-file factor analysis produced no usable files")
+            self._return_to_multi_file_fa_dialog()
+            return
+        self.multi_file_fa_payload = payload
+        self._multi_file_fa_analysis_dialog().set_cached_payload(payload)
+        self._open_multi_file_fa_window(payload)
+        self._log(f"Multi-file factor analysis: {len(records)} files, {len(errors)} skipped")
+
+    def _multi_file_fa_failed(self, details: str, worker: MultiFileFactorAnalysisWorker):
+        if self.active_multi_file_fa_worker is worker:
+            self.active_multi_file_fa_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self._log(details)
+        QMessageBox.critical(self, "Multi-file FA failed", details.splitlines()[-1] if details else "Unknown error")
+        self._return_to_multi_file_fa_dialog()
+
+    def _multi_file_fa_canceled(self, message: str, worker: MultiFileFactorAnalysisWorker):
+        if self.active_multi_file_fa_worker is worker:
+            self.active_multi_file_fa_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self._log(message or "Multi-file factor analysis cancelled")
+        self._return_to_multi_file_fa_dialog()
+
+    def _open_cached_multi_file_fa(self):
+        if not self.multi_file_fa_payload:
+            QMessageBox.information(self, "Multi-file FA", "Run analysis before opening results.")
+            return
+        self._open_multi_file_fa_window(self.multi_file_fa_payload)
+
+    def _open_multi_file_fa_window(self, payload: dict):
+        window = MultiFileFactorAnalysisWindow(payload, self)
+        self._show_multi_file_fa_result_window(window)
+
+    def _show_multi_file_fa_result_window(self, window: QDialog):
+        dialog = self._multi_file_fa_analysis_dialog()
+        dialog.hide()
+        window.finished.connect(lambda _result: self._return_to_multi_file_fa_dialog())
+        self._show_child(window)
+
+    def _return_to_multi_file_fa_dialog(self):
+        if self.multi_file_fa_dialog is None:
+            return
+        self.multi_file_fa_dialog.show()
+        self.multi_file_fa_dialog.raise_()
+        self.multi_file_fa_dialog.activateWindow()
+
+    def open_data(self):
+        dialog = DataFilesInputDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        paths = dialog.values()
+        if not paths:
+            return
+        selected_wells_by_path = {}
         try:
-            suffix = Path(path).suffix.lower()
-            if suffix == ".spk":
-                wells = list_axion_spk_wells(path)
+            if len(paths) == 1 and Path(paths[0]).suffix.lower() == ".spk":
+                wells = list_axion_spk_wells(paths[0])
                 if wells:
                     selected_wells, accepted = self._select_wells(wells)
                     if not accepted:
                         return
+                    selected_wells_by_path[str(Path(paths[0]))] = selected_wells
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
             return
@@ -11087,11 +13750,8 @@ class MainWindow(QMainWindow):
         self.preview_button.setEnabled(False)
         self.save_spike_train_button.setEnabled(False)
         self.save_spike_train_action.setEnabled(False)
-        self.run_button.setEnabled(False)
-        self.results_button.setEnabled(False)
-        self.temporal_button.setEnabled(False)
         self.pipeline_progress = self._start_progress("Loading data", "Starting data load...", 100)
-        worker = DataLoadWorker(path, selected_wells=selected_wells)
+        worker = FileDatabaseLoadWorker(paths, selected_wells_by_path=selected_wells_by_path)
         self.pipeline_progress.canceled.connect(worker.cancel)
         worker.signals.progress.connect(self._on_progress)
         worker.signals.finished.connect(lambda payload, worker=worker: self._data_load_finished(payload, worker))
@@ -11100,7 +13760,7 @@ class MainWindow(QMainWindow):
         self.active_load_worker = worker
         self.thread_pool.start(worker)
 
-    def _data_load_finished(self, payload: dict, worker: DataLoadWorker):
+    def _data_load_finished(self, payload: dict, worker):
         if worker._is_cancelled():
             self._data_load_canceled("Data loading cancelled", worker)
             return
@@ -11108,70 +13768,180 @@ class MainWindow(QMainWindow):
             self.active_load_worker = None
         self._finish_progress(self.pipeline_progress)
         self.pipeline_progress = None
-        path = str(payload.get("path", ""))
-        self.raw_data = payload.get("raw_data")
-        self.data_kind = str(payload.get("data_kind", ""))
-        if isinstance(self.raw_data, UnifiedMEAData):
-            filtered = self._maybe_select_loaded_well(self.raw_data)
-            if filtered is None:
-                self._update_data_preview()
-                return
-            self.raw_data = filtered
-        self._apply_source_channel_map()
+        raw_records = payload.get("records")
+        if raw_records is None and payload.get("path"):
+            raw_records = [
+                {
+                    "path": str(payload.get("path", "")),
+                    "raw_data": payload.get("raw_data"),
+                    "data_kind": str(payload.get("data_kind", "")),
+                }
+            ]
+        records = []
+        raw_records = list(raw_records or [])
+        for raw_record in raw_records:
+            record = self._normalize_database_record(raw_record, allow_well_prompt=len(raw_records) == 1)
+            if record is not None:
+                records.append(record)
+        errors = list(payload.get("errors", []))
+        if not records:
+            self._refresh_file_database_table()
+            self._sync_active_file_controls()
+            details = "\n".join(errors[:12]) if errors else "No readable files were loaded."
+            QMessageBox.warning(self, "Load failed", details)
+            return
 
-        self.input_path = path
+        first_new_index = 0
+        for record in records:
+            first_new_index = self._upsert_database_record(record)
+            self._log_database_record(record)
+        self._refresh_file_database_table()
+        self.database_table.selectRow(first_new_index)
+        self._set_active_database_index(first_new_index)
+        if errors:
+            self._log(f"Skipped {len(errors)} files: {'; '.join(errors[:4])}")
+        self._log(f"Database loaded: {len(self.file_database)} files")
+
+    def _data_load_failed(self, details: str, worker):
+        if self.active_load_worker is worker:
+            self.active_load_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self.preview_button.setEnabled(self.raw_data is not None)
+        can_save_file = self.raw_data is not None
+        self.save_spike_train_button.setEnabled(can_save_file)
+        self.save_spike_train_action.setEnabled(can_save_file)
+        QMessageBox.critical(self, "Load failed", details.splitlines()[-1])
+
+    def _data_load_canceled(self, message: str, worker):
+        if self.active_load_worker is worker:
+            self.active_load_worker = None
+        self._finish_progress(self.pipeline_progress)
+        self.pipeline_progress = None
+        self.preview_button.setEnabled(self.raw_data is not None)
+        can_save_file = self.raw_data is not None
+        self.save_spike_train_button.setEnabled(can_save_file)
+        self.save_spike_train_action.setEnabled(can_save_file)
+        self._log(message or "Data loading cancelled")
+
+    def _normalize_database_record(self, record: dict, *, allow_well_prompt: bool = False) -> dict | None:
+        path = str(record.get("path", ""))
+        raw_data = record.get("raw_data")
+        data_kind = str(record.get("data_kind", ""))
+        if isinstance(raw_data, UnifiedMEAData) and allow_well_prompt:
+            filtered = self._maybe_select_loaded_well(raw_data)
+            if filtered is None:
+                return None
+            raw_data = filtered
+        return {"path": path, "raw_data": raw_data, "data_kind": data_kind}
+
+    def _upsert_database_record(self, record: dict) -> int:
+        path = str(record.get("path", ""))
+        for index, existing in enumerate(self.file_database):
+            if str(existing.get("path", "")) == path:
+                self.file_database[index] = record
+                return index
+        self.file_database.append(record)
+        return len(self.file_database) - 1
+
+    def _database_record_stats(self, record: dict) -> tuple[int, int, int]:
+        return _loaded_data_stats(record.get("raw_data"))
+
+    def _refresh_file_database_table(self) -> None:
+        selected_rows = self._selected_database_rows() if hasattr(self, "database_table") else []
+        selected_paths = {str(self.file_database[row].get("path", "")) for row in selected_rows}
+        self.database_table.blockSignals(True)
+        self.database_table.setRowCount(len(self.file_database))
+        for row, record in enumerate(self.file_database):
+            path = Path(str(record.get("path", "")))
+            channels, spikes, waveforms = self._database_record_stats(record)
+            values = [
+                path.name,
+                _loaded_data_kind_label(record.get("raw_data"), str(record.get("data_kind", ""))),
+                str(channels),
+                str(spikes),
+                str(waveforms),
+                str(path.parent),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self.database_table.setItem(row, column, item)
+        self.database_table.resizeColumnsToContents()
+        self.database_table.clearSelection()
+        for row, record in enumerate(self.file_database):
+            if str(record.get("path", "")) in selected_paths:
+                self.database_table.selectRow(row)
+        self.database_table.blockSignals(False)
+        self._sync_active_file_controls()
+
+    def _selected_database_rows(self) -> list[int]:
+        rows = sorted({index.row() for index in self.database_table.selectedIndexes()})
+        return [row for row in rows if 0 <= row < len(self.file_database)]
+
+    def _selected_database_paths(self) -> list[str]:
+        rows = self._selected_database_rows() if hasattr(self, "database_table") else []
+        if rows:
+            return [str(self.file_database[row].get("path", "")) for row in rows]
+        return [str(record.get("path", "")) for record in self.file_database if record.get("path")]
+
+    def _selected_database_records(self) -> list[dict]:
+        rows = self._selected_database_rows()
+        if rows:
+            return [self.file_database[row] for row in rows]
+        return list(self.file_database)
+
+    def _database_selection_changed(self) -> None:
+        rows = self._selected_database_rows()
+        if not rows:
+            self._sync_active_file_controls()
+            return
+        current = self.database_table.currentRow()
+        self._set_active_database_index(current if current in rows else rows[0])
+
+    def _set_active_database_index(self, index: int) -> None:
+        if not (0 <= int(index) < len(self.file_database)):
+            self.raw_data = None
+            self.data_kind = ""
+            self.input_path = ""
+            self.file_label.setText("No data files loaded")
+            self._update_data_preview()
+            self._sync_active_file_controls()
+            return
+        record = self.file_database[int(index)]
+        self.input_path = str(record.get("path", ""))
+        self.raw_data = record.get("raw_data")
+        self.data_kind = str(record.get("data_kind", ""))
         self.result = None
-        self.file_label.setText(Path(path).name)
-        self.preview_button.setEnabled(True)
-        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
-        self.save_spike_train_button.setEnabled(can_save_spike_train)
-        self.save_spike_train_action.setEnabled(can_save_spike_train)
-        self.run_button.setEnabled(self.data_kind == "array")
-        self.results_button.setEnabled(self.data_kind == "nev")
-        self.temporal_button.setEnabled(self.data_kind == "nev")
-        self._log(f"Loaded {path}")
-        if self.data_kind == "nev":
-            spike_count = sum(values.size for values in self.raw_data.spikes.values())
-            source = self.raw_data.meta.get("source", "spike file") if isinstance(self.raw_data.meta, dict) else "spike file"
-            selected = self.raw_data.meta.get("selected_wells", []) if isinstance(self.raw_data.meta, dict) else []
-            self._log(f"Spike source: {source}")
-            if selected:
-                self._log(f"Selected wells: {', '.join(selected)}")
-            self._log(f"Spike channels: {len(self.raw_data.spikes)}")
-            self._log(f"Spikes: {spike_count}")
-            self._log("Spike-event files can be previewed and opened as results")
-        else:
-            self._log(f"Raw data shape: {np.asarray(self.raw_data).shape}")
+        self.file_label.setText(f"{int(index) + 1}/{len(self.file_database)}: {Path(self.input_path).name}")
+        self._apply_source_channel_map()
+        self._sync_active_file_controls()
         self._update_data_preview()
         self._validate_default_channel_map()
 
-    def _data_load_failed(self, details: str, worker: DataLoadWorker):
-        if self.active_load_worker is worker:
-            self.active_load_worker = None
-        self._finish_progress(self.pipeline_progress)
-        self.pipeline_progress = None
-        self.preview_button.setEnabled(self.raw_data is not None)
-        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
-        self.save_spike_train_button.setEnabled(can_save_spike_train)
-        self.save_spike_train_action.setEnabled(can_save_spike_train)
-        self.run_button.setEnabled(self.data_kind == "array")
-        self.results_button.setEnabled(self.data_kind == "nev")
-        self.temporal_button.setEnabled(self.data_kind == "nev")
-        QMessageBox.critical(self, "Load failed", details.splitlines()[-1])
+    def _sync_active_file_controls(self) -> None:
+        has_data = self.raw_data is not None
+        self.preview_button.setEnabled(has_data)
+        self.save_spike_train_button.setEnabled(has_data)
+        self.save_spike_train_action.setEnabled(has_data)
 
-    def _data_load_canceled(self, message: str, worker: DataLoadWorker):
-        if self.active_load_worker is worker:
-            self.active_load_worker = None
-        self._finish_progress(self.pipeline_progress)
-        self.pipeline_progress = None
-        self.preview_button.setEnabled(self.raw_data is not None)
-        can_save_spike_train = isinstance(self.raw_data, UnifiedMEAData)
-        self.save_spike_train_button.setEnabled(can_save_spike_train)
-        self.save_spike_train_action.setEnabled(can_save_spike_train)
-        self.run_button.setEnabled(self.data_kind == "array")
-        self.results_button.setEnabled(self.data_kind == "nev")
-        self.temporal_button.setEnabled(self.data_kind == "nev")
-        self._log(message or "Data loading cancelled")
+    def _log_database_record(self, record: dict) -> None:
+        path = str(record.get("path", ""))
+        data = record.get("raw_data")
+        data_kind = str(record.get("data_kind", ""))
+        self._log(f"Loaded {path}")
+        if data_kind == "nev" and isinstance(data, UnifiedMEAData):
+            spike_count = sum(values.size for values in data.spikes.values())
+            source = data.meta.get("source", "spike file") if isinstance(data.meta, dict) else "spike file"
+            selected = data.meta.get("selected_wells", []) if isinstance(data.meta, dict) else []
+            self._log(f"Spike source: {source}")
+            if selected:
+                self._log(f"Selected wells: {', '.join(selected)}")
+            self._log(f"Spike channels: {len(data.spikes)}")
+            self._log(f"Spikes: {spike_count}")
+            self._log("Spike-event files can be previewed and opened as results")
+        elif data is not None:
+            self._log(f"Raw data shape: {np.asarray(data).shape}")
 
     def _select_wells(self, wells):
         ordered = sorted([str(well) for well in wells], key=_well_sort_key)
@@ -11230,12 +14000,12 @@ class MainWindow(QMainWindow):
 
     def _data_preview_text(self) -> str:
         if self.raw_data is None:
-            return "No data loaded.\n\nUse Open Data to load an array, NPZ, or Blackrock NEV file."
+            return "No data loaded.\n\nUse Open Data Files to build a file database. Select one row for raster/sorting, or multiple rows for FA and stimulus response analysis."
 
         lines = []
         if self.input_path:
             lines.append(f"File: {self.input_path}")
-        lines.append(f"Kind: {self.data_kind or type(self.raw_data).__name__}")
+        lines.append(f"Kind: {_loaded_data_kind_label(self.raw_data, self.data_kind)}")
 
         if isinstance(self.raw_data, UnifiedMEAData):
             data = self.raw_data
@@ -11273,6 +14043,10 @@ class MainWindow(QMainWindow):
                     wells = data.meta.get("wells") or []
                     records = data.meta.get("event_records") or []
                     lines.append(f"Wells: {', '.join(wells) if wells else 'n/a'}")
+                    if data.meta.get("waveforms_deferred") or (
+                        data.meta.get("extract_waveforms") is False and not waveform_channels
+                    ):
+                        lines.append("Waveforms: deferred for faster loading; loaded on demand for sorting")
                     lines.append(f"Stim/event packets: {data.stim_times.size}")
                     if data.stim_times.size:
                         lines.append(f"Stim range: {float(data.stim_times[0]):.3f} - {float(data.stim_times[-1]):.3f} s")
@@ -11323,38 +14097,58 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def save_spike_train(self):
-        if not isinstance(self.raw_data, UnifiedMEAData):
-            QMessageBox.information(self, "Save Spike Train", "Load spike-event data before saving spike trains.")
+        if self.raw_data is None:
+            QMessageBox.information(self, "Save File", "Load data before saving.")
             return
 
-        default_name = "spike_train_data.npz"
+        save_mode = "Full file"
+        if isinstance(self.raw_data, UnifiedMEAData):
+            save_mode, accepted = QInputDialog.getItem(
+                self,
+                "Save File",
+                "Save mode:",
+                ["Full file", "Spike train only"],
+                0,
+                False,
+            )
+            if not accepted:
+                return
+
+        default_name = "data.npz"
         if self.input_path:
-            default_name = f"{Path(self.input_path).stem}_spike_train.npz"
+            suffix = "spike_train" if save_mode == "Spike train only" else "data"
+            default_name = f"{Path(self.input_path).stem}_{suffix}.npz"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save spike train data",
+            "Save file",
             default_name,
-            "Spike train data (*.npz);;All files (*)",
+            "NPZ data (*.npz);;All files (*)",
         )
         if not path:
             return
         if Path(path).suffix.lower() != ".npz":
             path = f"{path}.npz"
 
-        progress = self._start_progress("Save Spike Train", "Saving spike train data...", 0)
+        progress = self._start_progress("Save File", "Saving data...", 0)
         try:
-            saved = save_spike_train_npz(self.raw_data, path)
+            if isinstance(self.raw_data, UnifiedMEAData):
+                if save_mode == "Spike train only":
+                    saved = save_spike_train_npz(self.raw_data, path)
+                else:
+                    saved = save_unified_npz(self.raw_data, path, include_waveforms=True)
+            else:
+                saved = MEAWriter(path).save_data(self.raw_data)
         except Exception as exc:
-            QMessageBox.critical(self, "Save Spike Train failed", str(exc))
+            QMessageBox.critical(self, "Save File failed", str(exc))
             return
         finally:
             self._finish_progress(progress)
 
-        self._log(f"Saved spike train data: {saved}")
+        self._log(f"Saved data: {saved}")
         QMessageBox.information(
             self,
-            "Save Spike Train",
-            f"Saved spike train data without waveform arrays:\n{saved}",
+            "Save File",
+            f"Saved {save_mode.lower()}:\n{saved}",
         )
 
     def preview_raw(self):
@@ -11409,6 +14203,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Sorting", "Sorting currently requires loaded spike waveforms.")
             return
         if not self.raw_data.waveforms:
+            if self._can_load_deferred_maxwell_waveforms():
+                answer = QMessageBox.question(
+                    self,
+                    "Load Maxwell waveforms?",
+                    "This Maxwell file was loaded in spike-only mode for speed. Sorting requires spike-aligned waveforms.\n\nLoad waveforms now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                self._load_maxwell_waveforms_for_sorting()
+                return
             QMessageBox.warning(self, "Sorting", "The loaded NEV file does not contain spike waveforms.")
             return
         progress = self._start_progress("Opening sorting", "Preparing sorting workspace...", 0)
@@ -11420,6 +14226,86 @@ class MainWindow(QMainWindow):
         finally:
             self._finish_progress(progress)
         self._show_child(window)
+
+    def _can_load_deferred_maxwell_waveforms(self) -> bool:
+        if not isinstance(self.raw_data, UnifiedMEAData) or not isinstance(self.raw_data.meta, dict):
+            return False
+        return (
+            self.raw_data.meta.get("source") == "maxwell_h5"
+            and bool(self.input_path)
+            and Path(self.input_path).suffix.lower() in {".h5", ".hdf5"}
+        )
+
+    def _load_maxwell_waveforms_for_sorting(self):
+        if self.active_maxwell_waveform_worker is not None:
+            QMessageBox.information(self, "Sorting", "Maxwell waveforms are already loading.")
+            return
+        self.maxwell_waveform_progress = self._start_progress(
+            "Loading Maxwell waveforms",
+            "Reading spike-aligned waveforms for sorting...",
+            100,
+        )
+        worker = MaxwellWaveformLoadWorker(self.input_path)
+        self.maxwell_waveform_progress.canceled.connect(worker.cancel)
+        worker.signals.progress.connect(self._on_maxwell_waveform_progress)
+        worker.signals.finished.connect(lambda data, worker=worker: self._maxwell_waveforms_finished(data, worker))
+        worker.signals.failed.connect(lambda details, worker=worker: self._maxwell_waveforms_failed(details, worker))
+        worker.signals.canceled.connect(lambda message, worker=worker: self._maxwell_waveforms_canceled(message, worker))
+        self.active_maxwell_waveform_worker = worker
+        self.thread_pool.start(worker)
+
+    def _on_maxwell_waveform_progress(self, value: int, message: str):
+        if self.maxwell_waveform_progress is not None:
+            self._progress_step(self.maxwell_waveform_progress, message, max(0, min(100, int(value))))
+
+    def _maxwell_waveforms_finished(self, data: UnifiedMEAData, worker: MaxwellWaveformLoadWorker):
+        if worker._is_cancelled():
+            self._maxwell_waveforms_canceled("Waveform loading cancelled", worker)
+            return
+        if self.active_maxwell_waveform_worker is worker:
+            self.active_maxwell_waveform_worker = None
+        self._finish_progress(self.maxwell_waveform_progress)
+        self.maxwell_waveform_progress = None
+        if not isinstance(self.raw_data, UnifiedMEAData):
+            return
+        self.raw_data.waveforms = dict(data.waveforms)
+        if not self.raw_data.sr and data.sr:
+            self.raw_data.sr = data.sr
+        if isinstance(self.raw_data.meta, dict) and isinstance(data.meta, dict):
+            for key in (
+                "raw_data",
+                "waveform_unit",
+                "waveform_window_ms",
+                "waveform_extraction",
+                "extract_waveforms",
+                "waveforms_deferred",
+                "waveform_channel_count",
+            ):
+                if key in data.meta:
+                    self.raw_data.meta[key] = data.meta[key]
+            self.raw_data.meta["waveforms_deferred"] = False
+        self._update_data_preview()
+        self._log(f"Loaded Maxwell waveforms for {len(self.raw_data.waveforms)} channels")
+        self._refresh_file_database_table()
+        if self.raw_data.waveforms:
+            self.open_sorting()
+        else:
+            QMessageBox.warning(self, "Sorting", "No readable Maxwell waveforms were found in this file.")
+
+    def _maxwell_waveforms_failed(self, details: str, worker: MaxwellWaveformLoadWorker):
+        if self.active_maxwell_waveform_worker is worker:
+            self.active_maxwell_waveform_worker = None
+        self._finish_progress(self.maxwell_waveform_progress)
+        self.maxwell_waveform_progress = None
+        self._log(details)
+        QMessageBox.critical(self, "Waveform loading failed", details.splitlines()[-1])
+
+    def _maxwell_waveforms_canceled(self, message: str, worker: MaxwellWaveformLoadWorker):
+        if self.active_maxwell_waveform_worker is worker:
+            self.active_maxwell_waveform_worker = None
+        self._finish_progress(self.maxwell_waveform_progress)
+        self.maxwell_waveform_progress = None
+        self._log(message or "Waveform loading cancelled")
 
     def open_temporal_coupling(self):
         if self.data_kind != "nev" or not isinstance(self.raw_data, UnifiedMEAData):
@@ -11450,8 +14336,6 @@ class MainWindow(QMainWindow):
     def run_pipeline(self):
         if not self.input_path or self.data_kind != "array":
             return
-        self.run_button.setEnabled(False)
-        self.results_button.setEnabled(False)
         self._log("Starting pipeline")
         self.pipeline_progress = self._start_progress("Running pipeline", "Starting pipeline...", 100)
         worker = PipelineWorker(self.input_path, self.config)
@@ -11520,15 +14404,12 @@ class MainWindow(QMainWindow):
         self._finish_progress(self.pipeline_progress)
         self.pipeline_progress = None
         self.result = result
-        self.run_button.setEnabled(True)
-        self.results_button.setEnabled(True)
         self._log(f"Completed. Output: {result.output_path}")
         self.open_results()
 
     def _on_failed(self, details: str):
         self._finish_progress(self.pipeline_progress)
         self.pipeline_progress = None
-        self.run_button.setEnabled(True)
         self._log(details)
         QMessageBox.critical(self, "Pipeline failed", details.splitlines()[-1])
 

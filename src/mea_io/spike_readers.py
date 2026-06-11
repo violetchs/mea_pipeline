@@ -1548,6 +1548,9 @@ def read_maxwell_h5(
         "waveform_unit": waveform_unit,
         "waveform_window_ms": [float(waveform_window_ms[0]), float(waveform_window_ms[1])],
         "waveform_extraction": dict(waveform_extraction),
+        "extract_waveforms": bool(extract_waveforms),
+        "waveforms_deferred": bool(not extract_waveforms),
+        "waveform_channel_count": int(len(waveforms)),
     }
 
     return UnifiedMEAData(

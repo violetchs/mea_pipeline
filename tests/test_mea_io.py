@@ -312,9 +312,19 @@ class TestMaxwellH5Reader:
         assert data.meta["channel_map"]["well0_e11"]["x_um"] == pytest.approx(17.5)
         assert data.meta["raw_data"][0]["path"] == "data_store/data0000/groups/exp/raw"
         assert data.meta["waveform_unit"] == "adc_counts"
+        assert data.meta["extract_waveforms"] is True
+        assert data.meta["waveforms_deferred"] is False
+        assert data.meta["waveform_channel_count"] == 2
         assert data.waveforms["well0_e11"].shape == (2, 61)
         np.testing.assert_allclose(data.waveforms["well0_e11"][0], np.arange(80, 141, dtype=float))
         np.testing.assert_allclose(data.waveforms["well0_e12"][0], np.arange(1480, 1541, dtype=float))
+
+        fast_data = read_maxwell_h5(path, extract_waveforms=False)
+        assert fast_data.meta["extract_waveforms"] is False
+        assert fast_data.meta["waveforms_deferred"] is True
+        assert fast_data.meta["waveform_channel_count"] == 0
+        assert fast_data.waveforms == {}
+        np.testing.assert_allclose(fast_data.spikes["well0_e11"], data.spikes["well0_e11"])
 
     def test_mea_reader_loads_maxwell_h5(self, tmp_path):
         h5py = pytest.importorskip("h5py")
