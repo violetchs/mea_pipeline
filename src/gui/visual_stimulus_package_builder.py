@@ -62,7 +62,7 @@ class StimulusProtocol:
     interpulse_interval_ms: float = 50.0
     burst_count: int = 3
     burst_interval_ms: float = 200.0
-    start_ms: float = 0.0
+    start_ms: float = 1500.0
     channel: int = 0
     custom_points: list[dict[str, float]] = field(default_factory=list)
     spontaneous_data_path: str = ""
@@ -747,6 +747,8 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
             )
             protocol = protocols[block["protocol"]]
             electrode_group = groups[block["electrode_group"]]
+            if not dry_run:
+                configure_experiment_array(cfg_path, electrode_group, system_config)
 
             for phase in block.get("phases", []):
                 phase_id = phase["id"]
@@ -813,7 +815,6 @@ def _run_stim_phase(
     if dry_run:
         logging.info("Dry run: %s %s pulses=%d", block_name, protocol.get("name"), len(stim_times))
     else:
-        configure_experiment_array(cfg_path, electrode_group, system_config)
         saving = create_experiment_saving(phase_dir, segment_name)
         if protocol.get("type") == "poisson_random_electrodes":
             logging.warning("poisson_random_electrodes generated a fixed stim_plan.csv. Hardware dispatch remains conservative; review plan before enabling per-electrode delivery.")
@@ -1210,7 +1211,7 @@ def build_stim_sequence(protocol: dict[str, Any], electrode_group_name: str) -> 
     channel = int(protocol.get("channel", 0))
     event_id = 1
 
-    def pulse(amplitude_mv: float, event_index: int, dac_channel: int = channel, duration_us: float = width_us) -> None:
+    def pulse(amplitude_mv: float, event_index: int, dac_channel: int = channel, duration_us: float = width_us) -> float:
         bits = _half_bits(amplitude_mv)
         seq.append(_event(f"type stim name {name} amplitude_mv {amplitude_mv}", event_index))
         seq.append(mx.DAC(dac_channel, 512 - bits))
@@ -1220,31 +1221,25 @@ def build_stim_sequence(protocol: dict[str, Any], electrode_group_name: str) -> 
         seq.append(mx.DAC(dac_channel, 512 + bits))
         seq.append(mx.DelaySamples(_samples_us(duration_us)))
         seq.append(mx.DAC(dac_channel, 512))
+        return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
 
     ptype = protocol.get("type")
-    if ptype == "single_pulse":
-        pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
-    elif ptype == "individual_burst":
-        for _ in range(int(protocol.get("pulses_per_burst", 5))):
-            pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
+    if ptype in {"single_pulse", "individual_burst", "sequence_with_burst"}:
+        current_ms = 0.0
+        for stim_ms in _scheduled_stim_times_ms(protocol):
+            if stim_ms > current_ms:
+                seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))
+            current_ms = max(current_ms, stim_ms) + pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
             event_id += 1
-            seq.append(mx.DelaySamples(_samples_ms(_pulse_interval_ms(protocol))))
-    elif ptype == "sequence_with_burst":
-        for _ in range(int(protocol.get("burst_count", 3))):
-            for _ in range(int(protocol.get("pulses_per_burst", 5))):
-                pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
-                event_id += 1
-                seq.append(mx.DelaySamples(_samples_ms(_pulse_interval_ms(protocol))))
-            seq.append(mx.DelaySamples(_samples_ms(float(protocol.get("burst_interval_ms", 200.0)))))
     elif ptype == "custom_sequence":
         current_ms = 0.0
         for point in sorted(protocol.get("custom_points", []), key=lambda item: float(item["time_ms"])):
             point_ms = float(point["time_ms"])
             if point_ms > current_ms:
                 seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            pulse(float(point["amplitude_mv"]), event_id, int(point.get("channel", channel)), float(point.get("duration_us", width_us)))
+            pulse_width_ms = pulse(float(point["amplitude_mv"]), event_id, int(point.get("channel", channel)), float(point.get("duration_us", width_us)))
             event_id += 1
-            current_ms = point_ms
+            current_ms = max(current_ms, point_ms) + pulse_width_ms
     else:
         raise ValueError(f"Unsupported protocol type: {ptype}")
     return seq
@@ -1291,6 +1286,11 @@ def create_experiment_saving(run_dir: Path, file_name: str) -> Any:
 
 
 def get_stim_times_for_protocol(protocol: dict[str, Any], duration_s: int) -> list[float]:
+    times_ms = _scheduled_stim_times_ms(protocol)
+    return sorted(round(ms / 1000.0, 6) for ms in times_ms if 0 <= ms / 1000.0 <= float(duration_s))
+
+
+def _scheduled_stim_times_ms(protocol: dict[str, Any]) -> list[float]:
     ptype = protocol.get("type")
     start_ms = float(protocol.get("start_ms", 0.0))
     times_ms = []
@@ -1309,7 +1309,7 @@ def get_stim_times_for_protocol(protocol: dict[str, Any], duration_s: int) -> li
         times_ms.extend(float(point["time_ms"]) for point in protocol.get("custom_points", []))
     else:
         raise ValueError(f"Unsupported protocol type: {ptype}")
-    return sorted(round(ms / 1000.0, 6) for ms in times_ms if 0 <= ms / 1000.0 <= float(duration_s))
+    return sorted(ms for ms in times_ms if ms >= 0.0)
 
 
 def _pulse_interval_ms(protocol: dict[str, Any]) -> float:

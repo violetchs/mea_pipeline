@@ -3682,6 +3682,60 @@ def test_stimulus_generation_individual_burst_preview_is_single_burst():
     assert series[0]["times_ms"] == [0.0, 50.0, 100.0]
 
 
+def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "delayed_bursts",
+        "sequence_with_burst",
+        pulses_per_burst=2,
+        interpulse_interval_ms=25.0,
+        burst_count=2,
+        burst_interval_ms=1000.0,
+    )
+    group = stimulus_builder.ElectrodeGroup("group_A", [1234])
+    block = stimulus_builder.ExperimentBlock("block_A", "group_A", protocol.name)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        [group],
+        [protocol],
+        [block],
+    )
+
+    setup_text = (output_dir / "python" / "maxwell_setup.py").read_text(encoding="utf-8")
+    stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
+
+    assert "start_ms: 1500.0" in stimulation_text
+    assert "for stim_ms in _scheduled_stim_times_ms(protocol):" in setup_text
+    assert "seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))" in setup_text
+
+
+def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol("delayed_single", "single_pulse")
+    group = stimulus_builder.ElectrodeGroup("group_A", [1234])
+    block = stimulus_builder.ExperimentBlock("block_A", "group_A", protocol.name)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        [group],
+        [protocol],
+        [block],
+    )
+
+    runner_text = (output_dir / "python" / "experiment_runner.py").read_text(encoding="utf-8")
+    configure_index = runner_text.index("configure_experiment_array(cfg_path, electrode_group, system_config)")
+    phase_loop_index = runner_text.index('for phase in block.get("phases", []):')
+    stim_phase_index = runner_text.index("def _run_stim_phase(")
+
+    assert configure_index < phase_loop_index
+    assert runner_text.find("configure_experiment_array", stim_phase_index) == -1
+
+
 def test_stimulus_generation_protocol_fields_follow_selected_type():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

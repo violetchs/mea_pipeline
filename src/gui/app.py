@@ -17840,7 +17840,7 @@ class StimulusGenerationDialog(AppDialog):
             interpulse_interval_ms=float(self.protocol_fields["interpulse_interval_ms"].text() or 50),
             burst_count=int(self.protocol_fields["burst_count"].text() or 3),
             burst_interval_ms=float(self.protocol_fields["burst_interval_ms"].text() or 200),
-            start_ms=float(self.protocol_fields["start_ms"].text() or 0),
+            start_ms=float(self.protocol_fields["start_ms"].text() or 1500),
             channel=int(self.protocol_fields["channel"].text() or 0),
             custom_points=stimulus_builder.parse_custom_points(self.custom_points.toPlainText()),
             region_count=int(self.protocol_fields["region_count"].text() or 32),
