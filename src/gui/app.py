@@ -12812,12 +12812,15 @@ class BurstTrajectoryWindow(AppDialog):
         labels = np.asarray(result.get("labels", []), dtype=int)
         unique_labels = sorted(int(value) for value in np.unique(labels))
         time = np.asarray(result.get("normalized_time", []), dtype=float)
+        best_k = int(result.get("best_k", 1))
+        silhouette_by_k = result.get("silhouette_by_k", {}) or {}
+        best_silhouette = float(silhouette_by_k.get(f"k_{best_k}", 0.0))
         summary = " | ".join(
             [
                 f"Bursts: {trajs.shape[0]}",
                 f"Normalized steps: {int(result.get('resample_steps', 0))}",
-                f"Best k: {int(result.get('best_k', 1))}",
-                f"Silhouette: {float((result.get('silhouette_by_k', {}) or {}).get(f'k_{int(result.get('best_k', 1))}', 0.0)):.4g}",
+                f"Best k: {best_k}",
+                f"Silhouette: {best_silhouette:.4g}",
                 "Basis: latent trajectories aligned to burst onset and resampled to common length",
             ]
         )
