@@ -3773,6 +3773,45 @@ def test_stimulus_generation_package_writes_poisson_auto_electrode_group(tmp_pat
     assert "201" in stimulation_text
 
 
+def test_stimulus_generation_ui_updates_poisson_auto_electrode_group(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    app = QApplication.instance() or QApplication([])
+    rate_path = tmp_path / "rates.npz"
+    np.savez(
+        rate_path,
+        electrodes=np.asarray([100, 101, 200, 201], dtype=np.int32),
+        rates_hz=np.asarray([1.0, 9.0, 2.0, 8.0], dtype=float),
+    )
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_ui",
+        "poisson_random_electrodes",
+        spontaneous_data_path=str(rate_path),
+        region_count=2,
+        max_candidate_electrodes=4,
+    )
+    dialog.protocols = [protocol]
+    dialog.protocol_source_paths[protocol.name] = str(rate_path)
+    dialog.groups = [stimulus_builder.ElectrodeGroup("manual_group", [7317])]
+    dialog.blocks = [stimulus_builder.ExperimentBlock("poisson_block", "manual_group", protocol.name)]
+
+    dialog._sync_poisson_protocol_auto_group(protocol.name)
+
+    auto_group = next(group for group in dialog.groups if group.name == "manual_group_poisson_ui_auto")
+    assert auto_group.electrodes == [101, 201]
+    assert dialog.blocks[0].electrode_group == auto_group.name
+    group_names = [dialog.group_table.item(row, 0).text() for row in range(dialog.group_table.rowCount())]
+    assert auto_group.name in group_names
+    dialog.close()
+    app.processEvents()
+
+
 def test_stimulus_generation_protocol_fields_follow_selected_type():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

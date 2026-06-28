@@ -17163,6 +17163,7 @@ class StimulusGenerationDialog(AppDialog):
         if self.records:
             self.protocol_source_paths["poisson_random_safe"] = str(self.records[0].get("path", ""))
         self.blocks = [stimulus_builder.ExperimentBlock("group_A_150mV", "group_A", "feedback_single_150mV")]
+        self.poisson_auto_groups: dict[str, str] = {}
         self.output_dir = Path("generated_visual_experiment")
         self.preview_map_selected = None
         self.preview_map_selection_artist = None
@@ -17671,6 +17672,8 @@ class StimulusGenerationDialog(AppDialog):
                 self.protocol_source_paths[name] = source_path
             else:
                 self.protocol_source_paths.pop(name, None)
+            self._update_protocol_from_form_if_possible(name)
+            self._sync_poisson_protocol_auto_group(name)
             self._refresh_protocol_table()
         if hasattr(self, "preview_combo") and str(self.preview_combo.currentData() or "") == name:
             self._draw_preview()
@@ -17762,12 +17765,15 @@ class StimulusGenerationDialog(AppDialog):
             self.protocols[row] = protocol
             if old_name != protocol.name and old_name in self.protocol_source_paths:
                 self.protocol_source_paths[protocol.name] = self.protocol_source_paths.pop(old_name)
+            if old_name != protocol.name and old_name in self.poisson_auto_groups:
+                self.poisson_auto_groups[protocol.name] = self.poisson_auto_groups.pop(old_name)
         source_path = str(self.source_combo.currentData() or "")
         if source_path:
             self.protocol_source_paths[protocol.name] = source_path
         else:
             self.protocol_source_paths.pop(protocol.name, None)
         self._clear_preview_caches()
+        self._sync_poisson_protocol_auto_group(protocol.name)
         self._refresh_protocol_table()
         self._refresh_block_combos()
         self._refresh_preview_combo()
@@ -17801,11 +17807,14 @@ class StimulusGenerationDialog(AppDialog):
         else:
             self.blocks[row] = block
         self._clear_preview_caches()
+        self._sync_poisson_protocol_auto_group(block.protocol)
         self._refresh_block_table()
 
     def _remove_group(self) -> None:
         row = self._selected_table_row(self.group_table)
         if row is not None and 0 <= row < len(self.groups):
+            removed_name = self.groups[row].name
+            self.poisson_auto_groups = {key: value for key, value in self.poisson_auto_groups.items() if value != removed_name}
             del self.groups[row]
             self._clear_preview_caches()
             self._refresh_group_table()
@@ -17815,6 +17824,7 @@ class StimulusGenerationDialog(AppDialog):
         row = self._selected_table_row(self.protocol_table)
         if row is not None and 0 <= row < len(self.protocols):
             self.protocol_source_paths.pop(self.protocols[row].name, None)
+            self._remove_poisson_auto_group(self.protocols[row].name)
             del self.protocols[row]
             self._clear_preview_caches()
             self._refresh_protocol_table()
@@ -17827,6 +17837,85 @@ class StimulusGenerationDialog(AppDialog):
             del self.blocks[row]
             self._clear_preview_caches()
             self._refresh_block_table()
+
+    def _update_protocol_from_form_if_possible(self, protocol_name: str) -> None:
+        try:
+            protocol = self._protocol_from_form()
+        except Exception:
+            return
+        if protocol.name != protocol_name:
+            return
+        for index, existing in enumerate(self.protocols):
+            if existing.name == protocol_name:
+                self.protocols[index] = protocol
+                return
+
+    def _sync_poisson_protocol_auto_group(self, protocol_name: str) -> None:
+        protocol = next((item for item in self.protocols if item.name == protocol_name), None)
+        if protocol is None or protocol.type != "poisson_random_electrodes":
+            self._remove_poisson_auto_group(protocol_name)
+            return
+        related_blocks = [block for block in self.blocks if block.protocol == protocol.name]
+        if not related_blocks:
+            return
+        source_path = str(self.protocol_source_paths.get(protocol.name, "") or "")
+        if source_path:
+            protocol.spontaneous_data_path = source_path
+        manual_group = self._manual_group_for_poisson_blocks(related_blocks)
+        fallback = list(manual_group.electrodes) if manual_group is not None else self._default_electrodes()
+        try:
+            candidates = stimulus_builder.poisson_candidate_electrodes_for_protocol(protocol, fallback)
+        except Exception as exc:
+            self.generate_status.setText(f"Poisson auto electrodes unavailable: {exc}")
+            return
+        group_name = self.poisson_auto_groups.get(protocol.name)
+        if not group_name:
+            base_group = manual_group.name if manual_group is not None else "poisson"
+            group_name = self._unique_group_name(f"{base_group}_{protocol.name}_auto")
+            self.poisson_auto_groups[protocol.name] = group_name
+        auto_group = next((group for group in self.groups if group.name == group_name), None)
+        if auto_group is None:
+            auto_group = stimulus_builder.ElectrodeGroup(group_name, [])
+            self.groups.append(auto_group)
+        auto_group.electrodes = [int(value) for value in candidates]
+        for block in related_blocks:
+            block.electrode_group = group_name
+        self._clear_preview_caches()
+        self._refresh_group_table()
+        self._refresh_block_table()
+        self._refresh_block_combos()
+        self.generate_status.setText(f"Poisson auto electrodes updated: {group_name} ({len(candidates)})")
+
+    def _remove_poisson_auto_group(self, protocol_name: str) -> None:
+        group_name = self.poisson_auto_groups.pop(protocol_name, "")
+        if not group_name:
+            return
+        self.groups = [group for group in self.groups if group.name != group_name]
+        fallback = self.groups[0].name if self.groups else ""
+        for block in self.blocks:
+            if block.electrode_group == group_name:
+                block.electrode_group = fallback
+
+    def _manual_group_for_poisson_blocks(self, blocks: list) -> object | None:
+        auto_group_names = set(self.poisson_auto_groups.values())
+        group_lookup = {group.name: group for group in self.groups}
+        for block in blocks:
+            if block.electrode_group in auto_group_names:
+                continue
+            group = group_lookup.get(block.electrode_group)
+            if group is not None:
+                return group
+        return next((group for group in self.groups if group.name not in auto_group_names), None)
+
+    def _unique_group_name(self, base: str) -> str:
+        existing = {group.name for group in self.groups}
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "poisson_auto"
+        if cleaned not in existing:
+            return cleaned
+        index = 2
+        while f"{cleaned}_{index}" in existing:
+            index += 1
+        return f"{cleaned}_{index}"
 
     def _protocol_from_form(self):
         return stimulus_builder.StimulusProtocol(
