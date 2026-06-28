@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
+from src.analysis import run_generic_matrix_analysis
 from src.gui.app import (
     AutoSortingDialog,
     MainWindow,
@@ -15,7 +16,12 @@ from src.gui.app import (
     SortingWorkspaceWindow,
     StimulusActivationCurveWindow,
     MultiFileFactorAnalysisWindow,
+    FactorAnalysisDatabaseDialog,
+    GenericAnalysisDialog,
+    GenericAnalysisWindow,
     StimulusPSTHWindow,
+    StimulusDatabaseAnalysisDialog,
+    StimulusGenerationDialog,
     StimulusResponseWindow,
     TemporalCouplingWindow,
     BurstDelayWindow,
@@ -48,6 +54,9 @@ from src.gui.app import (
     _stimulus_response_group_records,
     _stimulus_response_record_from_data,
     _stimulus_response_supported_files,
+    _loaded_data_activity_label,
+    _generic_analysis_matrix_from_record,
+    _default_axion_channel_map,
     _default_maxwell_channel_map,
     StimulusResponseInputDialog,
     _temporal_coupling_pairs,
@@ -116,6 +125,92 @@ def test_raster_series_uses_channel_rows_without_units():
         ("chan2", [0.2]),
     ]
     assert sorted(waveforms) == ["chan1", "chan2"]
+
+
+def test_default_axion_channel_map_uses_64_by_6_layout_and_routes_channels():
+    data = UnifiedMEAData(
+        spikes={
+            "A1_r1c1": np.array([0.1]),
+            "B1_r2c3": np.array([0.2]),
+        },
+        meta={
+            "source": "axion_spk",
+            "wells": ["A1", "B1"],
+            "channel_map": {
+                "A1_r1c1": {"well": "A1", "electrode": "r1c1", "electrode_row": 1, "electrode_col": 1},
+                "B1_r2c3": {"well": "B1", "electrode": "r2c3", "electrode_row": 2, "electrode_col": 3},
+            },
+        },
+    )
+
+    channel_map = _default_axion_channel_map(data)
+
+    assert channel_map.name == "axion_map"
+    assert channel_map.rows == 6
+    assert channel_map.cols == 64
+    assert channel_map.channel_for("A1_slot01") == "A1_r1c1"
+    assert channel_map.channel_for("B1_slot11") == "B1_r2c3"
+    assert channel_map.electrodes["A1_slot01"]["routed"] is True
+    assert channel_map.electrodes["A1_slot02"]["routed"] is False
+    a1 = channel_map.electrodes["A1_slot01"]
+    a2 = channel_map.electrodes["A2_slot01"]
+    b1 = channel_map.electrodes["B1_slot01"]
+    assert float(a2["x_um"]) > float(a1["x_um"])
+    assert float(b1["y_um"]) > float(a1["y_um"])
+    assert int(a1["well_grid_row"]) == 0
+    assert int(a2["well_grid_col"]) == 1
+    assert int(b1["well_grid_row"]) == 1
+
+
+def test_default_axion_channel_map_wells_arrange_in_three_by_two_grid():
+    channel_map = _default_axion_channel_map(
+        UnifiedMEAData(
+            spikes={"A1_r1c1": np.array([0.1])},
+            meta={"source": "axion_spk", "wells": ["A1", "A2", "A3", "B1", "B2", "B3"]},
+        )
+    )
+
+    a1 = channel_map.electrodes["A1_slot01"]
+    a2 = channel_map.electrodes["A2_slot01"]
+    a3 = channel_map.electrodes["A3_slot01"]
+    b1 = channel_map.electrodes["B1_slot01"]
+    b2 = channel_map.electrodes["B2_slot01"]
+    b3 = channel_map.electrodes["B3_slot01"]
+
+    assert float(a2["x_um"]) > float(a1["x_um"])
+    assert float(a3["x_um"]) > float(a2["x_um"])
+    assert float(b1["y_um"]) > float(a1["y_um"])
+    assert float(b2["x_um"]) > float(b1["x_um"])
+    assert float(b3["x_um"]) > float(b2["x_um"])
+
+
+def test_axion_heatmap_keeps_same_electrode_names_separate_across_wells():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import ElectrodeHeatmapCanvas
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = _default_axion_channel_map(
+        UnifiedMEAData(
+            spikes={"B1_r1c1": np.array([0.1])},
+            meta={
+                "source": "axion_spk",
+                "wells": ["A1", "B1"],
+                "channel_map": {
+                    "B1_r1c1": {"well": "B1", "electrode": "r1c1", "electrode_row": 1, "electrode_col": 1},
+                },
+            },
+        )
+    )
+    canvas = ElectrodeHeatmapCanvas(channel_map)
+    b1_payload = channel_map.electrodes["B1_slot01"]
+    a1_payload = channel_map.electrodes["A1_slot01"]
+
+    assert canvas._count_for_entry({"B1_r1c1": 3}, b1_payload, "B1_slot01") == 3.0
+    assert canvas._count_for_entry({"B1_r1c1": 3}, a1_payload, "A1_slot01") == 0.0
 
 
 def test_raster_series_uses_unit_rows_when_sorting_labels_exist():
@@ -412,6 +507,13 @@ def test_burst_trajectory_window_is_factor_analysis_only():
     assert hasattr(window, "weight_metrics_button")
     assert hasattr(window, "temporal_model_button")
     assert hasattr(window, "trajectory_analysis_button")
+    assert hasattr(window, "normalized_time_button")
+    assert hasattr(window, "temporal_method")
+    assert hasattr(window, "history_bins")
+    assert hasattr(window, "spatial_temporal_button")
+    assert hasattr(window, "activity_similarity_weight")
+    assert hasattr(window, "spatial_similarity_weight")
+    assert hasattr(window, "region_membership_threshold")
     assert not hasattr(window, "export_latent_button")
     assert not hasattr(window, "latent_metrics_button")
     assert window.bin_ms.value() == 10.0
@@ -432,6 +534,10 @@ def test_burst_trajectory_window_is_factor_analysis_only():
     assert window.psth_canvas.figure.axes[0].get_ylabel() == "Mean firing rate (Hz)"
     assert "Factor loading matrix W" in window.weight_canvas.figure.axes[0].get_title()
 
+    window.temporal_method.setCurrentIndex(window.temporal_method.findData("knn"))
+    window.history_bins.setValue(2)
+    temporal_model = window._temporal_latent_model()
+    assert temporal_model["history_bins"] == 2
     window._show_reconstruction_metrics()
     window._show_weight_metrics()
     window._show_temporal_model()
@@ -443,9 +549,316 @@ def test_burst_trajectory_window_is_factor_analysis_only():
     weight_canvas = window.metric_windows[1].findChildren(FigureCanvas)[0]
     assert "W subspace singular spectrum" in weight_canvas.figure.axes[0].get_title()
     temporal_canvas = window.metric_windows[2].findChildren(FigureCanvas)[0]
-    assert "Raw data vs nonlinear temporal reconstruction" in temporal_canvas.figure.axes[0].get_title()
+    assert "Raw data vs temporal reconstruction" in temporal_canvas.figure.axes[0].get_title()
     trajectory_canvas = window.metric_windows[3].findChildren(FigureCanvas)[0]
-    assert "Initial latent state clusters" in trajectory_canvas.figure.axes[0].get_title()
+    titles = {axis.get_title() for axis in trajectory_canvas.figure.axes}
+    assert "Trajectory-structure clusters" in titles
+    assert "Trajectory distance matrix" in titles
+    assert "Trajectory-PCA eigenvalues and explained variance" in titles
+
+
+def test_burst_trajectory_window_shows_normalized_time_analysis():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    bursts = [(float(index), float(index) + 0.08 + 0.01 * (index % 3)) for index in range(6)]
+    spike_series = [
+        ("chan1", np.array([start + 0.010 for start, _stop in bursts] + [start + 0.020 for start, _stop in bursts])),
+        ("chan2", np.array([start + 0.018 for start, _stop in bursts] + [start + 0.036 for start, _stop in bursts])),
+        ("chan3", np.array([start + 0.046 for start, _stop in bursts])),
+    ]
+    window = BurstTrajectoryWindow(spike_series, bursts)
+
+    try:
+        result = window._normalized_time_analysis(resample_steps=24, max_k=3)
+        assert result["trajectories"].shape[1] == 24
+        assert result["population_trajectories"].shape == (len(bursts), 24)
+        assert result["normalized_time"][0] == pytest.approx(0.0)
+        assert result["normalized_time"][-1] == pytest.approx(1.0)
+        assert "clusters" in result["cluster_stats"]
+        assert result["silhouette_by_k"]
+
+        window._show_normalized_time_analysis()
+        assert window.metric_windows
+        metric_canvas = window.metric_windows[-1].findChildren(FigureCanvas)[0]
+        titles = {axis.get_title() for axis in metric_canvas.figure.axes}
+        assert "Normalized-time burst classes" in titles
+        assert "Latent dimensions over normalized burst time" in titles
+        assert "Population activity over normalized burst time" in titles
+    finally:
+        for metric_window in list(window.metric_windows):
+            metric_window.close()
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_spatial_temporal_regions_handles_module_time_weight_shapes():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = ChannelMap(
+        name="test",
+        rows=2,
+        cols=2,
+        electrodes={
+            "e1": {"channel": "chan1", "row": 0, "col": 0, "x_um": 0.0, "y_um": 0.0},
+            "e2": {"channel": "chan2", "row": 0, "col": 1, "x_um": 20.0, "y_um": 0.0},
+            "e3": {"channel": "chan3", "row": 1, "col": 0, "x_um": 0.0, "y_um": 20.0},
+            "e4": {"channel": "chan4", "row": 1, "col": 1, "x_um": 20.0, "y_um": 20.0},
+        },
+    )
+    window = BurstTrajectoryWindow(
+        [
+            ("chan1", np.array([0.005, 1.005])),
+            ("chan2", np.array([0.015, 1.015])),
+            ("chan3", np.array([0.025, 1.025])),
+            ("chan4", np.array([0.035, 1.035])),
+        ],
+        [(0.0, 0.05), (1.0, 1.05)],
+        channel_map=channel_map,
+    )
+
+    try:
+        analysis = window._spatial_temporal_regions()
+        assert isinstance(analysis, dict)
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_window_supports_lds_main_views():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = BurstTrajectoryWindow(
+        [
+            ("chan1", np.array([0.005, 0.018, 1.006, 1.019, 2.006, 2.019])),
+            ("chan2", np.array([0.012, 0.028, 1.013, 1.029, 2.013, 2.029])),
+            ("chan3", np.array([0.035, 1.034, 2.034])),
+        ],
+        [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05)],
+        model_method="lds",
+    )
+
+    try:
+        assert window.model_method == "lds"
+        assert str((window.current or {}).get("model_method", "")).lower() == "lds"
+        assert "LDS" in window.summary.text()
+        assert "LDS rollout reconstruction" in window.raster_canvas.figure.axes[0].get_title()
+        assert "Modeled latent state z(t)" in window.latent_canvas.figure.axes[0].get_title()
+        assert "LDS rollout PSTH" in window.psth_canvas.figure.axes[0].get_title()
+        assert "Factor loading matrix W" in window.weight_canvas.figure.axes[0].get_title()
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_window_supports_pivae_main_views(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as app_module
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    def fake_pivae(raw_observed, latent_dim=16, time_bin_ms=10.0, cancel_check=None):
+        raw = np.asarray(raw_observed, dtype=float)
+        latent = np.repeat(np.mean(raw, axis=2, keepdims=True), min(int(latent_dim), 2), axis=2)
+        params = {
+            "method": "pi_vae",
+            "latent_dim": latent.shape[2],
+            "loadings": np.ones((latent.shape[2], raw.shape[2]), dtype=float),
+            "mean": np.mean(raw.reshape((-1, raw.shape[2])), axis=0),
+            "n_iter": 1,
+        }
+        return latent, raw.copy(), params
+
+    monkeypatch.setattr(app_module, "_pivae_latent_states", fake_pivae)
+    app = QApplication.instance() or QApplication([])
+    window = BurstTrajectoryWindow(
+        [
+            ("chan1", np.array([0.005, 0.018, 1.006, 1.019, 2.006, 2.019])),
+            ("chan2", np.array([0.012, 0.028, 1.013, 1.029, 2.013, 2.029])),
+        ],
+        [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05)],
+        model_method="pivae",
+    )
+
+    try:
+        assert window.model_method == "pivae"
+        assert str((window.current or {}).get("model_method", "")).lower() == "pivae"
+        assert "pi-VAE" in window.summary.text()
+        assert "pi-VAE reconstruction" in window.raster_canvas.figure.axes[0].get_title()
+        assert "pi-VAE latent state z(t)" in window.latent_canvas.figure.axes[0].get_title()
+        assert "pi-VAE reconstructed PSTH" in window.psth_canvas.figure.axes[0].get_title()
+        assert "pi-VAE decoder loading" in window.weight_canvas.figure.axes[0].get_title()
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_spatial_temporal_regions_report_validation_metrics():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = ChannelMap(
+        name="test",
+        rows=2,
+        cols=3,
+        electrodes={
+            "e1": {"channel": "chan1", "x_um": 0.0, "y_um": 0.0},
+            "e2": {"channel": "chan2", "x_um": 20.0, "y_um": 0.0},
+            "e3": {"channel": "chan3", "x_um": 40.0, "y_um": 0.0},
+            "e4": {"channel": "chan4", "x_um": 0.0, "y_um": 20.0},
+            "e5": {"channel": "chan5", "x_um": 20.0, "y_um": 20.0},
+            "e6": {"channel": "chan6", "x_um": 40.0, "y_um": 20.0},
+        },
+    )
+    bursts = [(float(index), float(index) + 0.12) for index in range(12)]
+    spike_series = [
+        ("chan1", np.array([start + 0.006 for start, _ in bursts] + [start + 0.012 for start, _ in bursts])),
+        ("chan2", np.array([start + 0.007 for start, _ in bursts] + [start + 0.014 for start, _ in bursts])),
+        ("chan3", np.array([start + 0.009 for start, _ in bursts] + [start + 0.016 for start, _ in bursts])),
+        ("chan4", np.array([start + 0.045 for start, _ in bursts] + [start + 0.053 for start, _ in bursts])),
+        ("chan5", np.array([start + 0.047 for start, _ in bursts] + [start + 0.056 for start, _ in bursts])),
+        ("chan6", np.array([start + 0.050 for start, _ in bursts] + [start + 0.060 for start, _ in bursts])),
+    ]
+    window = BurstTrajectoryWindow(spike_series, bursts, channel_map=channel_map)
+
+    try:
+        window.activity_similarity_weight.setValue(0.65)
+        window.spatial_similarity_weight.setValue(0.35)
+        analysis = window._spatial_temporal_regions()
+        assert analysis
+        assert analysis["cluster_metrics"]
+        assert len(analysis["modules"]) >= 2
+        assert "similarity" in analysis
+        assert analysis["activity_weight"] == pytest.approx(0.65, abs=1e-6)
+        assert analysis["spatial_weight"] == pytest.approx(0.35, abs=1e-6)
+        if analysis["edges"]:
+            edge = analysis["edges"][0]
+            assert "median_delay_ms" in edge
+            assert "peak_delay_ms" in edge
+            assert "peak_window_mean_ms" in edge
+            assert "true_values" in edge
+            assert "background_values" in edge
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_spatial_temporal_filters_weakly_regional_channels():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = ChannelMap(
+        name="test",
+        rows=2,
+        cols=4,
+        electrodes={
+            "e1": {"channel": "chan1", "x_um": 0.0, "y_um": 0.0},
+            "e2": {"channel": "chan2", "x_um": 20.0, "y_um": 0.0},
+            "e3": {"channel": "chan3", "x_um": 40.0, "y_um": 0.0},
+            "e4": {"channel": "chan4", "x_um": 60.0, "y_um": 0.0},
+            "e5": {"channel": "chan5", "x_um": 0.0, "y_um": 20.0},
+            "e6": {"channel": "chan6", "x_um": 20.0, "y_um": 20.0},
+            "e7": {"channel": "chan7", "x_um": 40.0, "y_um": 20.0},
+            "e8": {"channel": "chan8", "x_um": 60.0, "y_um": 20.0},
+        },
+    )
+    bursts = [(float(index), float(index) + 0.12) for index in range(10)]
+    spike_series = [
+        ("chan1", np.array([start + 0.005 for start, _ in bursts] + [start + 0.010 for start, _ in bursts])),
+        ("chan2", np.array([start + 0.006 for start, _ in bursts] + [start + 0.011 for start, _ in bursts])),
+        ("chan3", np.array([start + 0.045 for start, _ in bursts] + [start + 0.053 for start, _ in bursts])),
+        ("chan4", np.array([start + 0.047 for start, _ in bursts] + [start + 0.056 for start, _ in bursts])),
+        ("chan5", np.array([start + 0.005 for start, _ in bursts[:5]] + [start + 0.048 for start, _ in bursts[5:]])),
+        ("chan6", np.array([start + 0.006 for start, _ in bursts[:5]] + [start + 0.051 for start, _ in bursts[5:]])),
+        ("chan7", np.array([start + 0.026 for start, _ in bursts])),
+        ("chan8", np.array([start + 0.028 for start, _ in bursts])),
+    ]
+    window = BurstTrajectoryWindow(spike_series, bursts, channel_map=channel_map)
+
+    try:
+        window.region_membership_threshold.setValue(0.30)
+        analysis = window._spatial_temporal_regions()
+        assert analysis
+        assert "channel_significant_mask" in analysis
+        assert int(np.sum(analysis["channel_significant_mask"])) < len(analysis["channel_significant_mask"])
+        assert int(analysis["retained_channels"]) == int(np.sum(analysis["channel_significant_mask"]))
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_burst_trajectory_spatial_temporal_metric_figure_draws_without_channel_map_type_errors():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import BurstTrajectoryWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = ChannelMap(
+        name="test",
+        rows=2,
+        cols=2,
+        electrodes={
+            "e1": {"channel": "chan1", "row": 0, "col": 0, "x_um": 0.0, "y_um": 0.0},
+            "e2": {"channel": "chan2", "row": 0, "col": 1, "x_um": 20.0, "y_um": 0.0},
+            "e3": {"channel": "chan3", "row": 1, "col": 0, "x_um": 0.0, "y_um": 20.0},
+            "e4": {"channel": "chan4", "row": 1, "col": 1, "x_um": 20.0, "y_um": 20.0},
+        },
+    )
+    window = BurstTrajectoryWindow(
+        [
+            ("chan1", np.array([0.005, 1.005])),
+            ("chan2", np.array([0.015, 1.015])),
+            ("chan3", np.array([0.025, 1.025])),
+            ("chan4", np.array([0.035, 1.035])),
+        ],
+        [(0.0, 0.05), (1.0, 1.05)],
+        channel_map=channel_map,
+    )
+
+    try:
+        window._show_spatial_temporal_analysis()
+        assert window.metric_windows
+        metric_window = window.metric_windows[-1]
+        metric_canvas = metric_window.findChildren(FigureCanvas)[0]
+        assert "Spatial-temporal regions and directed propagation" in metric_canvas.figure.axes[0].get_title()
+    finally:
+        for metric_window in list(window.metric_windows):
+            metric_window.close()
+        window.close()
+        app.processEvents()
 
 
 def test_aligned_weight_similarity_compares_rotated_factor_loadings():
@@ -565,6 +978,95 @@ def test_multi_file_factor_analysis_uses_global_channel_order_and_selection(monk
         assert record["analysis"]["latent_params"]["loadings"].shape[1] == 2
 
 
+def test_multi_file_factor_analysis_supports_lds_model(monkeypatch, tmp_path):
+    path = tmp_path / "segment_a.npz"
+    path.write_bytes(b"placeholder")
+    intervals = [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)]
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.010, 0.018, 1.010, 1.018, 2.010, 2.018]),
+            "chan2": np.array([0.014, 0.022, 1.014, 1.022, 2.014, 2.022]),
+        },
+        sr=20000.0,
+    )
+    import src.gui.app as app_module
+
+    monkeypatch.setattr(app_module, "_stimulus_response_supported_files", lambda _paths: [path])
+    monkeypatch.setattr(app_module, "_load_spike_only_data", lambda _path, cancel_check=None: data)
+    monkeypatch.setattr(app_module, "_detect_burst_intervals", lambda *args, **kwargs: intervals)
+
+    payload = _multi_file_factor_analysis_payload(
+        [path],
+        time_bin_ms=10.0,
+        window_ms=40.0,
+        model_method="lds",
+        latent_dim=1,
+        min_total_activity=0.0,
+        min_active_bursts=1,
+        max_channels=2,
+        artifact_ms=0.0,
+    )
+
+    assert payload["model_method"] == "lds"
+    analysis = payload["records"][0]["analysis"]
+    assert analysis["model_method"] == "lds"
+    assert np.asarray(analysis["transition_matrix"], dtype=float).shape == (1, 1)
+    assert np.asarray(analysis["model_latent_states"], dtype=float).shape == np.asarray(analysis["latent_states"], dtype=float).shape
+    assert "rollout_r2" in analysis
+    assert "one_step_r2" in analysis
+
+
+def test_multi_file_factor_analysis_supports_pivae_model(monkeypatch, tmp_path):
+    path = tmp_path / "segment_pivae.npz"
+    path.write_bytes(b"placeholder")
+    intervals = [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)]
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.010, 0.018, 1.010, 1.018, 2.010, 2.018]),
+            "chan2": np.array([0.014, 0.022, 1.014, 1.022, 2.014, 2.022]),
+        },
+        sr=20000.0,
+    )
+    import src.gui.app as app_module
+
+    def fake_pivae(raw_observed, latent_dim=16, time_bin_ms=10.0, cancel_check=None):
+        raw = np.asarray(raw_observed, dtype=float)
+        latent = np.repeat(np.mean(raw, axis=2, keepdims=True), int(latent_dim), axis=2)
+        params = {
+            "method": "pi_vae",
+            "latent_dim": int(latent_dim),
+            "loadings": np.ones((int(latent_dim), raw.shape[2]), dtype=float),
+            "mean": np.mean(raw.reshape((-1, raw.shape[2])), axis=0),
+            "n_iter": 1,
+        }
+        return latent, raw.copy(), params
+
+    monkeypatch.setattr(app_module, "_stimulus_response_supported_files", lambda _paths: [path])
+    monkeypatch.setattr(app_module, "_load_spike_only_data", lambda _path, cancel_check=None: data)
+    monkeypatch.setattr(app_module, "_detect_burst_intervals", lambda *args, **kwargs: intervals)
+    monkeypatch.setattr(app_module, "_pivae_latent_states", fake_pivae)
+
+    payload = _multi_file_factor_analysis_payload(
+        [path],
+        time_bin_ms=10.0,
+        window_ms=40.0,
+        model_method="pivae",
+        latent_dim=2,
+        min_total_activity=0.0,
+        min_active_bursts=1,
+        max_channels=2,
+        artifact_ms=0.0,
+    )
+
+    assert payload["model_method"] == "pivae"
+    analysis = payload["records"][0]["analysis"]
+    assert analysis["model_method"] == "pivae"
+    assert analysis["latent_params"]["method"] == "pi_vae"
+    assert "pi-VAE" in analysis["state_projection"]
+    assert np.asarray(analysis["latent_states"], dtype=float).shape[-1] == 2
+    assert np.asarray(analysis["raw_reconstructed_states"], dtype=float).shape == np.asarray(analysis["raw_observed_states"], dtype=float).shape
+
+
 def test_multi_file_factor_analysis_window_visualizes_aligned_w_similarity():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -609,12 +1111,13 @@ def test_multi_file_factor_analysis_window_visualizes_aligned_w_similarity():
         "errors": [],
         "w_similarity": similarity,
         "window_ms": 50.0,
+        "model_method": "fa",
     }
 
     app = QApplication.instance() or QApplication([])
     window = MultiFileFactorAnalysisWindow(payload)
 
-    assert "Files: 2" in window.summary.text()
+    assert "Model: FA" in window.summary.text()
     assert "Aligned W correlation" in window.similarity_canvas.figure.axes[0].get_title()
     assert "Selected aligned W" in window.weight_canvas.figure.axes[1].get_title()
     assert "Mean z(t)" in window.latent_canvas.figure.axes[0].get_title()
@@ -1259,6 +1762,16 @@ def test_stimulus_parameter_extraction_handles_common_tokens():
     assert "stim_mode=multi-site" in label
 
 
+def test_loaded_data_activity_label_detects_stimulus_and_spontaneous_files():
+    spontaneous = UnifiedMEAData(spikes={"chan1": np.array([0.1])}, sr=20000.0)
+    stimulus = UnifiedMEAData(spikes={"chan1": np.array([0.1])}, stim_times=np.array([1.0]), sr=20000.0)
+
+    assert _loaded_data_activity_label(r"C:\data\spont_pre\trial.npz", stimulus) == "Spontaneous"
+    assert _loaded_data_activity_label("recording_without_events.npz", spontaneous) == "Spontaneous"
+    assert _loaded_data_activity_label("recording_without_events.npz", stimulus) == "Stimulus"
+    assert _loaded_data_activity_label(r"C:\data\el=12_after\trial.h5", spontaneous) == "Stimulus"
+
+
 def test_stimulus_response_record_summarizes_spike_only_data():
     data = UnifiedMEAData(
         spikes={
@@ -1615,7 +2128,7 @@ def test_stimulus_response_results_return_to_cached_analysis_dialog():
 
     assert window.stimulus_response_payload is payload
     assert dialog.cached_payload is payload
-    assert dialog.open_raster_button.isEnabled()
+    assert not hasattr(dialog, "open_raster_button")
     assert dialog.psth_button.isEnabled()
     assert dialog.activation_curve_button.isEnabled()
     assert not dialog.isVisible()
@@ -1671,6 +2184,7 @@ def test_multi_file_factor_analysis_results_return_to_cached_dialog():
         "errors": [],
         "w_similarity": np.eye(1),
         "window_ms": 50.0,
+        "model_method": "fa",
     }
     worker = type("Worker", (), {"_is_cancelled": lambda self: False})()
 
@@ -1692,6 +2206,34 @@ def test_multi_file_factor_analysis_results_return_to_cached_dialog():
         child.close()
     dialog.close()
     main_window.close()
+
+
+def test_database_analysis_dialog_preserves_manual_subset_selection_on_refresh():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    records = [
+        {"path": "a.nev", "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.1])}, sr=30000.0), "data_kind": "nev"},
+        {"path": "b.nev", "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.2])}, sr=30000.0), "data_kind": "nev"},
+        {"path": "c.nev", "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.3])}, sr=30000.0), "data_kind": "nev"},
+    ]
+
+    dialog = FactorAnalysisDatabaseDialog(records)
+    dialog.table.clearSelection()
+    dialog.table.selectRow(1)
+    app.processEvents()
+
+    assert [Path(path).name for path in dialog.values()[0]] == ["b.nev"]
+
+    dialog._set_records(records)
+    app.processEvents()
+
+    assert [Path(path).name for path in dialog.values()[0]] == ["b.nev"]
+    dialog.close()
 
 
 def test_default_maxwell_map_is_full_template_and_recording_is_file_specific():
@@ -1846,16 +2388,13 @@ def test_spike_raster_actions_are_selected_from_dropdown(monkeypatch):
     window = SpikeRasterWindow("Raster", [("chan1", np.array([0.0, 1.0]))])
     called = []
     monkeypatch.setattr(window, "_open_burst_delay_window", lambda: called.append("burst_delay"))
-    monkeypatch.setattr(window, "_open_burst_trajectory_window", lambda: called.append("burst_trajectory"))
 
     index = window.raster_action_combo.findData("burst_delay")
     window.raster_action_combo.setCurrentIndex(index)
     window._raster_action_selected(index)
-    trajectory_index = window.raster_action_combo.findData("burst_trajectory")
-    window.raster_action_combo.setCurrentIndex(trajectory_index)
-    window._raster_action_selected(trajectory_index)
 
-    assert called == ["burst_delay", "burst_trajectory"]
+    assert called == ["burst_delay"]
+    assert window.raster_action_combo.findData("burst_trajectory") == -1
     assert window.raster_action_combo.currentIndex() == 0
 
 
@@ -1921,6 +2460,93 @@ def test_spike_raster_select_channel_updates_waveform_canvas():
     assert window.canvas.selected_channel == "chan2"
     assert window.waveform_canvas.channel == "chan2"
     assert window.waveform_canvas.waveforms.shape == (3, 4)
+
+
+def test_spike_raster_channel_selection_reuses_raster_cache():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import SpikeRasterWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    series = [(f"chan{index}", np.linspace(0.0, 2.0, 200)) for index in range(1, 8)]
+    window = SpikeRasterWindow("Raster", series)
+    window.canvas.resize(900, 500)
+
+    window.canvas.grab()
+    first_key = window.canvas._raster_cache_key
+    first_cache = window.canvas._raster_cache
+
+    window._select_channel("chan4")
+    window.canvas.grab()
+
+    assert first_key is not None
+    assert window.canvas._raster_cache_key == first_key
+    assert window.canvas._raster_cache is first_cache
+
+
+def test_spike_raster_can_filter_axion_rows_by_well():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import SpikeRasterWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = SpikeRasterWindow(
+        "Raster",
+        [
+            ("A1_r1c1", np.array([0.0, 0.2])),
+            ("A1_r1c2", np.array([0.1])),
+            ("B1_r1c1", np.array([0.3])),
+        ],
+        channel_groups={
+            "A1": ["A1_r1c1", "A1_r1c2"],
+            "B1": ["B1_r1c1"],
+        },
+    )
+
+    assert window.well_combo is not None
+    assert [label for label, _ in window.spike_series] == ["A1_r1c1", "A1_r1c2", "B1_r1c1"]
+
+    window.well_combo.setCurrentIndex(window.well_combo.findData("B1"))
+
+    assert [label for label, _ in window.spike_series] == ["B1_r1c1"]
+    assert window._window_channel_counts(0.0, 1.0) == {"B1_r1c1": 1}
+    assert "all wells" not in window.raster_settings_summary.text().lower()
+
+
+def test_main_window_uses_generated_axion_map_instead_of_previous_map():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.channel_map = ChannelMap.new("old_map")
+    window.raw_data = UnifiedMEAData(
+        spikes={"A1_r1c1": np.array([0.1])},
+        meta={
+            "source": "axion_spk",
+            "wells": ["A1"],
+            "channel_map": {
+                "A1_r1c1": {"well": "A1", "electrode": "r1c1", "electrode_row": 1, "electrode_col": 1},
+            },
+        },
+    )
+
+    window._apply_source_channel_map()
+
+    assert window.channel_map is not None
+    assert window.channel_map.name == "axion_map"
+    assert window.channel_map.rows == 6
+    assert window.channel_map.cols == 64
+    assert window.channel_map.channel_for("A1_slot01") == "A1_r1c1"
 
 
 def test_spike_raster_unit_labels_get_wider_axis_margin():
@@ -2046,6 +2672,31 @@ def test_spike_raster_playback_advances_time_slider_and_heatmap_counts():
     window._stop_playback()
 
     assert window.play_button.text() == "Play"
+
+
+def test_spike_raster_window_channel_counts_cache_preserves_results():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui.app import SpikeRasterWindow
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = SpikeRasterWindow(
+        "Raster",
+        [
+            ("chan1 unit 0", np.array([0.10, 0.20])),
+            ("chan1 unit 1", np.array([0.15])),
+            ("chan2", np.array([0.12, 0.40])),
+        ],
+    )
+
+    first = window._window_channel_counts(0.0, 0.25)
+    second = window._window_channel_counts(0.0, 0.25)
+
+    assert first == {"chan1": 3, "chan2": 1}
+    assert second == first
 
 
 def test_spike_raster_heatmap_gif_frame_times_and_rgb_render():
@@ -2379,13 +3030,14 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
         "Channel Map",
         "Sorting",
         "Stimulus Response Analysis",
-        "Multi-file FA Analysis",
+        "动力学分析",
     ]
     assert button_texts[: len(expected_button_order)] == expected_button_order
     assert "Run Full Pipeline" not in button_texts
     assert "Open Results" not in button_texts
     assert "Settings" not in button_texts
     assert "Temporal Coupling" not in button_texts
+    assert "Sort by Label" not in button_texts
     menu_texts = [
         action.text()
         for menu_action in window.menuBar().actions()
@@ -2395,7 +3047,7 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
     assert "Settings" not in menu_texts
     assert "Temporal Coupling" not in menu_texts
     assert "No data loaded" in window.data_preview.toPlainText()
-    assert window.database_table.columnCount() == 6
+    assert window.database_table.columnCount() == 7
     assert window.stimulus_response_button.text() == "Stimulus Response Analysis"
 
     window.raw_data = UnifiedMEAData(
@@ -2415,6 +3067,25 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
     assert "chan1: 2 spikes" in preview
 
 
+def test_main_and_dialog_windows_enable_maximize_controls():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    main_window = MainWindow()
+    dialog = DataFilesInputDialog()
+
+    assert bool(main_window.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint)
+    assert bool(dialog.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint)
+
+    dialog.close()
+    main_window.close()
+
+
 def test_main_window_file_database_selection_feeds_single_and_multi_file_actions(tmp_path):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2425,7 +3096,7 @@ def test_main_window_file_database_selection_feeds_single_and_multi_file_actions
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     first_path = tmp_path / "first.nev"
-    second_path = tmp_path / "second.raw.h5"
+    second_path = tmp_path / "el=12_after.raw.h5"
     first_path.write_bytes(b"placeholder")
     second_path.write_bytes(b"placeholder")
     first = UnifiedMEAData(
@@ -2435,6 +3106,7 @@ def test_main_window_file_database_selection_feeds_single_and_multi_file_actions
     )
     second = UnifiedMEAData(
         spikes={"chan2": np.array([0.3, 0.4, 0.5])},
+        stim_times=np.array([0.25]),
         sr=20000.0,
         meta={"source": "maxwell_h5", "waveforms_deferred": True},
     )
@@ -2448,10 +3120,27 @@ def test_main_window_file_database_selection_feeds_single_and_multi_file_actions
 
     assert window.input_path == str(second_path)
     assert window.raw_data is second
-    assert "second.raw.h5" in window.data_preview.toPlainText()
+    assert "el=12_after.raw.h5" in window.data_preview.toPlainText()
     assert "Kind: maxwell_h5" in window.data_preview.toPlainText()
     assert "deferred for faster loading" in window.data_preview.toPlainText()
     assert window.database_table.item(1, 1).text() == "maxwell_h5"
+    assert window.database_table.item(0, 2).text() == "Spontaneous"
+    assert window.database_table.item(1, 2).text() == "Stimulus"
+
+    window._database_header_clicked(2)
+    assert Path(window.file_database[0]["path"]).name == "el=12_after.raw.h5"
+    assert window.database_table.item(0, 2).text() == "Stimulus"
+    assert window.database_sort_column == 2
+
+    window._database_header_clicked(2)
+    assert Path(window.file_database[0]["path"]).name == "first.nev"
+    assert window.database_sort_column is None
+
+    window._database_header_clicked(2)
+    assert Path(window.file_database[0]["path"]).name == "el=12_after.raw.h5"
+    window._database_header_clicked(4)
+    assert Path(window.file_database[0]["path"]).name == "first.nev"
+    assert window.database_sort_column == 4
 
     window.database_table.selectAll()
     app.processEvents()
@@ -2460,10 +3149,193 @@ def test_main_window_file_database_selection_feeds_single_and_multi_file_actions
 
     stimulus_paths = window.stimulus_response_dialog.values()[0]
     fa_paths = window.multi_file_fa_dialog.values()[0]
-    assert sorted(Path(path).name for path in stimulus_paths) == ["first.nev", "second.raw.h5"]
-    assert sorted(Path(path).name for path in fa_paths) == ["first.nev", "second.raw.h5"]
+    assert sorted(Path(path).name for path in stimulus_paths) == ["el=12_after.raw.h5", "first.nev"]
+    assert sorted(Path(path).name for path in fa_paths) == ["el=12_after.raw.h5", "first.nev"]
+    stimulus_labels = [window.stimulus_response_dialog.table.item(row, 2).text() for row in range(2)]
+    fa_labels = [window.multi_file_fa_dialog.table.item(row, 2).text() for row in range(2)]
+    assert sorted(stimulus_labels) == ["Spontaneous", "Stimulus"]
+    assert sorted(fa_labels) == ["Spontaneous", "Stimulus"]
     window.stimulus_response_dialog.close()
     window.multi_file_fa_dialog.close()
+    window.close()
+
+
+def test_dynamics_database_dialog_exposes_pivae_model():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = FactorAnalysisDatabaseDialog([])
+    try:
+        index = dialog.model_method.findData("pivae")
+        assert index >= 0
+        dialog.model_method.setCurrentIndex(index)
+        _paths, parameters = dialog.values()
+        assert parameters["model_method"] == "pivae"
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_stimulus_database_dialog_sorts_by_label_column(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    spontaneous_path = tmp_path / "baseline.nev"
+    stimulus_path = tmp_path / "el=12_after.raw.h5"
+    spontaneous_path.write_bytes(b"placeholder")
+    stimulus_path.write_bytes(b"placeholder")
+    records = [
+        {
+            "path": str(spontaneous_path),
+            "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.1])}, meta={"source": "blackrock_nev"}),
+            "data_kind": "nev",
+        },
+        {
+            "path": str(stimulus_path),
+            "raw_data": UnifiedMEAData(
+                spikes={"chan2": np.array([0.2, 0.3])},
+                stim_times=np.array([0.15]),
+                meta={"source": "maxwell_h5"},
+            ),
+            "data_kind": "nev",
+        },
+    ]
+
+    dialog = StimulusDatabaseAnalysisDialog(records)
+    dialog.table.clearSelection()
+    dialog.table.selectRow(0)
+    app.processEvents()
+
+    dialog._database_header_clicked(2)
+    assert Path(dialog.records[0]["path"]).name == "el=12_after.raw.h5"
+    assert dialog.table.item(0, 2).text() == "Stimulus"
+    assert dialog.database_sort_column == 2
+    assert [Path(path).name for path in dialog.values()[0]] == ["baseline.nev"]
+
+    dialog._database_header_clicked(2)
+    assert Path(dialog.records[0]["path"]).name == "baseline.nev"
+    assert dialog.database_sort_column is None
+    dialog.close()
+
+
+def test_stimulus_database_dialog_preserves_multi_selection_on_refresh(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QItemSelectionModel
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    paths = [tmp_path / f"stim_{index}.nev" for index in range(3)]
+    for path in paths:
+        path.write_bytes(b"placeholder")
+    records = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(
+                spikes={"chan1": np.array([0.01, 0.02])},
+                stim_times=np.array([0.015]),
+                meta={"source": "blackrock_nev"},
+            ),
+            "data_kind": "nev",
+        }
+        for path in paths
+    ]
+
+    dialog = StimulusDatabaseAnalysisDialog(records)
+    selection_model = dialog.table.selectionModel()
+    dialog.table.clearSelection()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection_model.select(dialog.table.model().index(0, 0), flags)
+    selection_model.select(dialog.table.model().index(2, 0), flags)
+    app.processEvents()
+
+    assert sorted(Path(path).name for path in dialog.values()[0]) == ["stim_0.nev", "stim_2.nev"]
+    assert dialog.selected_count_label.text() == "Selected files: 2 / 3"
+
+    dialog._set_records(records)
+    app.processEvents()
+
+    assert sorted(Path(path).name for path in dialog.values()[0]) == ["stim_0.nev", "stim_2.nev"]
+    assert dialog.selected_count_label.text() == "Selected files: 2 / 3"
+    dialog.close()
+
+
+def test_main_window_stimulus_response_start_uses_all_selected_dialog_paths(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QItemSelectionModel
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    paths = [tmp_path / f"stim_start_{index}.nev" for index in range(3)]
+    for path in paths:
+        path.write_bytes(b"placeholder")
+    window.file_database = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(
+                spikes={"chan1": np.array([0.01, 0.02])},
+                stim_times=np.array([0.015]),
+                meta={"source": "blackrock_nev"},
+            ),
+            "data_kind": "nev",
+        }
+        for path in paths
+    ]
+    dialog = window._stimulus_response_analysis_dialog()
+    selection_model = dialog.table.selectionModel()
+    dialog.table.clearSelection()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    selection_model.select(dialog.table.model().index(0, 0), flags)
+    selection_model.select(dialog.table.model().index(1, 0), flags)
+    app.processEvents()
+
+    captured = {}
+
+    class FakeProgress:
+        canceled = type("SignalStub", (), {"connect": lambda self, _callback: None})()
+
+    class FakeWorker:
+        def __init__(self, paths_arg, **kwargs):
+            captured["paths"] = list(paths_arg)
+            captured["kwargs"] = dict(kwargs)
+            self.signals = type(
+                "SignalsStub",
+                (),
+                {
+                    "progress": type("SignalStub", (), {"connect": lambda self, _callback: None})(),
+                    "finished": type("SignalStub", (), {"connect": lambda self, _callback: None})(),
+                    "failed": type("SignalStub", (), {"connect": lambda self, _callback: None})(),
+                    "canceled": type("SignalStub", (), {"connect": lambda self, _callback: None})(),
+                },
+            )()
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(window, "_start_progress", lambda *args, **kwargs: FakeProgress())
+    monkeypatch.setattr(window.thread_pool, "start", lambda worker: captured.setdefault("worker", worker))
+    monkeypatch.setattr(gui_app, "StimulusResponseWorker", FakeWorker)
+
+    window._start_stimulus_response_from_dialog()
+
+    assert sorted(Path(path).name for path in captured["paths"]) == ["stim_start_0.nev", "stim_start_1.nev"]
+    assert window.active_stimulus_worker is captured["worker"]
+    dialog.close()
     window.close()
 
 
@@ -2496,6 +3368,869 @@ def test_data_files_input_dialog_adds_folders_and_removes_selected(tmp_path):
     assert len(dialog.values()) == 1
     assert Path(dialog.values()[0]).name in {"a.raw.h5", "b.nev"}
     dialog.close()
+
+
+def test_generic_analysis_matrix_from_record_supports_unified_and_array_data():
+    unified = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.01, 0.03, 0.05]),
+            "chan2": np.array([0.02, 0.04]),
+        },
+        sr=20000.0,
+    )
+    matrix, labels, description = _generic_analysis_matrix_from_record({"raw_data": unified}, bin_ms=10.0)
+    assert matrix.shape[0] == 2
+    assert labels == ["chan1", "chan2"]
+    assert "Channel x time-bin spike-count matrix" in description
+
+    time_matrix, time_labels, time_description = _generic_analysis_matrix_from_record(
+        {"raw_data": unified},
+        view_mode="time_channel",
+        bin_ms=10.0,
+    )
+    assert time_matrix.shape[1] == 2
+    assert time_labels
+    assert "Time-bin x channel" in time_description
+
+    burst_matrix, burst_labels, burst_description = _generic_analysis_matrix_from_record(
+        {"raw_data": unified},
+        view_mode="burst_flat",
+        bin_ms=10.0,
+        burst_window_ms=100.0,
+        burst_threshold_z=0.5,
+    )
+    assert burst_matrix.ndim == 2
+    assert burst_labels is not None
+    assert "Burst x flattened" in burst_description
+
+    array_matrix, array_labels, array_description = _generic_analysis_matrix_from_record({"raw_data": np.arange(12, dtype=float).reshape(3, 4)}, bin_ms=10.0)
+    assert array_matrix.shape == (3, 4)
+    assert array_labels == ["row 1", "row 2", "row 3"]
+    assert "Array matrix" in array_description
+
+    array_columns, array_column_labels, array_column_description = _generic_analysis_matrix_from_record(
+        {"raw_data": np.arange(12, dtype=float).reshape(3, 4)},
+        array_axis="columns",
+        bin_ms=10.0,
+    )
+    assert array_columns.shape == (4, 3)
+    assert array_column_labels == ["column 1", "column 2", "column 3", "column 4"]
+    assert "samples=columns" in array_column_description
+
+
+def test_generic_analysis_window_constructs_from_payload():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    payload = {
+        "records": [
+            {
+                "file": "sample.nev",
+                "condition": "Spontaneous",
+                "matrix_description": "Spike-count matrix",
+                "analysis": run_generic_matrix_analysis(
+                    np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]], dtype=float),
+                    sample_axis=0,
+                    normalization="feature_zscore",
+                    similarity="correlation",
+                    reduction="pca",
+                    reduction_dims=2,
+                    clustering="kmeans",
+                    cluster_count=2,
+                ),
+            }
+        ],
+        "errors": [],
+        "parameters": {
+            "normalization": "feature_zscore",
+            "similarity": "correlation",
+            "reduction": "pca",
+            "clustering": "kmeans",
+        },
+    }
+    window = GenericAnalysisWindow(payload)
+    try:
+        assert "Files: 1" in window.summary.text()
+        assert window.canvas.figure.axes
+        assert "Samples x features" in window.detail.toPlainText()
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_main_window_can_open_generic_analysis_from_database(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "sample.nev"
+    path.write_bytes(b"placeholder")
+    window.file_database = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(
+                spikes={
+                    "chan1": np.array([0.01, 0.03, 0.05]),
+                    "chan2": np.array([0.02, 0.04]),
+                },
+                sr=20000.0,
+            ),
+            "data_kind": "nev",
+        }
+    ]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    window._set_active_database_index(0)
+    added, errors = window._ensure_processed_data_for_records(window.file_database)
+    assert added >= 1
+    assert window.processed_database
+    dialog = window._generic_analysis_dialog()
+    dialog.table.selectRow(0)
+    shown = []
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child.show()
+
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window._start_generic_analysis_from_dialog()
+
+    assert shown
+    assert isinstance(shown[0], GenericAnalysisWindow)
+    shown[0].close()
+    dialog.close()
+    window.close()
+
+
+def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "spontaneous_source.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.0, 0.1, 0.2], dtype=float),
+            "chan2": np.array([0.05, 0.15], dtype=float),
+        },
+        sr=20000.0,
+    )
+    window.file_database = [{"path": str(path), "raw_data": data, "data_kind": "nev"}]
+    window.channel_map = ChannelMap(
+        name="test_maxwell",
+        rows=1,
+        cols=3,
+        electrodes={
+            "e1": {"channel": "chan1", "electrode": 1, "x_um": 0.0, "y_um": 0.0, "aliases": ["chan1", "1"], "routed": True},
+            "e2": {"channel": "chan2", "electrode": 2, "x_um": 20.0, "y_um": 0.0, "aliases": ["chan2", "2"], "routed": True},
+            "e7317": {"channel": "", "electrode": 7317, "x_um": 40.0, "y_um": 0.0, "aliases": ["7317"], "routed": True},
+        },
+    )
+
+    messages = []
+    import src.gui.app as gui_app
+
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: messages.append(args))
+    window.open_stimulus_generation()
+
+    dialog = window.stimulus_generation_dialog
+    assert isinstance(dialog, StimulusGenerationDialog)
+    assert dialog.tabs.count() == 6
+    assert dialog.width() <= 1000
+    assert dialog.minimumSizeHint().height() < 700
+    assert dialog.source_combo.findData(str(path)) >= 0
+    dialog.tabs.setCurrentWidget(dialog.protocols_tab)
+    fixed = next(protocol for protocol in dialog.protocols if protocol.name == "feedback_single_150mV")
+    dialog._fill_protocol_form(fixed)
+    assert dialog.source_box.isHidden()
+    fixed_series = dialog._preview_series_for_protocol(fixed)
+    assert 7317 in dialog._stimulus_electrodes_for_preview(fixed, fixed_series)
+    dialog._render_protocol_preview(fixed)
+    assert dialog.preview_raster_axis.get_xlim()[0] < 0.0
+    assert dialog.preview_map_canvas.figure.axes
+    state = dialog.preview_map_state
+    assert "e1" in state["recording"]
+    assert "e7317" in state["stimulation"]
+    assert dialog.preview_map_canvas.figure.get_facecolor()[:3] == pytest.approx((1.0, 1.0, 1.0))
+    detail = dialog._preview_map_selection_text("e1")
+    assert "Electrode: e1" in detail
+    assert "Firing rate:" in detail
+    poisson = next(protocol for protocol in dialog.protocols if protocol.name == "poisson_random_safe")
+    dialog._fill_protocol_form(poisson)
+    assert dialog.source_box.isVisible()
+    preview_series = dialog._preview_series_for_protocol(poisson)
+    assert any(item["times_ms"] for item in preview_series)
+    assert max((max(item["times_ms"]) for item in preview_series if item["times_ms"]), default=0.0) > 5000.0
+    output = tmp_path / "generated_stimulus_package"
+    dialog.output_path.setText(str(output))
+    dialog._generate()
+
+    assert (output / "config" / "system.yaml").exists()
+    assert (output / "config" / "stimulation.yaml").exists()
+    rate_files = list((output / "config" / "pipeline_rate_sources").glob("*_rates.npz"))
+    assert rate_files
+    rates = np.load(rate_files[0])
+    assert set(rates.files) >= {"electrodes", "rates_hz", "firing_rate_hz", "source_path"}
+    assert str(rates["source_path"]) == str(path)
+    dialog.close()
+    window.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_preview_raster_scrolls_and_zooms_without_regenerating(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "spontaneous_source.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.linspace(0.0, 10.0, 80),
+            "chan2": np.linspace(0.05, 10.05, 70),
+        },
+        sr=20000.0,
+    )
+    channel_map = ChannelMap(
+        name="test_maxwell",
+        rows=1,
+        cols=2,
+        electrodes={
+            "e1": {"channel": "chan1", "electrode": 1, "x_um": 0.0, "y_um": 0.0, "aliases": ["chan1", "1"], "routed": True},
+            "e2": {"channel": "chan2", "electrode": 2, "x_um": 20.0, "y_um": 0.0, "aliases": ["chan2", "2"], "routed": True},
+        },
+    )
+    dialog = StimulusGenerationDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        channel_map=channel_map,
+    )
+    protocol = next(item for item in dialog.protocols if item.name == "poisson_random_safe")
+    dialog._render_protocol_preview(protocol)
+    dialog.preview_canvas.draw()
+
+    assert dialog.preview_total_ms == pytest.approx(300000.0)
+    assert dialog.preview_window_ms == pytest.approx(5000.0)
+    assert max((values[-1] for _item, values in dialog.preview_raster_arrays if values.size), default=0.0) > 5000.0
+
+    regenerated = []
+    redrew_map = []
+    monkeypatch.setattr(dialog, "_preview_series_for_protocol", lambda *args, **kwargs: regenerated.append(args) or [])
+    monkeypatch.setattr(dialog, "_draw_preview_channel_map", lambda *args, **kwargs: redrew_map.append(args))
+
+    class ScrollEvent:
+        inaxes = dialog.preview_raster_axis
+        xdata = 2500.0
+        step = -1
+        button = "down"
+
+    dialog._preview_raster_scrolled(ScrollEvent())
+    assert dialog.preview_window_ms > 5000.0
+
+    class PressEvent:
+        inaxes = dialog.preview_raster_axis
+        button = 1
+        x = 240.0
+
+    class MoveEvent:
+        x = 120.0
+
+    dialog._preview_raster_mouse_pressed(PressEvent())
+    dialog._preview_raster_mouse_moved(MoveEvent())
+    dialog._preview_raster_mouse_released(MoveEvent())
+
+    assert dialog.preview_window_start_ms > 0.0
+    assert regenerated == []
+    assert redrew_map == []
+    dialog._reset_preview_raster_view()
+    assert dialog.preview_window_start_ms == pytest.approx(0.0)
+    assert dialog.preview_window_ms == pytest.approx(5000.0)
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_individual_burst_preview_is_single_burst():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "three_bursts",
+        "individual_burst",
+        start_ms=0.0,
+        pulses_per_burst=3,
+        interpulse_interval_ms=50.0,
+        burst_count=3,
+        burst_interval_ms=1000.0,
+    )
+
+    series = stimulus_builder.preview_raster_series(protocol, preview_limit_ms=3000.0)
+
+    assert series[0]["times_ms"] == [0.0, 50.0, 100.0]
+
+
+def test_stimulus_generation_protocol_fields_follow_selected_type():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+
+    dialog.protocol_type.setCurrentText("individual_burst")
+    dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
+    assert dialog.protocol_fields["burst_count"].isHidden()
+    assert dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert dialog.custom_points.isHidden()
+    assert dialog.source_box.isHidden()
+
+    dialog.protocol_type.setCurrentText("sequence_with_burst")
+    dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["burst_count"].isHidden()
+    assert not dialog.protocol_fields["burst_interval_ms"].isHidden()
+
+    dialog.protocol_type.setCurrentText("custom_sequence")
+    dialog._update_protocol_type_fields()
+    assert not dialog.custom_points.isHidden()
+    assert dialog.protocol_fields["amplitude_mv"].isHidden()
+    assert dialog.protocol_fields["burst_count"].isHidden()
+
+    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog._update_protocol_type_fields()
+    assert not dialog.source_box.isHidden()
+    assert not dialog.lambda_mode.isHidden()
+    assert not dialog.protocol_fields["poisson_duration_s"].isHidden()
+    assert dialog.protocol_fields["burst_interval_ms"].isHidden()
+    dialog.advanced_toggle.setChecked(True)
+    dialog.lambda_mode.setCurrentText("scale")
+    dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["lambda_scale"].isHidden()
+    assert dialog.protocol_fields["lambda_mean_hz"].isHidden()
+    assert dialog.protocol_fields["lambda_std_hz"].isHidden()
+    dialog.lambda_mode.setCurrentText("normal")
+    dialog._update_protocol_type_fields()
+    assert dialog.protocol_fields["lambda_scale"].isHidden()
+    assert not dialog.protocol_fields["lambda_mean_hz"].isHidden()
+    assert not dialog.protocol_fields["lambda_std_hz"].isHidden()
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_poisson_lambda_scale_and_normal_modes():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    scale_protocol = stimulus_builder.StimulusProtocol(
+        "scaled",
+        "poisson_random_electrodes",
+        lambda_mode="scale",
+        lambda_scale=2.5,
+        lambda_floor_hz=0.001,
+    )
+    assert stimulus_builder._preview_lambda_hz(4.0, scale_protocol, __import__("random").Random(1)) == pytest.approx(10.0)
+
+    normal_protocol = stimulus_builder.StimulusProtocol(
+        "normal",
+        "poisson_random_electrodes",
+        lambda_mode="normal",
+        lambda_mean_hz=3.0,
+        lambda_std_hz=0.0,
+        lambda_floor_hz=0.001,
+    )
+    assert stimulus_builder._preview_lambda_hz(100.0, normal_protocol, __import__("random").Random(1)) == pytest.approx(3.0)
+
+    payload = normal_protocol.to_yaml()["random_electrode_plan"]
+    assert payload["lambda_mode"] == "normal"
+    assert payload["lambda_mean_hz"] == pytest.approx(3.0)
+    assert payload["lambda_std_hz"] == pytest.approx(0.0)
+    assert "lambda_gaussian_cv" not in payload
+
+
+def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "spontaneous_source.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.0, 0.1, 0.2], dtype=float),
+            "chan2": np.array([0.05, 0.15], dtype=float),
+        },
+        sr=20000.0,
+    )
+    channel_map = ChannelMap(
+        name="test_maxwell",
+        rows=1,
+        cols=3,
+        electrodes={
+            "e1": {"channel": "chan1", "electrode": 1, "x_um": 0.0, "y_um": 0.0, "aliases": ["chan1", "1"], "routed": True},
+            "e2": {"channel": "chan2", "electrode": 2, "x_um": 20.0, "y_um": 0.0, "aliases": ["chan2", "2"], "routed": True},
+            "e7317": {"channel": "", "electrode": 7317, "x_um": 40.0, "y_um": 0.0, "aliases": ["7317"], "routed": True},
+        },
+    )
+    dialog = StimulusGenerationDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        channel_map=channel_map,
+    )
+    protocol = next(item for item in dialog.protocols if item.name == "feedback_single_150mV")
+    dialog._render_protocol_preview(protocol)
+    state = dialog.preview_map_state
+    x, y, _payload = state["positions"]["e1"]
+    redraw_calls = []
+    monkeypatch.setattr(dialog, "_draw_preview_channel_map", lambda *args, **kwargs: redraw_calls.append(args))
+
+    class Event:
+        inaxes = dialog.preview_map_canvas.figure.axes[0]
+        xdata = float(x)
+        ydata = float(y)
+
+    dialog._preview_map_clicked(Event())
+
+    assert redraw_calls == []
+    assert dialog.preview_map_selected == "e1"
+    assert dialog.preview_map_selection_artist is not None
+    assert "Electrode: e1" in dialog.preview_map_detail.text()
+    dialog.close()
+    app.processEvents()
+
+
+def test_preview_raw_auto_caches_processed_datasets(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "processed_sample.nev"
+    path.write_bytes(b"placeholder")
+    raw_record = {
+        "path": str(path),
+        "raw_data": UnifiedMEAData(
+            spikes={
+                "chan1": np.array([0.01, 0.03, 0.05], dtype=float),
+                "chan2": np.array([0.015, 0.035, 0.055], dtype=float),
+            },
+            sr=20000.0,
+        ),
+        "data_kind": "nev",
+    }
+    window.file_database = [raw_record]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    window._set_active_database_index(0)
+
+    shown = []
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child
+
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window.preview_raw()
+
+    assert shown
+    assert len(window.processed_database) >= 1
+    assert any(record.get("dataset_type") == "channel_time" for record in window.processed_database)
+    assert any(record.get("dataset_group") in {"raster", "burst", "array"} for record in window.processed_database)
+    assert any(record.get("commit") for record in window.processed_database)
+    window.processed_table.selectRow(0)
+    window._processed_selection_changed()
+    preview = window._data_preview_text()
+    assert "Processed dataset:" in preview
+    assert "Dataset type:" in preview
+    assert "Commit:" in preview
+    assert "Samples x features:" in preview
+
+    for child in shown:
+        if hasattr(child, "close"):
+            child.close()
+    window.close()
+    app.processEvents()
+
+
+def test_build_processed_records_preserve_dataset_metadata(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "metadata_sample.nev"
+    path.write_bytes(b"placeholder")
+    raw_record = {
+        "path": str(path),
+        "raw_data": UnifiedMEAData(
+            spikes={
+                "chan1": np.array([0.01, 0.03, 0.05], dtype=float),
+                "chan2": np.array([0.02, 0.04, 0.06], dtype=float),
+            },
+            sr=20000.0,
+        ),
+        "data_kind": "nev",
+    }
+
+    processed_records, errors = window._build_processed_records(
+        [raw_record],
+        [str(path)],
+        {
+            "dataset_type": "channel_time",
+            "dataset_group": "raster",
+            "origin": "auto-raster",
+            "display_name": "Channel x time",
+            "view_mode": "channel_time",
+            "bin_ms": 10.0,
+            "burst_window_ms": 300.0,
+            "burst_threshold_z": 4.0,
+            "array_axis": "rows",
+        },
+    )
+
+    assert not errors
+    assert len(processed_records) == 1
+    processed = processed_records[0]
+    assert processed["dataset_type"] == "channel_time"
+    assert processed["dataset_group"] == "raster"
+    assert processed["dataset_origin"] == "auto-raster"
+    assert processed["name"] == "Channel x time"
+    assert "channel-time spike counts" in processed["commit"]
+    assert "bin=10 ms" in processed["commit_detail"]
+
+    window.close()
+    app.processEvents()
+
+
+def test_main_window_save_file_saves_single_active_record(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    data = UnifiedMEAData(spikes={"chan1": np.array([0.0, 0.1])}, sr=20000.0)
+    window.raw_data = data
+    window.input_path = str(tmp_path / "single.nev")
+    path = tmp_path / "single_data.npz"
+
+    monkeypatch.setattr(gui_app.QInputDialog, "getItem", lambda *args, **kwargs: ("Spike train only", True))
+    monkeypatch.setattr(gui_app.QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(path), ""))
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: None)
+
+    window.save_spike_train()
+
+    assert path.exists()
+    window.close()
+    window.deleteLater()
+    app.closeAllWindows()
+    app.processEvents()
+    app.quit()
+    app.processEvents()
+
+
+def test_main_window_save_file_saves_multiple_selected_records(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = tmp_path / "first.nev"
+    second = tmp_path / "second.nev"
+    first.write_bytes(b"placeholder")
+    second.write_bytes(b"placeholder")
+    window.file_database = [
+        {"path": str(first), "raw_data": UnifiedMEAData(spikes={"a": np.array([0.0, 0.1])}, sr=20000.0), "data_kind": "nev"},
+        {"path": str(second), "raw_data": UnifiedMEAData(spikes={"b": np.array([0.2, 0.3])}, sr=20000.0), "data_kind": "nev"},
+    ]
+    window._refresh_file_database_table()
+    window._set_active_database_index(0)
+    output_dir = tmp_path / "saved"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(window, "_selected_database_records", lambda: list(window.file_database))
+    monkeypatch.setattr(gui_app.QInputDialog, "getItem", lambda *args, **kwargs: ("Spike train only", True))
+    monkeypatch.setattr(gui_app.QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(output_dir))
+    monkeypatch.setattr(gui_app.QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(output_dir / "fallback.npz"), ""))
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: None)
+
+    window.save_spike_train()
+
+    assert (output_dir / "first_spike_train.npz").exists()
+    assert (output_dir / "second_spike_train.npz").exists()
+    window.close()
+    window.deleteLater()
+    app.closeAllWindows()
+    app.processEvents()
+    app.quit()
+    app.processEvents()
+
+
+def test_main_window_save_file_multiple_records_avoids_name_collisions(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    same_name_a = tmp_path / "group_a" / "same.nev"
+    same_name_b = tmp_path / "group_b" / "same.nev"
+    same_name_a.parent.mkdir()
+    same_name_b.parent.mkdir()
+    same_name_a.write_bytes(b"placeholder")
+    same_name_b.write_bytes(b"placeholder")
+    window.file_database = [
+        {"path": str(same_name_a), "raw_data": UnifiedMEAData(spikes={"a": np.array([0.0, 0.1])}, sr=20000.0), "data_kind": "nev"},
+        {"path": str(same_name_b), "raw_data": UnifiedMEAData(spikes={"b": np.array([0.2, 0.3])}, sr=20000.0), "data_kind": "nev"},
+    ]
+    output_dir = tmp_path / "collision_saved"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(window, "_selected_database_records", lambda: list(window.file_database))
+    monkeypatch.setattr(gui_app.QInputDialog, "getItem", lambda *args, **kwargs: ("Spike train only", True))
+    monkeypatch.setattr(gui_app.QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(output_dir))
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: None)
+
+    window.save_spike_train()
+
+    assert (output_dir / "same_spike_train.npz").exists()
+    assert (output_dir / "same_spike_train_1.npz").exists()
+    window.close()
+    window.deleteLater()
+    app.closeAllWindows()
+    app.processEvents()
+    app.quit()
+    app.processEvents()
+
+
+def test_main_window_save_file_multiple_records_handles_mixed_data_types(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    nev_path = tmp_path / "mixed.nev"
+    array_path = tmp_path / "array_source.npy"
+    nev_path.write_bytes(b"placeholder")
+    np.save(array_path, np.arange(6, dtype=float).reshape(2, 3))
+    window.file_database = [
+        {"path": str(nev_path), "raw_data": UnifiedMEAData(spikes={"a": np.array([0.0, 0.1])}, sr=20000.0), "data_kind": "nev"},
+        {"path": str(array_path), "raw_data": np.arange(6, dtype=float).reshape(2, 3), "data_kind": "npy"},
+    ]
+    output_dir = tmp_path / "mixed_saved"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(window, "_selected_database_records", lambda: list(window.file_database))
+    monkeypatch.setattr(gui_app.QInputDialog, "getItem", lambda *args, **kwargs: ("Spike train only", True))
+    monkeypatch.setattr(gui_app.QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(output_dir))
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: None)
+
+    window.save_spike_train()
+
+    assert (output_dir / "mixed_spike_train.npz").exists()
+    assert (output_dir / "array_source_array_data.npz").exists()
+    window.close()
+    window.deleteLater()
+    app.closeAllWindows()
+    app.processEvents()
+    app.quit()
+    app.processEvents()
+
+
+def test_dynamics_analysis_single_selected_file_opens_burst_trajectory_window(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "single.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.005, 0.020, 1.005, 1.020]),
+            "chan2": np.array([0.012, 0.028, 1.012, 1.028]),
+        },
+        sr=30000.0,
+    )
+    window.file_database = [{"path": str(path), "raw_data": data, "data_kind": "nev"}]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    window._set_active_database_index(0)
+    dialog = window._multi_file_fa_analysis_dialog()
+    dialog.table.selectRow(0)
+    dialog.analysis_scope.setCurrentIndex(dialog.analysis_scope.findData("burst"))
+    shown = []
+
+    def fake_detect(*args, **kwargs):
+        return [(0.0, 0.05), (1.0, 1.05)]
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child.show()
+
+    monkeypatch.setattr(gui_app, "_detect_burst_intervals", fake_detect)
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window._start_multi_file_fa_from_dialog()
+
+    assert shown
+    child = shown[0]
+    assert child.__class__.__name__ == "BurstTrajectoryWindow"
+    assert child.bin_ms.value() == pytest.approx(dialog.bin_ms.value())
+    assert child.window_ms.value() == int(round(dialog.window_ms.value()))
+    child.close()
+    dialog.close()
+    window.close()
+
+
+def test_dynamics_analysis_single_selected_file_removes_stimulus_tail(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "single_stimulus.nev"
+    path.write_bytes(b"placeholder")
+    starts = np.array([0.0, 1.0, 2.0])
+    artifact_offsets = np.array([0.0005, 0.010, 0.014, 0.018, 0.022, 0.026])
+    clean_offsets = np.array([0.0015, 0.012, 0.016, 0.020, 0.024, 0.028])
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.sort(np.concatenate([start + artifact_offsets for start in starts])),
+            "chan2": np.sort(np.concatenate([start + clean_offsets for start in starts])),
+        },
+        stim_times=starts,
+        sr=30000.0,
+    )
+    window.file_database = [{"path": str(path), "raw_data": data, "data_kind": "nev"}]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    window._set_active_database_index(0)
+    dialog = window._multi_file_fa_analysis_dialog()
+    dialog.table.selectRow(0)
+    dialog.analysis_scope.setCurrentIndex(dialog.analysis_scope.findData("burst"))
+    dialog.artifact_ms.setValue(1.0)
+    captured = {}
+    shown = []
+
+    def fake_detect(spike_series, *args, **kwargs):
+        captured.update({str(label): np.asarray(times, dtype=float).copy() for label, times in spike_series})
+        return [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)]
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child.show()
+
+    monkeypatch.setattr(gui_app, "_detect_burst_intervals", fake_detect)
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window._start_multi_file_fa_from_dialog()
+
+    assert shown
+    assert captured["chan1"].size == starts.size * (artifact_offsets.size - 1)
+    assert captured["chan2"].size == starts.size * clean_offsets.size
+    removed_times = starts + artifact_offsets[0]
+    for value in removed_times:
+        assert not np.any(np.isclose(captured["chan1"], value, atol=1e-12))
+    shown[0].close()
+    dialog.close()
+    window.close()
+
+
+def test_dynamics_analysis_single_selected_file_lds_uses_burst_trajectory_window(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "single_lds.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.005, 0.020, 1.005, 1.020, 2.005, 2.020]),
+            "chan2": np.array([0.012, 0.028, 1.012, 1.028, 2.012, 2.028]),
+        },
+        sr=30000.0,
+    )
+    window.file_database = [{"path": str(path), "raw_data": data, "data_kind": "nev"}]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    window._set_active_database_index(0)
+    dialog = window._multi_file_fa_analysis_dialog()
+    dialog.table.selectRow(0)
+    dialog.analysis_scope.setCurrentIndex(dialog.analysis_scope.findData("burst"))
+    dialog.model_method.setCurrentIndex(dialog.model_method.findData("lds"))
+
+    shown = []
+
+    def fake_detect(*args, **kwargs):
+        return [(0.0, 0.05), (1.0, 1.05), (2.0, 2.05)]
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child.show()
+
+    monkeypatch.setattr(gui_app, "_detect_burst_intervals", fake_detect)
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window._start_multi_file_fa_from_dialog()
+
+    assert shown
+    child = shown[0]
+    assert child.__class__.__name__ == "BurstTrajectoryWindow"
+    assert getattr(child, "model_method", "") == "lds"
+    assert str((child.current or {}).get("model_method", "")).lower() == "lds"
+    assert "LDS" in child.summary.text()
+    child.close()
+    dialog.close()
+    window.close()
 
 
 def test_data_load_worker_reads_maxwell_h5_spikes_without_waveforms(monkeypatch, tmp_path):
