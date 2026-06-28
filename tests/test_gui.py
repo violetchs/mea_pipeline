@@ -3736,6 +3736,43 @@ def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp
     assert runner_text.find("configure_experiment_array", stim_phase_index) == -1
 
 
+def test_stimulus_generation_package_writes_poisson_auto_electrode_group(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    rate_path = tmp_path / "rates.npz"
+    np.savez(
+        rate_path,
+        electrodes=np.asarray([100, 101, 200, 201], dtype=np.int32),
+        rates_hz=np.asarray([1.0, 9.0, 2.0, 8.0], dtype=float),
+    )
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_auto",
+        "poisson_random_electrodes",
+        spontaneous_data_path=str(rate_path),
+        region_count=2,
+        max_candidate_electrodes=4,
+    )
+    group = stimulus_builder.ElectrodeGroup("manual_group", [7317])
+    block = stimulus_builder.ExperimentBlock("poisson_block", "manual_group", protocol.name)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        [group],
+        [protocol],
+        [block],
+    )
+
+    system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
+    stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
+
+    assert "electrode_group: manual_group_poisson_auto_auto" in system_text
+    assert "name: manual_group_poisson_auto_auto" in stimulation_text
+    assert "7317" in stimulation_text
+    assert "101" in stimulation_text
+    assert "201" in stimulation_text
+
+
 def test_stimulus_generation_protocol_fields_follow_selected_type():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

@@ -391,6 +391,7 @@ def build_package(
 ) -> Path:
     output_dir = output_dir.expanduser().resolve()
     _validate(info, groups, protocols, blocks)
+    groups, blocks = _with_poisson_electrode_groups(groups, protocols, blocks)
 
     for rel in ["config", "python/utils", "cpp/src", "scripts", "data"]:
         (output_dir / rel).mkdir(parents=True, exist_ok=True)
@@ -444,6 +445,47 @@ def _validate(
             raise ValueError(f"Block {block.name} references missing protocol {block.protocol}")
         if [phase.id for phase in block.phases] != list(PHASES):
             raise ValueError(f"Block {block.name} must contain fixed phases: {', '.join(PHASES)}")
+
+
+def _with_poisson_electrode_groups(
+    groups: list[ElectrodeGroup],
+    protocols: list[StimulusProtocol],
+    blocks: list[ExperimentBlock],
+) -> tuple[list[ElectrodeGroup], list[ExperimentBlock]]:
+    protocol_lookup = {protocol.name: protocol for protocol in protocols}
+    group_lookup = {group.name: group for group in groups}
+    resolved_groups = [ElectrodeGroup(group.name, list(group.electrodes)) for group in groups]
+    resolved_blocks: list[ExperimentBlock] = []
+    existing_names = {group.name for group in resolved_groups}
+
+    for block in blocks:
+        protocol = protocol_lookup.get(block.protocol)
+        group = group_lookup.get(block.electrode_group)
+        target_group = block.electrode_group
+        if protocol is not None and group is not None and protocol.type == "poisson_random_electrodes":
+            candidates = poisson_candidate_electrodes_for_protocol(protocol, list(group.electrodes))
+            target_group = _unique_group_name(f"{block.electrode_group}_{protocol.name}_auto", existing_names)
+            existing_names.add(target_group)
+            resolved_groups.append(ElectrodeGroup(target_group, [int(value) for value in candidates]))
+        resolved_blocks.append(
+            ExperimentBlock(
+                block.name,
+                target_group,
+                block.protocol,
+                [Phase(phase.id, phase.duration_s, phase.mode) for phase in block.phases],
+            )
+        )
+    return resolved_groups, resolved_blocks
+
+
+def _unique_group_name(base: str, existing_names: set[str]) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "poisson_auto"
+    if cleaned not in existing_names:
+        return cleaned
+    index = 2
+    while f"{cleaned}_{index}" in existing_names:
+        index += 1
+    return f"{cleaned}_{index}"
 
 
 def _write(path: Path, content: str) -> None:
@@ -714,6 +756,7 @@ from python.maxwell_setup import (
     initialize_maxlab,
 )
 from python.random_stim_plan import build_poisson_random_plan
+from python.random_stim_plan import select_poisson_candidate_electrodes
 from python.utils.time_log import ExternalTimeLog, SegmentStimLog
 
 
@@ -747,6 +790,7 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
             )
             protocol = protocols[block["protocol"]]
             electrode_group = groups[block["electrode_group"]]
+            electrode_group = _effective_electrode_group(protocol, electrode_group)
             if not dry_run:
                 configure_experiment_array(cfg_path, electrode_group, system_config)
 
@@ -848,6 +892,17 @@ def _run_stim_phase(
     segment_log.record_end_epoch = time.time()
     segment_log.save_txt(phase_dir / "stim_times.txt")
     segment_log.save_json(phase_dir / "segment_time_meta.json")
+
+
+def _effective_electrode_group(protocol: dict[str, Any], electrode_group: dict[str, Any]) -> dict[str, Any]:
+    if protocol.get("type") != "poisson_random_electrodes":
+        return electrode_group
+    fallback = [int(item) for item in electrode_group.get("electrodes", [])]
+    candidate_electrodes = select_poisson_candidate_electrodes(protocol, fallback)
+    effective = dict(electrode_group)
+    effective["electrodes"] = candidate_electrodes
+    effective["candidate_source"] = "poisson_random_electrodes"
+    return effective
 '''.lstrip()
 
 
@@ -966,16 +1021,7 @@ def build_poisson_random_plan(
     duration_s: int,
     fallback_electrodes: list[int],
 ) -> list[dict[str, Any]]:
-    random_cfg = protocol.get("random_electrode_plan", {})
-    source_path = Path(random_cfg.get("spontaneous_data_path", ""))
-    if source_path and not source_path.is_absolute():
-        source_path = Path.cwd() / source_path
-
-    if source_path.exists():
-        rates = load_spontaneous_rates(source_path)
-    else:
-        rates = {int(electrode): float(random_cfg.get("lambda_floor_hz", 0.001)) for electrode in fallback_electrodes}
-
+    rates, random_cfg = _poisson_rates_and_config(protocol, fallback_electrodes)
     candidate_electrodes = select_candidate_electrodes(
         rates,
         region_count=int(random_cfg.get("region_count", 32)),
@@ -1010,6 +1056,31 @@ def build_poisson_random_plan(
     rows.sort(key=lambda item: (item["time_sec"], item["electrode"]))
     save_plan(phase_dir, rows, candidate_electrodes, random_cfg)
     return rows
+
+
+def select_poisson_candidate_electrodes(protocol: dict[str, Any], fallback_electrodes: list[int]) -> list[int]:
+    rates, random_cfg = _poisson_rates_and_config(protocol, fallback_electrodes)
+    candidate_electrodes = select_candidate_electrodes(
+        rates,
+        region_count=int(random_cfg.get("region_count", 32)),
+        max_candidates=int(random_cfg.get("max_candidate_electrodes", 32)),
+    )
+    if not candidate_electrodes:
+        raise ValueError("No candidate stimulation electrodes could be selected")
+    return candidate_electrodes
+
+
+def _poisson_rates_and_config(protocol: dict[str, Any], fallback_electrodes: list[int]) -> tuple[dict[int, float], dict[str, Any]]:
+    random_cfg = protocol.get("random_electrode_plan", {})
+    source_path = Path(random_cfg.get("spontaneous_data_path", ""))
+    if source_path and not source_path.is_absolute():
+        source_path = Path.cwd() / source_path
+
+    if source_path.exists():
+        rates = load_spontaneous_rates(source_path)
+    else:
+        rates = {int(electrode): float(random_cfg.get("lambda_floor_hz", 0.001)) for electrode in fallback_electrodes}
+    return rates, random_cfg
 
 
 def load_spontaneous_rates(path: Path) -> dict[int, float]:
@@ -1142,6 +1213,18 @@ def save_plan(phase_dir: Path, rows: list[dict[str, Any]], candidate_electrodes:
         encoding="utf-8",
     )
 '''
+
+
+def poisson_candidate_electrodes_for_protocol(protocol: StimulusProtocol, fallback_electrodes: list[int]) -> list[int]:
+    if protocol.type != "poisson_random_electrodes":
+        return list(fallback_electrodes)
+    rates = _preview_spontaneous_rates(protocol)
+    if not rates:
+        rates = {int(electrode): float(protocol.lambda_floor_hz) for electrode in fallback_electrodes}
+    candidates = _preview_candidate_electrodes(rates, protocol.region_count, protocol.max_candidate_electrodes)
+    if not candidates:
+        raise ValueError(f"No poisson candidate electrodes could be selected for protocol {protocol.name}")
+    return candidates
 
 
 GENERATED_MAXWELL_SETUP = r'''

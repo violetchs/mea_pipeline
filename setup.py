@@ -9,7 +9,7 @@ LONG_DESCRIPTION = README.read_text(encoding="utf-8") if README.exists() else ""
 
 setup(
     name="mea-pipeline",
-    version="0.3.2",
+    version="0.3.3",
     description="MEA (Microelectrode Array) data processing pipeline for neural activity analysis",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
