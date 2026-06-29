@@ -3812,6 +3812,49 @@ def test_stimulus_generation_ui_updates_poisson_auto_electrode_group(tmp_path):
     app.processEvents()
 
 
+def test_stimulus_generation_save_protocol_creates_poisson_group_without_block(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    app = QApplication.instance() or QApplication([])
+    source_path = tmp_path / "spontaneous.nev"
+    source_path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan100": np.array([0.0, 0.5], dtype=float),
+            "chan101": np.array([0.0, 0.1, 0.2, 0.3], dtype=float),
+            "chan200": np.array([0.0], dtype=float),
+            "chan201": np.array([0.0, 0.05, 0.1], dtype=float),
+        },
+        sr=20000.0,
+    )
+    dialog = StimulusGenerationDialog(
+        [{"path": str(source_path), "raw_data": data, "data_kind": "nev"}],
+        channel_map=None,
+    )
+    dialog.blocks = [stimulus_builder.ExperimentBlock("ordinary_block", "group_A", "feedback_single_150mV")]
+    dialog._refresh_all()
+
+    dialog.protocol_fields["name"].setText("poisson_saved")
+    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog.protocol_fields["region_count"].setText("2")
+    dialog.protocol_fields["max_candidate_electrodes"].setText("4")
+    dialog._set_combo_data(dialog.source_combo, str(source_path))
+    dialog._save_protocol()
+
+    auto_group = next(group for group in dialog.groups if group.name == "group_A_poisson_saved_auto")
+    assert auto_group.electrodes == [101, 201]
+    assert dialog.blocks[0].electrode_group == "group_A"
+    group_names = [dialog.group_table.item(row, 0).text() for row in range(dialog.group_table.rowCount())]
+    assert auto_group.name in group_names
+    dialog.close()
+    app.processEvents()
+
+
 def test_stimulus_generation_protocol_fields_follow_selected_type():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

@@ -17856,15 +17856,13 @@ class StimulusGenerationDialog(AppDialog):
             self._remove_poisson_auto_group(protocol_name)
             return
         related_blocks = [block for block in self.blocks if block.protocol == protocol.name]
-        if not related_blocks:
-            return
         source_path = str(self.protocol_source_paths.get(protocol.name, "") or "")
         if source_path:
             protocol.spontaneous_data_path = source_path
         manual_group = self._manual_group_for_poisson_blocks(related_blocks)
         fallback = list(manual_group.electrodes) if manual_group is not None else self._default_electrodes()
         try:
-            candidates = stimulus_builder.poisson_candidate_electrodes_for_protocol(protocol, fallback)
+            candidates = self._poisson_candidate_electrodes_for_ui(protocol, fallback)
         except Exception as exc:
             self.generate_status.setText(f"Poisson auto electrodes unavailable: {exc}")
             return
@@ -17886,6 +17884,22 @@ class StimulusGenerationDialog(AppDialog):
         self._refresh_block_combos()
         self.generate_status.setText(f"Poisson auto electrodes updated: {group_name} ({len(candidates)})")
 
+    def _poisson_candidate_electrodes_for_ui(self, protocol, fallback: list[int]) -> list[int]:
+        source_path = self._preview_source_path_for_protocol(protocol)
+        source_record = self._record_by_path(source_path)
+        if isinstance(source_record, dict):
+            electrodes, rates = self._rate_table_from_record(source_record)
+            rate_map = {int(electrode): float(rate) for electrode, rate in zip(electrodes, rates)}
+            candidates = stimulus_builder._preview_candidate_electrodes(
+                rate_map,
+                int(getattr(protocol, "region_count", 32)),
+                int(getattr(protocol, "max_candidate_electrodes", 32)),
+            )
+            if not candidates:
+                raise ValueError(f"No poisson candidate electrodes could be selected for protocol {protocol.name}")
+            return candidates
+        return stimulus_builder.poisson_candidate_electrodes_for_protocol(protocol, fallback)
+
     def _remove_poisson_auto_group(self, protocol_name: str) -> None:
         group_name = self.poisson_auto_groups.pop(protocol_name, "")
         if not group_name:
@@ -17904,6 +17918,11 @@ class StimulusGenerationDialog(AppDialog):
                 continue
             group = group_lookup.get(block.electrode_group)
             if group is not None:
+                return group
+        row = self._selected_table_row(self.group_table) if hasattr(self, "group_table") else None
+        if row is not None and 0 <= row < len(self.groups):
+            group = self.groups[row]
+            if group.name not in auto_group_names:
                 return group
         return next((group for group in self.groups if group.name not in auto_group_names), None)
 
