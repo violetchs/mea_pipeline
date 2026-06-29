@@ -56,6 +56,9 @@ from src.gui.app import (
     _stimulus_response_supported_files,
     _loaded_data_activity_label,
     _generic_analysis_matrix_from_record,
+    _custom_channel_filter,
+    _custom_spike_vector_matrix,
+    _parse_custom_time_windows,
     _default_axion_channel_map,
     _default_maxwell_channel_map,
     StimulusResponseInputDialog,
@@ -3418,6 +3421,24 @@ def test_generic_analysis_matrix_from_record_supports_unified_and_array_data():
     assert "samples=columns" in array_column_description
 
 
+def test_custom_spike_vector_matrix_compares_time_window_rates():
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.1, 0.2, 1.2], dtype=float),
+            "chan2": np.array([0.4, 1.1, 1.3, 1.4], dtype=float),
+        },
+        sr=20000.0,
+    )
+    windows = _parse_custom_time_windows("0-1, 1-2", data)
+    selected = _custom_channel_filter(_spike_series_from_unified(data), "chan1, chan2")
+    matrix, sample_labels, feature_labels, description = _custom_spike_vector_matrix(selected, windows, "firing_rate_vector")
+
+    assert sample_labels == ["0-1s", "1-2s"]
+    assert feature_labels == ["chan1", "chan2"]
+    assert matrix.tolist() == [[2.0, 1.0], [1.0, 3.0]]
+    assert "firing rate" in description
+
+
 def test_generic_analysis_window_constructs_from_payload():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -3462,7 +3483,7 @@ def test_generic_analysis_window_constructs_from_payload():
         app.processEvents()
 
 
-def test_main_window_can_open_generic_analysis_from_database(tmp_path, monkeypatch):
+def test_main_window_can_open_custom_analysis_from_database(tmp_path, monkeypatch):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
@@ -3489,11 +3510,9 @@ def test_main_window_can_open_generic_analysis_from_database(tmp_path, monkeypat
     window._refresh_file_database_table()
     window.database_table.selectRow(0)
     window._set_active_database_index(0)
-    added, errors = window._ensure_processed_data_for_records(window.file_database)
-    assert added >= 1
-    assert window.processed_database
     dialog = window._generic_analysis_dialog()
     dialog.table.selectRow(0)
+    dialog.time_windows.setText("0-0.04, 0.04-0.08")
     shown = []
 
     def wrapped_show_child(child):
@@ -3503,11 +3522,61 @@ def test_main_window_can_open_generic_analysis_from_database(tmp_path, monkeypat
     monkeypatch.setattr(window, "_show_child", wrapped_show_child)
     window._start_generic_analysis_from_dialog()
 
+    assert window.processed_database
     assert shown
     assert isinstance(shown[0], GenericAnalysisWindow)
     shown[0].close()
     dialog.close()
     window.close()
+
+
+def test_main_window_custom_analysis_adds_processed_rate_dataset(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "sample.nev"
+    path.write_bytes(b"placeholder")
+    window.file_database = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(
+                spikes={
+                    "chan1": np.array([0.1, 0.2, 1.2], dtype=float),
+                    "chan2": np.array([0.4, 1.1, 1.3, 1.4], dtype=float),
+                },
+                sr=20000.0,
+            ),
+            "data_kind": "nev",
+        }
+    ]
+    window._refresh_file_database_table()
+    dialog = window._generic_analysis_dialog()
+    dialog.table.selectRow(0)
+    dialog.time_windows.setText("0-1, 1-2")
+    dialog.channels.setText("chan1, chan2")
+    shown = []
+
+    def wrapped_show_child(child):
+        shown.append(child)
+        return child.show()
+
+    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
+    window._start_generic_analysis_from_dialog()
+
+    assert window.processed_database
+    processed = window.processed_database[-1]
+    assert processed["dataset_group"] == "custom"
+    assert np.asarray(processed["matrix"], dtype=float).tolist() == [[2.0, 1.0], [1.0, 3.0]]
+    assert shown and isinstance(shown[0], GenericAnalysisWindow)
+    shown[0].close()
+    dialog.close()
+    window.close()
+    app.processEvents()
 
 
 def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_path, monkeypatch):

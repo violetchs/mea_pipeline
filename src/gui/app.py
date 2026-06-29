@@ -4169,6 +4169,80 @@ def _generic_analysis_matrix_from_record(
     return np.asarray(array, dtype=float), labels, description
 
 
+def _parse_optional_float_list(text: str) -> np.ndarray:
+    values = []
+    for token in re.split(r"[\s,;]+", str(text or "").strip()):
+        if not token:
+            continue
+        values.append(float(token))
+    return np.asarray(values, dtype=float)
+
+
+def _parse_custom_time_windows(text: str, data: UnifiedMEAData) -> list[tuple[float, float, str]]:
+    raw = str(text or "full").strip()
+    start_s, stop_s = data.time_range()
+    if stop_s <= start_s:
+        finite = [np.asarray(times, dtype=float) for _label, times in _spike_series_from_unified(data) if np.asarray(times, dtype=float).size]
+        if finite:
+            stop_s = max(float(np.nanmax(values)) for values in finite if values.size)
+        stop_s = max(stop_s, start_s + 1.0)
+    if not raw or raw.lower() in {"full", "all", "*"}:
+        return [(float(start_s), float(stop_s), f"{float(start_s):g}-{float(stop_s):g}s")]
+    windows: list[tuple[float, float, str]] = []
+    for chunk in re.split(r"[,;]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*(?:-|:|to)\s*([+-]?\d+(?:\.\d+)?)\s*$", chunk, re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Invalid time window: {chunk}")
+        lo = float(match.group(1))
+        hi = float(match.group(2))
+        if hi <= lo:
+            raise ValueError(f"Time window stop must be greater than start: {chunk}")
+        windows.append((lo, hi, f"{lo:g}-{hi:g}s"))
+    if not windows:
+        raise ValueError("No valid time windows were defined")
+    return windows
+
+
+def _custom_channel_filter(spike_series, channels_text: str):
+    requested = [token.strip() for token in re.split(r"[,;]+", str(channels_text or "")) if token.strip()]
+    if not requested:
+        return [(str(label), np.asarray(times, dtype=float)) for label, times in spike_series]
+    requested_keys = {normalize_channel_name(token) for token in requested}
+    requested_keys.update(normalize_channel_name(_base_channel_from_raster_label(token)) for token in requested)
+    selected = []
+    for label, times in spike_series:
+        candidates = {
+            normalize_channel_name(str(label)),
+            normalize_channel_name(_base_channel_from_raster_label(str(label))),
+        }
+        if candidates & requested_keys:
+            selected.append((str(label), np.asarray(times, dtype=float)))
+    return selected
+
+
+def _custom_spike_vector_matrix(spike_series, windows, analysis_type: str):
+    mode = str(analysis_type or "firing_rate_vector")
+    feature_labels = [str(label) for label, _times in spike_series]
+    sample_labels = [str(label) for _start, _stop, label in windows]
+    matrix = np.zeros((len(windows), len(spike_series)), dtype=float)
+    for row, (start_s, stop_s, _label) in enumerate(windows):
+        duration_s = max(float(stop_s) - float(start_s), 1e-9)
+        for col, (_channel, times) in enumerate(spike_series):
+            values = np.asarray(times, dtype=float)
+            count = int(np.count_nonzero((values >= float(start_s)) & (values < float(stop_s))))
+            matrix[row, col] = float(count) / duration_s if mode == "firing_rate_vector" else float(count)
+    if mode == "firing_rate_vector":
+        description = f"Custom vector firing rate | windows={len(windows)} | channels={len(spike_series)}"
+    elif mode == "spike_count_vector":
+        description = f"Custom vector spike count | windows={len(windows)} | channels={len(spike_series)}"
+    else:
+        raise ValueError(f"Unsupported custom analysis type: {analysis_type}")
+    return matrix, sample_labels, feature_labels, description
+
+
 def _processed_dataset_label(record, *, view_mode: str) -> str:
     path = Path(str((record or {}).get("path", "")))
     source_name = path.name or str((record or {}).get("name", "") or "dataset")
@@ -4970,48 +5044,31 @@ class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
 class GenericAnalysisDialog(_DatabaseAnalysisDialogBase):
     def __init__(self, records, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Generic Analysis")
-        self.resize(960, 560)
+        self.setWindowTitle("Custom Analysis")
+        self.resize(980, 620)
         self.cached_payload: dict | None = None
 
-        self.normalization = QComboBox()
-        self.normalization.addItem("Feature z-score", "feature_zscore")
-        self.normalization.addItem("Per sample L1", "per_sample_l1")
-        self.normalization.addItem("Sample peak", "sample_peak")
-        self.normalization.addItem("Log1p", "log1p")
-        self.normalization.addItem("None", "none")
-        self.normalization.setToolTip("Common preprocessing shared across different data types.")
+        self.analysis_type = QComboBox()
+        self.analysis_type.addItem("Vector firing rate (Hz)", "firing_rate_vector")
+        self.analysis_type.addItem("Vector spike count", "spike_count_vector")
+        self.analysis_type.setToolTip("Basic function applied after file/channel/time-window selection.")
 
-        self.similarity = QComboBox()
-        self.similarity.addItem("Correlation", "correlation")
-        self.similarity.addItem("Cosine", "cosine")
-        self.similarity.addItem("Euclidean affinity", "euclidean_affinity")
-
-        self.reduction = QComboBox()
-        self.reduction.addItem("PCA", "pca")
-        self.reduction.addItem("t-SNE", "tsne")
-
-        self.reduction_dims = QSpinBox()
-        self.reduction_dims.setRange(2, 8)
-        self.reduction_dims.setValue(2)
-
-        self.clustering = QComboBox()
-        self.clustering.addItem("KMeans", "kmeans")
-        self.clustering.addItem("Hierarchical", "hierarchical")
-
-        self.cluster_count = QSpinBox()
-        self.cluster_count.setRange(1, 24)
-        self.cluster_count.setValue(3)
-
-        self.group_threshold = QDoubleSpinBox()
-        self.group_threshold.setRange(0.0, 1.99)
-        self.group_threshold.setDecimals(2)
-        self.group_threshold.setSingleStep(0.05)
-        self.group_threshold.setValue(0.45)
-        self.group_threshold.setToolTip("Used by hierarchical grouping/order on the similarity matrix.")
-
-        self.standardize_before_reduce = QCheckBox("Standardize before reduction")
-        self.standardize_before_reduce.setChecked(False)
+        self.time_windows = QLineEdit("full")
+        self.time_windows.setPlaceholderText("full, or 0-10, 10-20")
+        self.time_windows.setToolTip("Comma-separated windows in seconds. Use full for the whole recording.")
+        self.channels = QLineEdit()
+        self.channels.setPlaceholderText("blank = all channels; e.g. chan12, chan13")
+        self.channels.setToolTip("Comma-separated channel labels. Matching is case-insensitive and accepts base channel names.")
+        self.dataset_name = QLineEdit()
+        self.dataset_name.setPlaceholderText("optional processed dataset name")
+        self.x_values = QLineEdit()
+        self.x_values.setPlaceholderText("optional x values, e.g. 0, 10, 20")
+        self.x_label = QLineEdit("Time window")
+        self.y_label = QLineEdit("")
+        self.plot_mode = QComboBox()
+        self.plot_mode.addItem("Auto", "auto")
+        self.plot_mode.addItem("Line", "line")
+        self.plot_mode.addItem("Bar", "bar")
 
         self._setup_database_table()
         self._set_records(records)
@@ -5022,37 +5079,35 @@ class GenericAnalysisDialog(_DatabaseAnalysisDialogBase):
         controls.setContentsMargins(12, 10, 12, 10)
         controls.setHorizontalSpacing(10)
         controls.setVerticalSpacing(8)
-        controls.addWidget(QLabel("Normalize"), 0, 0)
-        controls.addWidget(self.normalization, 0, 1)
-        controls.addWidget(QLabel("Similarity"), 0, 2)
-        controls.addWidget(self.similarity, 0, 3)
-        controls.addWidget(QLabel("Reduction"), 0, 4)
-        controls.addWidget(self.reduction, 0, 5)
-        controls.addWidget(QLabel("Dims"), 1, 0)
-        controls.addWidget(self.reduction_dims, 1, 1)
-        controls.addWidget(QLabel("Clustering"), 1, 2)
-        controls.addWidget(self.clustering, 1, 3)
-        controls.addWidget(QLabel("Clusters"), 1, 4)
-        controls.addWidget(self.cluster_count, 1, 5)
-        controls.addWidget(QLabel("Group threshold"), 2, 0)
-        controls.addWidget(self.group_threshold, 2, 1)
-        controls.addWidget(self.standardize_before_reduce, 2, 2, 1, 4)
-        controls.addWidget(
-            QLabel("Processed datasets already include burst detection / matrix building. This panel only controls downstream analysis."),
-            3,
-            0,
-            1,
-            6,
-        )
+        controls.addWidget(QLabel("Basic function"), 0, 0)
+        controls.addWidget(self.analysis_type, 0, 1)
+        controls.addWidget(QLabel("Time windows"), 0, 2)
+        controls.addWidget(self.time_windows, 0, 3, 1, 3)
+        controls.addWidget(QLabel("Channels"), 1, 0)
+        controls.addWidget(self.channels, 1, 1, 1, 5)
+        controls.addWidget(QLabel("Name"), 2, 0)
+        controls.addWidget(self.dataset_name, 2, 1, 1, 2)
+        controls.addWidget(QLabel("Plot"), 2, 3)
+        controls.addWidget(self.plot_mode, 2, 4)
+        controls.addWidget(QLabel("X values"), 3, 0)
+        controls.addWidget(self.x_values, 3, 1, 1, 2)
+        controls.addWidget(QLabel("X label"), 3, 3)
+        controls.addWidget(self.x_label, 3, 4)
+        controls.addWidget(QLabel("Y label"), 4, 3)
+        controls.addWidget(self.y_label, 4, 4)
+        note = QLabel("Results are saved into the processed-data database and can be plotted immediately.")
+        note.setObjectName("MutedText")
+        note.setWordWrap(True)
+        controls.addWidget(note, 4, 0, 1, 3)
 
         intro = QLabel(
-            "Run reusable matrix analysis on selected processed datasets. "
-            "Preprocessing and burst extraction are cached automatically when raw data are previewed or analyzed elsewhere."
+            "Build a custom dataset from loaded files by choosing files, channels, and time windows, "
+            "then run a basic analysis function such as firing-rate vectorization."
         )
         intro.setObjectName("MutedText")
         intro.setWordWrap(True)
 
-        analyze = QPushButton("Analyze")
+        analyze = QPushButton("Run Custom Analysis")
         analyze.setObjectName("PrimaryButton")
         analyze.clicked.connect(self.accept)
         cancel = QPushButton("Cancel")
@@ -5071,37 +5126,18 @@ class GenericAnalysisDialog(_DatabaseAnalysisDialogBase):
 
     def _set_records(self, records) -> None:
         super()._set_records(records)
-        has_processed = any("matrix" in (record or {}) for record in self.records)
-        if has_processed:
-            self.table.setColumnCount(6)
-            self.table.setHorizontalHeaderLabels(["Name", "Source", "Type", "Samples", "Features", "Origin"])
-            self.table.setRowCount(len(self.records))
-            for row, record in enumerate(self.records):
-                matrix = np.asarray(record.get("matrix", []), dtype=float)
-                values = [
-                    str(record.get("name", "")),
-                    str(record.get("source_label", "")),
-                    str(record.get("dataset_type", "") or record.get("view_mode", "")),
-                    str(int(matrix.shape[0]) if matrix.ndim >= 1 else 0),
-                    str(int(matrix.shape[1]) if matrix.ndim == 2 else 0),
-                    str(Path(str(record.get("source_path", ""))).name),
-                ]
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    item.setData(Qt.ItemDataRole.UserRole, str(record.get("path", "")))
-                    self.table.setItem(row, column, item)
-            self.table.resizeColumnsToContents()
 
     def values(self) -> tuple[list[str], dict]:
         return self._selected_paths(), {
-            "normalization": str(self.normalization.currentData() or "feature_zscore"),
-            "similarity": str(self.similarity.currentData() or "correlation"),
-            "reduction": str(self.reduction.currentData() or "pca"),
-            "reduction_dims": int(self.reduction_dims.value()),
-            "clustering": str(self.clustering.currentData() or "kmeans"),
-            "cluster_count": int(self.cluster_count.value()),
-            "group_threshold": float(self.group_threshold.value()),
-            "reduction_standardize": bool(self.standardize_before_reduce.isChecked()),
+            "analysis_kind": "custom_basic",
+            "analysis_type": str(self.analysis_type.currentData() or "firing_rate_vector"),
+            "time_windows": self.time_windows.text().strip(),
+            "channels": self.channels.text().strip(),
+            "display_name": self.dataset_name.text().strip(),
+            "x_values": self.x_values.text().strip(),
+            "x_label": self.x_label.text().strip() or "Time window",
+            "y_label": self.y_label.text().strip(),
+            "plot_mode": str(self.plot_mode.currentData() or "auto"),
         }
 
 
@@ -13358,7 +13394,7 @@ class MultiFileFactorAnalysisWindow(AppDialog):
 class GenericAnalysisWindow(AppDialog):
     def __init__(self, payload: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Generic Analysis")
+        self.setWindowTitle("Custom Analysis")
         self.resize(1220, 820)
         self.payload = payload if isinstance(payload, dict) else {}
         self.records = list(self.payload.get("records", []))
@@ -13384,7 +13420,7 @@ class GenericAnalysisWindow(AppDialog):
         controls.setSpacing(10)
         controls.addWidget(QLabel("Inspect file"))
         controls.addWidget(self.file_combo, 1)
-        controls.addWidget(QLabel("Shared primitives: normalize -> similarity -> reduction -> clustering"))
+        controls.addWidget(QLabel("Custom data -> basic function -> processed dataset -> auto plot"))
         controls.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -13409,10 +13445,23 @@ class GenericAnalysisWindow(AppDialog):
 
     def _update_summary(self):
         if not self.records:
-            self.summary.setText("No generic-analysis records.")
+            self.summary.setText("No custom-analysis records.")
             return
         params = dict(self.payload.get("parameters", {}) or {})
         errors = list(self.payload.get("errors", []))
+        if params.get("analysis_kind") == "custom_basic":
+            self.summary.setText(
+                " | ".join(
+                    [
+                        f"Files: {len(self.records)}",
+                        f"Skipped: {len(errors)}",
+                        f"Function: {params.get('analysis_type', 'n/a')}",
+                        f"Windows: {params.get('time_windows', 'n/a')}",
+                        f"Channels: {params.get('channels') or 'all'}",
+                    ]
+                )
+            )
+            return
         self.summary.setText(
             " | ".join(
                 [
@@ -13428,6 +13477,9 @@ class GenericAnalysisWindow(AppDialog):
         )
 
     def _draw_figure(self):
+        if dict(self.payload.get("parameters", {}) or {}).get("analysis_kind") == "custom_basic":
+            self._draw_custom_figure()
+            return
         figure = create_generic_analysis_figure({}, title="Generic analysis")
         selected = self._selected_record_index()
         if 0 <= selected < len(self.records):
@@ -13448,12 +13500,81 @@ class GenericAnalysisWindow(AppDialog):
         old_canvas.close()
         self.canvas.draw_idle()
 
+    def _draw_custom_figure(self):
+        figure = Figure(figsize=(10.5, 7.0), tight_layout=True)
+        ax = figure.add_subplot(111)
+        selected = self._selected_record_index()
+        record = self.records[selected] if 0 <= selected < len(self.records) else {}
+        processed = dict(record.get("processed", {}) or {})
+        matrix = np.asarray(processed.get("matrix", []), dtype=float)
+        plot_payload = dict(processed.get("plot_payload", {}) or {})
+        sample_labels = list(processed.get("sample_labels", []))
+        feature_labels = list(processed.get("feature_labels", []))
+        if matrix.ndim != 2 or matrix.size == 0:
+            ax.text(0.5, 0.5, "No plottable custom data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            x = np.asarray(plot_payload.get("x", list(range(1, matrix.shape[0] + 1))), dtype=float)
+            if x.size != matrix.shape[0]:
+                x = np.arange(1, matrix.shape[0] + 1, dtype=float)
+            mode = str(plot_payload.get("plot_mode", "auto") or "auto")
+            if mode == "auto":
+                mode = "bar" if matrix.shape[0] <= 8 else "line"
+            if mode == "bar":
+                width = 0.8 / max(1, matrix.shape[1])
+                offsets = (np.arange(matrix.shape[1]) - (matrix.shape[1] - 1) / 2.0) * width
+                for col in range(matrix.shape[1]):
+                    label = feature_labels[col] if col < len(feature_labels) else f"series {col + 1}"
+                    ax.bar(x + offsets[col], matrix[:, col], width=width, alpha=0.82, label=label)
+            else:
+                for col in range(matrix.shape[1]):
+                    label = feature_labels[col] if col < len(feature_labels) else f"series {col + 1}"
+                    ax.plot(x, matrix[:, col], marker="o", linewidth=1.8, label=label)
+            if sample_labels and len(sample_labels) == matrix.shape[0]:
+                ax.set_xticks(x)
+                ax.set_xticklabels(sample_labels, rotation=30, ha="right")
+            ax.set_xlabel(str(plot_payload.get("x_label", "X")))
+            ax.set_ylabel(str(plot_payload.get("y_label", "Value")))
+            ax.set_title(str(processed.get("name") or record.get("file") or "Custom analysis"))
+            if matrix.shape[1] <= 12:
+                ax.legend(loc="best", fontsize=8)
+        old_canvas = self.canvas
+        new_canvas = FigureCanvas(figure)
+        layout = self.layout()
+        if layout is not None:
+            old_item = layout.itemAt(2)
+            if old_item is not None:
+                widget = old_item.widget()
+                if widget is not None:
+                    layout.replaceWidget(widget, new_canvas)
+                    widget.setParent(None)
+        self.canvas = new_canvas
+        old_canvas.close()
+        self.canvas.draw_idle()
+
     def _draw_detail(self):
         if not self.records:
             self.detail.setPlainText("No details available.")
             return
         selected = self._selected_record_index()
         record = self.records[selected]
+        if dict(self.payload.get("parameters", {}) or {}).get("analysis_kind") == "custom_basic":
+            processed = dict(record.get("processed", {}) or {})
+            matrix = np.asarray(processed.get("matrix", []), dtype=float)
+            self.detail.setPlainText(
+                "\n".join(
+                    [
+                        f"File: {record.get('file')}",
+                        f"Dataset: {processed.get('name', 'n/a')}",
+                        f"Description: {processed.get('description', 'n/a')}",
+                        f"Shape: {matrix.shape[0] if matrix.ndim >= 1 else 0} x {matrix.shape[1] if matrix.ndim == 2 else 0}",
+                        f"Samples: {', '.join(list(processed.get('sample_labels', []))[:12])}",
+                        f"Features: {', '.join(list(processed.get('feature_labels', []))[:12])}",
+                    ]
+                )
+            )
+            return
         analysis = dict(record.get("analysis", {}) or {})
         params = dict(analysis.get("parameters", {}) or {})
         prepared = analysis.get("prepared")
@@ -18816,7 +18937,7 @@ class MainWindow(QMainWindow):
         self.stimulus_response_button.clicked.connect(self.open_stimulus_response_analysis)
         self.multi_file_fa_button = QPushButton("Dynamics Analysis")
         self.multi_file_fa_button.clicked.connect(self.open_multi_file_factor_analysis)
-        self.generic_analysis_button = QPushButton("Generic Analysis")
+        self.generic_analysis_button = QPushButton("Custom Analysis")
         self.generic_analysis_button.clicked.connect(self.open_generic_analysis)
 
         library_label = QLabel("Data Library")
@@ -18933,7 +19054,7 @@ class MainWindow(QMainWindow):
         multi_file_fa_action = QAction("Dynamics Analysis", self)
         multi_file_fa_action.triggered.connect(self.open_multi_file_factor_analysis)
         tools_menu.addAction(multi_file_fa_action)
-        generic_action = QAction("Generic Analysis", self)
+        generic_action = QAction("Custom Analysis", self)
         generic_action.triggered.connect(self.open_generic_analysis)
         tools_menu.addAction(generic_action)
 
@@ -18972,7 +19093,7 @@ class MainWindow(QMainWindow):
         self.sorting_button.setEnabled(has_data and not any_busy)
         self.stimulus_response_button.setEnabled(has_database and not (loading or stimulus_busy or dynamics_busy))
         self.multi_file_fa_button.setEnabled(has_database and not (loading or stimulus_busy or dynamics_busy))
-        self.generic_analysis_button.setEnabled(has_processed and not any_busy)
+        self.generic_analysis_button.setEnabled(has_database and not any_busy)
 
     def open_stimulus_generation(self):
         if self.stimulus_generation_dialog is None:
@@ -19117,9 +19238,8 @@ class MainWindow(QMainWindow):
         self.stimulus_response_dialog.activateWindow()
 
     def open_generic_analysis(self):
-        self._ensure_processed_data_for_selected_records()
-        if not self.processed_database:
-            _show_info_message(self, "Generic Analysis", "No processed datasets are available yet. Open or preview raw data first.")
+        if not self.file_database:
+            _show_info_message(self, "Custom Analysis", "Load files into the database before custom analysis.")
             return
         dialog = self._generic_analysis_dialog()
         dialog.show()
@@ -19128,54 +19248,40 @@ class MainWindow(QMainWindow):
 
     def _generic_analysis_dialog(self):
         if self.generic_analysis_dialog is None:
-            dialog = GenericAnalysisDialog(self.processed_database, self)
+            dialog = GenericAnalysisDialog(self.file_database, self)
             dialog.setWindowModality(Qt.WindowModality.NonModal)
             dialog.accepted.connect(self._start_generic_analysis_from_dialog)
             self.generic_analysis_dialog = dialog
         elif hasattr(self.generic_analysis_dialog, "_set_records"):
-            self.generic_analysis_dialog._set_records(self.processed_database)
+            self.generic_analysis_dialog._set_records(self.file_database)
         return self.generic_analysis_dialog
 
     def _start_generic_analysis_from_dialog(self):
         dialog = self._generic_analysis_dialog()
         paths, parameters = dialog.values()
         if not paths:
-            _show_info_message(self, "Generic Analysis", "Select at least one database file.")
+            _show_info_message(self, "Custom Analysis", "Select at least one database file.")
             dialog.show()
             return
         selected_lookup = set(paths)
         records = []
         errors = []
-        for record in self.processed_database:
+        processed_records = []
+        for record in self.file_database:
             path_text = str(record.get("path", ""))
             if path_text not in selected_lookup:
                 continue
             try:
-                matrix = np.nan_to_num(np.asarray(record.get("matrix", []), dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-                labels = list(record.get("sample_labels", []))
-                description = str(record.get("description", "Processed matrix"))
-                if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
-                    raise ValueError("No usable matrix could be constructed")
-                analysis = run_generic_matrix_analysis(
-                    matrix,
-                    sample_axis=0,
-                    normalization=str(parameters.get("normalization", "feature_zscore")),
-                    similarity=str(parameters.get("similarity", "correlation")),
-                    reduction=str(parameters.get("reduction", "pca")),
-                    reduction_dims=int(parameters.get("reduction_dims", 2)),
-                    clustering=str(parameters.get("clustering", "kmeans")),
-                    cluster_count=int(parameters.get("cluster_count", 3)),
-                    grouping_threshold=float(parameters.get("group_threshold", 0.45)),
-                    reduction_standardize=bool(parameters.get("reduction_standardize", False)),
-                )
-                analysis["labels"] = list(labels)
+                processed = self._build_custom_analysis_record(record, parameters)
+                self._upsert_processed_record(processed)
+                processed_records.append(processed)
                 records.append(
                     {
-                        "path": path_text,
-                        "file": str(record.get("name") or Path(path_text).name),
-                        "condition": str(record.get("source_label") or record.get("origin_name") or "Processed"),
-                        "matrix_description": description,
-                        "analysis": analysis,
+                        "path": str(processed.get("path", "")),
+                        "file": str(processed.get("name") or Path(path_text).name),
+                        "condition": str(processed.get("source_label") or "Custom"),
+                        "matrix_description": str(processed.get("description", "")),
+                        "processed": processed,
                     }
                 )
             except Exception as exc:
@@ -19183,9 +19289,14 @@ class MainWindow(QMainWindow):
         payload = {"records": records, "errors": errors, "parameters": dict(parameters or {})}
         if not records:
             details = "\n".join(errors[:12]) if errors else "No files could be analyzed."
-            _show_warning_message(self, "Generic Analysis", details)
+            _show_warning_message(self, "Custom Analysis", details)
             dialog.show()
             return
+        self._refresh_processed_database_table()
+        if self.generic_analysis_dialog is not None and hasattr(self.generic_analysis_dialog, "_set_records"):
+            self.generic_analysis_dialog._set_records(self.file_database)
+        self._update_analysis_action_states()
+        self._set_app_status("Custom analysis ready", f"{len(processed_records)} processed dataset(s) added.")
         self.generic_analysis_payload = payload
         self._open_generic_analysis_window(payload)
 
@@ -19195,6 +19306,53 @@ class MainWindow(QMainWindow):
         window.finished.connect(lambda _result: self._return_to_generic_analysis_dialog())
         self._show_child(window)
         _defer_hide(dialog, 0)
+
+    def _build_custom_analysis_record(self, record: dict, parameters: dict) -> dict:
+        data = (record or {}).get("raw_data")
+        if not isinstance(data, UnifiedMEAData):
+            raise ValueError("Custom spike-vector analysis requires loaded spike-event data")
+        path_text = str((record or {}).get("path", ""))
+        spike_series = _spike_series_from_unified(data)
+        selected_channels = _custom_channel_filter(spike_series, str(parameters.get("channels", "")))
+        if not selected_channels:
+            raise ValueError("No selected channels matched this file")
+        windows = _parse_custom_time_windows(str(parameters.get("time_windows", "full")), data)
+        analysis_type = str(parameters.get("analysis_type", "firing_rate_vector"))
+        matrix, sample_labels, feature_labels, description = _custom_spike_vector_matrix(selected_channels, windows, analysis_type)
+        x_values = _parse_optional_float_list(str(parameters.get("x_values", "")))
+        if x_values.size and x_values.size != len(sample_labels):
+            raise ValueError("x values must match the number of selected time windows")
+        plot_payload = {
+            "kind": "auto_xy",
+            "plot_mode": str(parameters.get("plot_mode", "auto")),
+            "x": x_values.tolist() if x_values.size else list(range(1, len(sample_labels) + 1)),
+            "x_labels": list(sample_labels),
+            "y_label": str(parameters.get("y_label") or ("Firing rate (Hz)" if analysis_type == "firing_rate_vector" else "Spike count")),
+            "x_label": str(parameters.get("x_label") or "Time window"),
+            "series_labels": list(feature_labels),
+        }
+        safe_stamp = int(time.time() * 1000)
+        dataset_type = str(analysis_type)
+        display_name = str(parameters.get("display_name", "") or "").strip() or f"{Path(path_text).name} | {dataset_type}"
+        return {
+            "path": f"{path_text}::custom::{dataset_type}::{safe_stamp}",
+            "source_path": path_text,
+            "origin_name": Path(path_text).name,
+            "name": display_name,
+            "source_label": _loaded_data_activity_label(path_text, data),
+            "dataset_type": dataset_type,
+            "dataset_group": "custom",
+            "dataset_origin": "custom_analysis",
+            "commit": f"custom | {dataset_type}",
+            "commit_detail": description,
+            "view_mode": "custom_vector",
+            "description": description,
+            "matrix": matrix,
+            "sample_labels": list(sample_labels),
+            "feature_labels": list(feature_labels),
+            "parameters": dict(parameters or {}),
+            "plot_payload": plot_payload,
+        }
 
     def _return_to_generic_analysis_dialog(self):
         if self.generic_analysis_dialog is None:
@@ -19973,11 +20131,24 @@ class MainWindow(QMainWindow):
                 f"Commit: {record.get('commit', 'n/a')}",
                 f"Description: {record.get('description', 'n/a')}",
                 f"Samples x features: {int(matrix.shape[0]) if matrix.ndim >= 1 else 0} x {int(matrix.shape[1]) if matrix.ndim == 2 else 0}",
-                f"Normalization preset: {params.get('normalization', 'n/a')}",
-                f"Similarity preset: {params.get('similarity', 'n/a')}",
-                f"Reduction preset: {params.get('reduction', 'n/a')}",
-                f"Clustering preset: {params.get('clustering', 'n/a')}",
             ]
+            if params.get("analysis_kind") == "custom_basic":
+                lines.extend(
+                    [
+                        f"Basic function: {params.get('analysis_type', 'n/a')}",
+                        f"Time windows: {params.get('time_windows', 'n/a')}",
+                        f"Channels: {params.get('channels') or 'all'}",
+                    ]
+                )
+            else:
+                for label, key in [
+                    ("Normalization preset", "normalization"),
+                    ("Similarity preset", "similarity"),
+                    ("Reduction preset", "reduction"),
+                    ("Clustering preset", "clustering"),
+                ]:
+                    if key in params:
+                        lines.append(f"{label}: {params.get(key, 'n/a')}")
             commit_detail = str(record.get("commit_detail", "") or "").strip()
             if commit_detail:
                 lines.append(f"Commit detail: {commit_detail}")
@@ -19990,7 +20161,7 @@ class MainWindow(QMainWindow):
             return (
                 "No data loaded.\n\n"
                 "Use Open Data Files to build a raw-file database. "
-                "Processed datasets for generic analysis are cached automatically."
+                "Custom analysis can turn selected files, channels, and time windows into processed datasets."
             )
 
         lines = []
