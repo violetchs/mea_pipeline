@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
@@ -34,6 +35,7 @@ try:
         QHBoxLayout,
         QInputDialog,
         QLabel,
+        QLayout,
         QLineEdit,
         QMainWindow,
         QMessageBox,
@@ -65,7 +67,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.path import Path as MplPath
 from matplotlib.colors import Normalize
-from matplotlib.widgets import LassoSelector
+from matplotlib.widgets import LassoSelector, RectangleSelector
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import curve_fit
@@ -182,6 +184,16 @@ def _channel_sort_key(channel: str):
         )
     suffix = "".join(char for char in text if char.isdigit())
     return (text.rstrip(suffix), int(suffix) if suffix else -1, text)
+
+
+class NoWheelComboBox(QComboBox):
+    """Combo box that ignores wheel changes unless its popup is open."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt override
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 def _enable_standard_window_controls(window) -> None:
@@ -1635,9 +1647,16 @@ def draw_maxwell_channel_map(
         return state
 
     entries = [(electrode, float(x), float(y), payload) for electrode, (x, y, payload) in positions.items()]
+    point_count = max(len(entries), 1)
+    if point_count >= 5000:
+        all_size, recording_size, stimulation_size, selected_size = 1.8, 10, 18, 42
+    elif point_count >= 1000:
+        all_size, recording_size, stimulation_size, selected_size = 2.6, 14, 26, 58
+    else:
+        all_size, recording_size, stimulation_size, selected_size = 5, 24, 50, 92
     xs = [entry[1] for entry in entries]
     ys = [entry[2] for entry in entries]
-    ax.scatter(xs, ys, s=5, color="#cbd5e1", alpha=0.72, marker="o", linewidths=0, zorder=2)
+    ax.scatter(xs, ys, s=all_size, color="#cbd5e1", alpha=0.72, marker="o", linewidths=0, zorder=2)
 
     for electrode, x, y, payload in entries:
         state["point_lookup"].append({"electrode": electrode, "x": x, "y": y, "payload": payload})
@@ -1666,18 +1685,18 @@ def draw_maxwell_channel_map(
         rec_points = [(positions[electrode][0], positions[electrode][1]) for electrode in sorted(recording) if electrode in positions]
         if rec_points:
             rec = np.asarray(rec_points, dtype=float)
-            ax.scatter(rec[:, 0], rec[:, 1], s=24, color="#16a34a", marker="o", edgecolors="#064e3b", linewidths=0.45, zorder=4)
+            ax.scatter(rec[:, 0], rec[:, 1], s=recording_size, color="#16a34a", marker="o", edgecolors="#064e3b", linewidths=0.45, zorder=4)
 
     if stimulation:
         stim_points = [(positions[electrode][0], positions[electrode][1]) for electrode in sorted(stimulation) if electrode in positions]
         if stim_points:
             stim = np.asarray(stim_points, dtype=float)
-            ax.scatter(stim[:, 0], stim[:, 1], s=50, color="#dc2626", marker="o", edgecolors="#111827", linewidths=0.8, zorder=6)
+            ax.scatter(stim[:, 0], stim[:, 1], s=stimulation_size, color="#dc2626", marker="o", edgecolors="#111827", linewidths=0.8, zorder=6)
 
     selected = _resolve_channel_map_electrode(selected_electrode, lookup, positions)
     if selected is not None and selected in positions:
         x, y, _payload = positions[selected]
-        ax.scatter([x], [y], s=92, facecolors="none", edgecolors="#111827", marker="o", linewidths=1.8, zorder=8)
+        ax.scatter([x], [y], s=selected_size, facecolors="none", edgecolors="#111827", marker="o", linewidths=1.8, zorder=8)
         state["selected"] = selected
 
     ax.plot([0, 1, 1, 0, 0], [0, 0, 1, 1, 0], color="#111827", linewidth=1.15, zorder=3)
@@ -2047,13 +2066,52 @@ def _factor_analysis_latent_states(
         return np.zeros((burst_count, bin_count, 0), dtype=float), {}
     flat = values.reshape((burst_count * bin_count, channel_count))
     sample_count = flat.shape[0]
-    components = min(max(1, int(latent_dim)), channel_count, sample_count)
+    requested_components = min(max(1, int(latent_dim)), channel_count, sample_count)
     if sample_count < 2 or np.allclose(flat, flat[0]):
-        latent = np.zeros((burst_count, bin_count, components), dtype=float)
+        latent = np.zeros((burst_count, bin_count, requested_components), dtype=float)
         params = {
             "method": "factor_analysis",
-            "latent_dim": components,
-            "loadings": np.zeros((components, channel_count), dtype=float),
+            "latent_dim": requested_components,
+            "loadings": np.zeros((requested_components, channel_count), dtype=float),
+            "mean": np.mean(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float),
+            "noise_variance": np.zeros(channel_count, dtype=float),
+            "log_likelihood": np.zeros(0, dtype=float),
+            "n_iter": 0,
+        }
+        return latent, params
+    variances = np.var(flat, axis=0)
+    active_mask = np.isfinite(variances) & (variances > 1e-12)
+    active_indices = np.flatnonzero(active_mask)
+    if active_indices.size == 0:
+        latent = np.zeros((burst_count, bin_count, requested_components), dtype=float)
+        params = {
+            "method": "factor_analysis",
+            "latent_dim": requested_components,
+            "loadings": np.zeros((requested_components, channel_count), dtype=float),
+            "mean": np.mean(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float),
+            "noise_variance": np.zeros(channel_count, dtype=float),
+            "log_likelihood": np.zeros(0, dtype=float),
+            "n_iter": 0,
+        }
+        return latent, params
+    active_flat = flat[:, active_indices]
+    centered_active = active_flat - np.mean(active_flat, axis=0, keepdims=True)
+    try:
+        singular_values = np.linalg.svd(centered_active, compute_uv=False)
+    except np.linalg.LinAlgError:
+        singular_values = np.zeros(0, dtype=float)
+    if singular_values.size:
+        tolerance = max(centered_active.shape) * np.finfo(float).eps * float(np.nanmax(singular_values))
+        effective_rank = int(np.count_nonzero(singular_values > max(tolerance, 1e-12)))
+    else:
+        effective_rank = 0
+    components = min(requested_components, int(active_indices.size), max(1, sample_count - 1), effective_rank)
+    if components < 1:
+        latent = np.zeros((burst_count, bin_count, requested_components), dtype=float)
+        params = {
+            "method": "factor_analysis",
+            "latent_dim": requested_components,
+            "loadings": np.zeros((requested_components, channel_count), dtype=float),
             "mean": np.mean(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float),
             "noise_variance": np.zeros(channel_count, dtype=float),
             "log_likelihood": np.zeros(0, dtype=float),
@@ -2061,16 +2119,24 @@ def _factor_analysis_latent_states(
         }
         return latent, params
     model = SkFactorAnalysis(n_components=components, random_state=7, max_iter=max(10, int(max_iter)))
-    latent_flat = model.fit_transform(flat)
+    latent_flat = model.fit_transform(active_flat)
     latent = np.nan_to_num(latent_flat.reshape((burst_count, bin_count, components)), nan=0.0, posinf=0.0, neginf=0.0)
+    loadings = np.zeros((components, channel_count), dtype=float)
+    loadings[:, active_indices] = np.nan_to_num(np.asarray(model.components_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    mean = np.mean(flat, axis=0) if flat.size else np.zeros(channel_count, dtype=float)
+    mean[active_indices] = np.nan_to_num(np.asarray(model.mean_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    noise = np.zeros(channel_count, dtype=float)
+    noise[active_indices] = np.nan_to_num(np.asarray(model.noise_variance_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
     params = {
         "method": "factor_analysis",
         "latent_dim": components,
-        "loadings": np.nan_to_num(np.asarray(model.components_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
-        "mean": np.nan_to_num(np.asarray(model.mean_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
-        "noise_variance": np.nan_to_num(np.asarray(model.noise_variance_, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        "loadings": loadings,
+        "mean": np.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0),
+        "noise_variance": noise,
         "log_likelihood": np.nan_to_num(np.asarray(getattr(model, "loglike_", []), dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
         "n_iter": int(getattr(model, "n_iter_", 0)),
+        "active_channel_count": int(active_indices.size),
+        "effective_rank": int(effective_rank),
     }
     return latent, params
 
@@ -3593,14 +3659,14 @@ class ChannelMapDialog(AppDialog):
         self.canvas.set_available_channels(self.available_channels)
         self.canvas.electrode_selected.connect(self._select_electrode)
 
-        self.saved_maps = QComboBox()
+        self.saved_maps = NoWheelComboBox()
         self._refresh_saved_maps()
 
         self.name_edit = QLineEdit(self.channel_map.name)
         self.electrode_label = QLabel(self.selected_electrode)
         self.electrode_label.setObjectName("CardTitle")
 
-        self.channel_combo = QComboBox()
+        self.channel_combo = NoWheelComboBox()
         self.channel_combo.setEditable(True)
         self._refresh_channel_choices()
 
@@ -4178,6 +4244,17 @@ def _parse_optional_float_list(text: str) -> np.ndarray:
     return np.asarray(values, dtype=float)
 
 
+def _natural_sort_key(value) -> tuple:
+    parts = re.split(r"(\d+)", str(value or ""))
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return tuple(key)
+
+
 def _parse_custom_time_windows(text: str, data: UnifiedMEAData) -> list[tuple[float, float, str]]:
     raw = str(text or "full").strip()
     start_s, stop_s = data.time_range()
@@ -4241,6 +4318,368 @@ def _custom_spike_vector_matrix(spike_series, windows, analysis_type: str):
     else:
         raise ValueError(f"Unsupported custom analysis type: {analysis_type}")
     return matrix, sample_labels, feature_labels, description
+
+
+def _custom_plot_axis_mode(record: dict, requested: str = "auto") -> str:
+    mode = str(requested or "auto")
+    if mode != "auto":
+        return mode
+    matrix = np.asarray((record or {}).get("matrix", []), dtype=float)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape((-1, 1))
+    sample_labels = list((record or {}).get("sample_labels", []))
+    feature_labels = list((record or {}).get("feature_labels", []))
+    if matrix.ndim == 2 and matrix.shape[0] == 1 and matrix.shape[1] > 1 and feature_labels:
+        return "features"
+    if sample_labels and matrix.ndim == 2 and len(sample_labels) == matrix.shape[0]:
+        return "sample_labels"
+    return "sample_index"
+
+
+def _custom_plot_x_axis(record: dict, parameters: dict | None = None):
+    params = dict(parameters or {})
+    matrix = np.asarray((record or {}).get("matrix", []), dtype=float)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape((-1, 1))
+    if matrix.ndim != 2:
+        return np.zeros(0, dtype=float), [], "Sample", False, matrix
+    mode = _custom_plot_axis_mode(record, str(params.get("x_mode", "auto") or "auto"))
+    sample_labels = [str(label) for label in list((record or {}).get("sample_labels", []))]
+    feature_labels = [str(label) for label in list((record or {}).get("feature_labels", []))]
+    if mode == "manual":
+        x = _parse_optional_float_list(str(params.get("x_values", "")))
+        if matrix.shape[0] == 1 and matrix.shape[1] > 1 and x.size == matrix.shape[1]:
+            return x, [], str(params.get("x_label") or "Manual x"), True, matrix
+        if x.size != matrix.shape[0]:
+            x = np.arange(1, matrix.shape[0] + 1, dtype=float)
+        return x, [], str(params.get("x_label") or "Sample"), False, matrix
+    if mode == "generated":
+        try:
+            start = float(params.get("x_start", 1.0))
+        except (TypeError, ValueError):
+            start = 1.0
+        try:
+            step = float(params.get("x_step", 1.0))
+        except (TypeError, ValueError):
+            step = 1.0
+        if matrix.shape[0] == 1 and matrix.shape[1] > 1:
+            x = start + np.arange(matrix.shape[1], dtype=float) * step
+            return x, [], str(params.get("x_label") or "Generated x"), True, matrix
+        x = start + np.arange(matrix.shape[0], dtype=float) * step
+        return x, [], str(params.get("x_label") or "Generated x"), False, matrix
+    if mode == "features" and matrix.shape[0] == 1:
+        labels = feature_labels if len(feature_labels) == matrix.shape[1] else [f"feature {index + 1}" for index in range(matrix.shape[1])]
+        return np.arange(1, matrix.shape[1] + 1, dtype=float), labels, str(params.get("x_label") or "Channel / feature"), True, matrix
+    if mode == "sample_labels":
+        labels = sample_labels if len(sample_labels) == matrix.shape[0] else [f"sample {index + 1}" for index in range(matrix.shape[0])]
+        return np.arange(1, matrix.shape[0] + 1, dtype=float), labels, str(params.get("x_label") or "Sample"), False, matrix
+    return np.arange(1, matrix.shape[0] + 1, dtype=float), [], str(params.get("x_label") or "Sample index"), False, matrix
+
+
+def _custom_plot_y_options(record: dict) -> list[tuple[str, str]]:
+    matrix = np.asarray((record or {}).get("matrix", []), dtype=float)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape((-1, 1))
+    if matrix.ndim != 2 or matrix.size == 0:
+        return []
+    feature_labels = [str(label) for label in list((record or {}).get("feature_labels", []))]
+    if len(feature_labels) != matrix.shape[1]:
+        feature_labels = [f"feature {index + 1}" for index in range(matrix.shape[1])]
+    sample_labels = [str(label) for label in list((record or {}).get("sample_labels", []))]
+    if len(sample_labels) != matrix.shape[0]:
+        sample_labels = [f"sample {index + 1}" for index in range(matrix.shape[0])]
+    options: list[tuple[str, str]] = []
+    if matrix.shape[0] == 1 and matrix.shape[1] > 1:
+        options.append(("all_features", "All features"))
+        options.extend((f"feature:{index}", label) for index, label in enumerate(feature_labels))
+    else:
+        options.append(("all_features", "All features"))
+        options.extend((f"feature:{index}", label) for index, label in enumerate(feature_labels))
+        if matrix.shape[1] == 1:
+            options.append(("single_feature", feature_labels[0]))
+        if matrix.shape[0] > 1:
+            options.extend((f"sample:{index}", f"Sample {label}") for index, label in enumerate(sample_labels))
+    seen = set()
+    unique = []
+    for key, label in options:
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((key, label))
+    return unique
+
+
+def _custom_plot_dataset_y_options(records) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for record_index, record in enumerate(list(records or [])):
+        base_label = str(record.get("name") or record.get("dataset_type") or f"dataset {record_index + 1}")
+        options.append((f"record:{record_index}|dataset", base_label))
+    return options
+
+
+def _custom_plot_split_y_key(y_key: str) -> tuple[int | None, str]:
+    text = str(y_key or "")
+    if text.startswith("record:") and "|" in text:
+        head, inner = text.split("|", 1)
+        try:
+            return int(head.split(":", 1)[1]), inner
+        except (TypeError, ValueError, IndexError):
+            return None, inner
+    return None, text
+
+
+def _custom_plot_resolve_y(record: dict, y_key: str, parameters: dict | None = None):
+    params = dict(parameters or {})
+    x, x_tick_labels, resolved_x_label, transpose_features, matrix = _custom_plot_x_axis(record, params)
+    if matrix.ndim != 2 or matrix.size == 0:
+        return np.zeros(0, dtype=float), np.zeros(0, dtype=float), [], "", "Y", False
+    feature_labels = [str(label) for label in list((record or {}).get("feature_labels", []))]
+    if len(feature_labels) != matrix.shape[1]:
+        feature_labels = [f"feature {index + 1}" for index in range(matrix.shape[1])]
+    sample_labels = [str(label) for label in list((record or {}).get("sample_labels", []))]
+    if len(sample_labels) != matrix.shape[0]:
+        sample_labels = [f"sample {index + 1}" for index in range(matrix.shape[0])]
+    key = str(y_key or "all_features")
+    if key == "dataset":
+        if transpose_features:
+            return x, matrix[0, :], x_tick_labels, resolved_x_label, str(record.get("name") or record.get("dataset_type") or "dataset"), True
+        if matrix.shape[1] == 1:
+            return x, matrix[:, 0], x_tick_labels, resolved_x_label, str(record.get("name") or feature_labels[0]), False
+        return x, matrix, x_tick_labels, resolved_x_label, str(record.get("name") or "dataset"), False
+    if key.startswith("feature:"):
+        try:
+            col = int(key.split(":", 1)[1])
+        except (TypeError, ValueError):
+            col = 0
+        col = min(max(0, col), max(0, matrix.shape[1] - 1))
+        if matrix.shape[0] == 1 and matrix.shape[1] > 1:
+            return x, matrix[0, :], x_tick_labels, resolved_x_label, feature_labels[col], transpose_features
+        return x, matrix[:, col], x_tick_labels, resolved_x_label, feature_labels[col], False
+    if key.startswith("sample:"):
+        try:
+            row = int(key.split(":", 1)[1])
+        except (TypeError, ValueError):
+            row = 0
+        row = min(max(0, row), max(0, matrix.shape[0] - 1))
+        values = matrix[row, :]
+        x_values = np.arange(1, values.size + 1, dtype=float)
+        labels = feature_labels if len(feature_labels) == values.size else []
+        return x_values, values, labels, "Channel / feature", sample_labels[row], True
+    if transpose_features:
+        return x, matrix[0, :], x_tick_labels, resolved_x_label, str(record.get("dataset_type") or "value"), True
+    if matrix.shape[1] == 1:
+        return x, matrix[:, 0], x_tick_labels, resolved_x_label, feature_labels[0], False
+    return x, matrix, x_tick_labels, resolved_x_label, "All features", False
+
+
+def _draw_custom_plot_figure(figure: Figure, records, parameters: dict | None = None):
+    params = dict(parameters or {})
+    record_list = list(records or [])
+    figure.clear()
+    ax = figure.add_subplot(111)
+    mode = str(params.get("plot_mode", "auto") or "auto")
+    x_mode = str(params.get("x_mode", "auto") or "auto")
+    y_keys = [str(key) for key in list(params.get("y_data_keys") or []) if str(key)]
+    if not y_keys:
+        y_keys = ["all_features"]
+    if len(y_keys) > 1 or params.get("plot_style") == "multi_y":
+        plotted = 0
+        resolved_axis_label = str(params.get("x_label", "") or "").strip()
+        numeric_x_for_axis = None
+        first_tick_labels: list[str] = []
+        bar_series: list[tuple[np.ndarray, np.ndarray, str]] = []
+        local_mode = "line" if mode == "auto" else mode
+        for y_key in y_keys:
+            record_index, inner_key = _custom_plot_split_y_key(y_key)
+            if record_index is None:
+                target_records = list(enumerate(record_list))
+            elif 0 <= record_index < len(record_list):
+                target_records = [(record_index, record_list[record_index])]
+            else:
+                target_records = []
+            for current_index, record in target_records:
+                base_label = str(record.get("name") or record.get("dataset_type") or f"dataset {current_index + 1}")
+                x, y_values, x_tick_labels, resolved_x_label, y_name, _transpose = _custom_plot_resolve_y(record, inner_key, params)
+                y_array = np.asarray(y_values, dtype=float)
+                if y_array.ndim == 2:
+                    for col in range(y_array.shape[1]):
+                        label = f"{base_label}: {y_name} {col + 1}" if len(record_list) > 1 else f"{y_name} {col + 1}"
+                        series = y_array[:, col]
+                        if local_mode == "bar":
+                            bar_series.append((x, series, label))
+                        else:
+                            ax.plot(x, series, marker="o", linewidth=1.4, label=label)
+                        plotted += 1
+                elif y_array.size:
+                    label = f"{base_label}: {y_name}" if len(record_list) > 1 else y_name
+                    if local_mode == "bar":
+                        bar_series.append((x, y_array, label))
+                    else:
+                        ax.plot(x, y_array, marker="o", linewidth=1.5, label=label)
+                    plotted += 1
+                if not x_tick_labels and numeric_x_for_axis is None and x.size:
+                    numeric_x_for_axis = np.asarray(x, dtype=float)
+                if x_tick_labels and not first_tick_labels:
+                    first_tick_labels = list(x_tick_labels)
+                    numeric_x_for_axis = np.asarray(x, dtype=float)
+                if not resolved_axis_label:
+                    resolved_axis_label = resolved_x_label
+        if local_mode == "bar" and bar_series:
+            series_count = len(bar_series)
+            width = 0.78 / max(1, series_count)
+            offsets = (np.arange(series_count) - (series_count - 1) / 2.0) * width
+            for index, (x, y_array, label) in enumerate(bar_series):
+                ax.bar(np.asarray(x, dtype=float) + offsets[index], y_array, width=width, alpha=0.82, label=label)
+        if plotted == 0:
+            ax.text(0.5, 0.5, "No plottable data", ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            if first_tick_labels and numeric_x_for_axis is not None and len(first_tick_labels) == numeric_x_for_axis.size:
+                ax.set_xticks(numeric_x_for_axis)
+                rotation = 70 if len(first_tick_labels) > 20 else 35
+                ax.set_xticklabels(first_tick_labels, rotation=rotation, ha="right", fontsize=7 if len(first_tick_labels) > 20 else 8)
+            elif numeric_x_for_axis is not None and numeric_x_for_axis.size:
+                ax.set_xticks(numeric_x_for_axis)
+                if x_mode == "generated":
+                    x0 = float(numeric_x_for_axis[0])
+                    x1 = float(numeric_x_for_axis[-1]) if numeric_x_for_axis.size > 1 else x0 + 1.0
+                    ax.set_xlim(x0, x1)
+            ax.set_xlabel(resolved_axis_label or "Sample")
+            ax.set_ylabel(str(params.get("y_label") or "Value"))
+            ax.set_title("Custom plot")
+            ax.legend(loc="best", fontsize=8)
+            if any(label.get_visible() and len(label.get_text()) > 10 for label in ax.get_xticklabels()):
+                ax.tick_params(axis="x", labelsize=7)
+        return plotted
+
+    plotted = 0
+    resolved_axis_label = str(params.get("x_label", "") or "").strip()
+    numeric_x_for_axis = None
+    for record in record_list:
+        x, x_tick_labels, resolved_x_label, transpose_features, matrix = _custom_plot_x_axis(record, params)
+        if matrix.ndim != 2 or matrix.size == 0:
+            continue
+        if not x_tick_labels and numeric_x_for_axis is None and x.size:
+            numeric_x_for_axis = np.asarray(x, dtype=float)
+        local_mode = mode
+        if local_mode == "auto":
+            local_mode = "bar" if (transpose_features or matrix.shape[0] <= 8) and len(record_list) == 1 else "line"
+        base_label = str(record.get("name") or record.get("dataset_type") or "dataset")
+        feature_labels = list(record.get("feature_labels", []))
+        if transpose_features:
+            values = matrix[0, :]
+            label = base_label if len(record_list) > 1 else str(record.get("dataset_type") or "value")
+            if local_mode == "bar":
+                ax.bar(x, values, width=0.72, alpha=0.82, label=label)
+            else:
+                ax.plot(x, values, marker="o", linewidth=1.5, label=label)
+        elif local_mode == "bar" and len(record_list) == 1:
+            width = 0.8 / max(1, matrix.shape[1])
+            offsets = (np.arange(matrix.shape[1]) - (matrix.shape[1] - 1) / 2.0) * width
+            for col in range(matrix.shape[1]):
+                label = feature_labels[col] if col < len(feature_labels) else f"feature {col + 1}"
+                ax.bar(x + offsets[col], matrix[:, col], width=width, alpha=0.82, label=label)
+        else:
+            for col in range(matrix.shape[1]):
+                label = feature_labels[col] if col < len(feature_labels) else f"feature {col + 1}"
+                ax.plot(x, matrix[:, col], marker="o", linewidth=1.4, label=f"{base_label}: {label}")
+        if x_tick_labels and len(x_tick_labels) == len(x):
+            ax.set_xticks(x)
+            rotation = 70 if len(x_tick_labels) > 20 else 35
+            ax.set_xticklabels(x_tick_labels, rotation=rotation, ha="right", fontsize=7 if len(x_tick_labels) > 20 else 8)
+            if len(x_tick_labels) > 60:
+                stride = max(1, int(np.ceil(len(x_tick_labels) / 40)))
+                for index, label in enumerate(ax.get_xticklabels()):
+                    label.set_visible(index % stride == 0)
+        if not resolved_axis_label:
+            resolved_axis_label = resolved_x_label
+        plotted += 1
+    if plotted == 0:
+        ax.text(0.5, 0.5, "No plottable data", ha="center", va="center")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        if numeric_x_for_axis is not None and numeric_x_for_axis.size:
+            ax.set_xticks(numeric_x_for_axis)
+            if x_mode in {"generated", "sample_index"}:
+                x0 = float(numeric_x_for_axis[0])
+                x1 = float(numeric_x_for_axis[-1]) if numeric_x_for_axis.size > 1 else x0 + 1.0
+                ax.set_xlim(x0, x1)
+        ax.set_xlabel(resolved_axis_label or "Sample")
+        ax.set_ylabel(str(params.get("y_label") or "Value"))
+        ax.set_title("Custom plot")
+        if plotted <= 2:
+            ax.legend(loc="best", fontsize=8)
+        if any(label.get_visible() and len(label.get_text()) > 10 for label in ax.get_xticklabels()):
+            ax.tick_params(axis="x", labelsize=7)
+    return plotted
+
+
+def _custom_filter_tokens(text: str) -> list[str]:
+    return [token.strip() for token in re.split(r"[,;\n]+", str(text or "")) if token.strip()]
+
+
+def _custom_label_filter_indices(labels, text: str) -> list[int]:
+    tokens = _custom_filter_tokens(text)
+    label_list = [str(label) for label in labels]
+    if not tokens:
+        return list(range(len(label_list)))
+    selected: list[int] = []
+    normalized_labels = [normalize_channel_name(label) for label in label_list]
+    base_labels = [normalize_channel_name(_base_channel_from_raster_label(label)) for label in label_list]
+    for token in tokens:
+        token_key = normalize_channel_name(token)
+        exact_matches = [
+            index
+            for index, (label_key, base_key) in enumerate(zip(normalized_labels, base_labels))
+            if token_key and (token_key == label_key or token_key == base_key)
+        ]
+        matches = exact_matches
+        if not matches:
+            token_lower = str(token).lower()
+            matches = [index for index, label in enumerate(label_list) if token_lower in str(label).lower()]
+        for index in matches:
+            if index not in selected:
+                selected.append(index)
+    return selected
+
+
+def _custom_extract_processed_record(record: dict, parameters: dict | None = None) -> dict:
+    params = dict(parameters or {})
+    matrix = np.asarray((record or {}).get("matrix", []), dtype=float)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape((-1, 1))
+    if matrix.ndim != 2:
+        matrix = np.zeros((0, 0), dtype=float)
+    sample_labels = [str(label) for label in list((record or {}).get("sample_labels", []))]
+    feature_labels = [str(label) for label in list((record or {}).get("feature_labels", []))]
+    if len(sample_labels) != matrix.shape[0]:
+        sample_labels = [f"sample {index + 1}" for index in range(matrix.shape[0])]
+    if len(feature_labels) != matrix.shape[1]:
+        feature_labels = [f"feature {index + 1}" for index in range(matrix.shape[1])]
+    sample_indices = _custom_label_filter_indices(sample_labels, str(params.get("sample_filter", "")))
+    feature_indices = _custom_label_filter_indices(feature_labels, str(params.get("feature_filter", "")))
+    sample_indices = [index for index in sample_indices if 0 <= index < matrix.shape[0]]
+    feature_indices = [index for index in feature_indices if 0 <= index < matrix.shape[1]]
+    if not sample_indices or not feature_indices:
+        extracted = np.zeros((0, 0), dtype=float)
+    else:
+        extracted = matrix[np.ix_(sample_indices, feature_indices)]
+    output = dict(record or {})
+    output["matrix"] = extracted
+    output["sample_labels"] = [sample_labels[index] for index in sample_indices]
+    output["feature_labels"] = [feature_labels[index] for index in feature_indices]
+    output["description"] = f"{str((record or {}).get('description', '') or 'Processed data')} | extracted samples={len(sample_indices)} features={len(feature_indices)}"
+    extraction = dict(params)
+    extraction["source_processed_path"] = str((record or {}).get("path", ""))
+    extraction["source_processed_name"] = str((record or {}).get("name", ""))
+    output["custom_extraction"] = extraction
+    if str(params.get("extracted_name", "")).strip():
+        output["name"] = str(params.get("extracted_name", "")).strip()
+    elif params.get("apply_filters"):
+        output["name"] = f"{str((record or {}).get('name') or 'processed')} | extracted"
+    return output
 
 
 def _processed_dataset_label(record, *, view_mode: str) -> str:
@@ -4832,16 +5271,16 @@ class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
         self.window_ms.setValue(300.0)
         self.window_ms.setSuffix(" ms")
         self.window_ms.setToolTip("Analysis window per burst or per non-overlapping segment. Typical range: 100-500 ms.")
-        self.analysis_scope = QComboBox()
+        self.analysis_scope = NoWheelComboBox()
         self.analysis_scope.addItem("Bursts", "burst")
         self.analysis_scope.addItem("All data windows", "all_windows")
         self.analysis_scope.setToolTip("Bursts uses detected burst intervals; All data windows splits the recording into consecutive windows.")
-        self.model_method = QComboBox()
+        self.model_method = NoWheelComboBox()
         self.model_method.addItem("Factor Analysis (FA)", "fa")
         self.model_method.addItem("Linear Dynamical System (LDS)", "lds")
         self.model_method.addItem("pi-VAE", "pivae")
         self.model_method.setToolTip("FA estimates latent states independently; LDS adds a temporal latent-state model; pi-VAE fits a conditional Poisson VAE.")
-        self.normalize = QComboBox()
+        self.normalize = NoWheelComboBox()
         self.normalize.addItem("Channel z-score", "channel_zscore")
         self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
         self.normalize.addItem("Per time total", "per_time_total")
@@ -5041,104 +5480,843 @@ class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
         self._update_option_summary()
 
 
-class GenericAnalysisDialog(_DatabaseAnalysisDialogBase):
+class GenericAnalysisDialog(AppDialog):
     def __init__(self, records, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom Analysis")
-        self.resize(980, 620)
-        self.cached_payload: dict | None = None
+        self.resize(320, 480)
+        self.setMinimumWidth(300)
+        self.records = list(records or [])
+        self.action = ""
 
-        self.analysis_type = QComboBox()
-        self.analysis_type.addItem("Vector firing rate (Hz)", "firing_rate_vector")
-        self.analysis_type.addItem("Vector spike count", "spike_count_vector")
-        self.analysis_type.setToolTip("Basic function applied after file/channel/time-window selection.")
+        intro = QLabel("Custom workflow")
+        intro.setObjectName("SectionTitle")
+        summary = QLabel(
+            "Choose a basic function first. Data range, channels, and plotting are configured in the following steps."
+        )
+        summary.setObjectName("MutedText")
+        summary.setWordWrap(True)
 
-        self.time_windows = QLineEdit("full")
-        self.time_windows.setPlaceholderText("full, or 0-10, 10-20")
-        self.time_windows.setToolTip("Comma-separated windows in seconds. Use full for the whole recording.")
-        self.channels = QLineEdit()
-        self.channels.setPlaceholderText("blank = all channels; e.g. chan12, chan13")
-        self.channels.setToolTip("Comma-separated channel labels. Matching is case-insensitive and accepts base channel names.")
-        self.dataset_name = QLineEdit()
-        self.dataset_name.setPlaceholderText("optional processed dataset name")
-        self.x_values = QLineEdit()
-        self.x_values.setPlaceholderText("optional x values, e.g. 0, 10, 20")
-        self.x_label = QLineEdit("Time window")
-        self.y_label = QLineEdit("")
-        self.plot_mode = QComboBox()
-        self.plot_mode.addItem("Auto", "auto")
-        self.plot_mode.addItem("Line", "line")
-        self.plot_mode.addItem("Bar", "bar")
+        function_frame = QFrame()
+        function_frame.setObjectName("Panel")
+        function_layout = QVBoxLayout(function_frame)
+        function_layout.setContentsMargins(10, 10, 10, 10)
+        function_layout.setSpacing(8)
+        function_layout.addWidget(QLabel("Data processing"))
+        for text, action, tooltip in [
+            ("Vector firing rate", "firing_rate_vector", "Counts spikes in selected windows and divides by duration."),
+            ("Spike count vector", "spike_count_vector", "Counts spikes in selected windows without rate normalization."),
+        ]:
+            button = QPushButton(text)
+            button.setToolTip(tooltip)
+            button.clicked.connect(lambda _checked=False, value=action: self._choose_action(value))
+            function_layout.addWidget(button)
+
+        plot_frame = QFrame()
+        plot_frame.setObjectName("Panel")
+        plot_layout = QVBoxLayout(plot_frame)
+        plot_layout.setContentsMargins(10, 10, 10, 10)
+        plot_layout.setSpacing(8)
+        plot_layout.addWidget(QLabel("Plotting"))
+        plot_button = QPushButton("Plot processed data")
+        plot_button.clicked.connect(lambda: self._choose_action("plot"))
+        plot_layout.addWidget(plot_button)
+
+        pipeline_frame = QFrame()
+        pipeline_frame.setObjectName("Panel")
+        pipeline_layout = QVBoxLayout(pipeline_frame)
+        pipeline_layout.setContentsMargins(10, 10, 10, 10)
+        pipeline_layout.setSpacing(8)
+        pipeline_layout.addWidget(QLabel("Pipeline"))
+        pipeline_button = QPushButton("Run custom pipeline")
+        pipeline_button.setToolTip("Run a saved-style workflow with selected files, time range, channels, and one basic function.")
+        pipeline_button.clicked.connect(lambda: self._choose_action("pipeline"))
+        pipeline_layout.addWidget(pipeline_button)
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addWidget(summary)
+        layout.addWidget(function_frame)
+        layout.addWidget(plot_frame)
+        layout.addWidget(pipeline_frame)
+        layout.addStretch(1)
+        layout.addWidget(cancel)
+        _fix_spinbox_hit_targets(self)
+
+    def _set_records(self, records) -> None:
+        self.records = list(records or [])
+
+    def _choose_action(self, action: str) -> None:
+        self.action = str(action or "")
+        self.accept()
+
+    def values(self) -> tuple[list[str], dict]:
+        return [], {"action": self.action}
+
+
+class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
+    def __init__(self, records, analysis_type: str, channel_map: ChannelMap | None = None, parent=None, open_main_raster_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Data Selection")
+        self.resize(920, 680)
+        self.analysis_type = str(analysis_type or "firing_rate_vector")
+        self.channel_map = channel_map
+        self.open_main_raster_callback = open_main_raster_callback
+        self.current_spike_series: list[tuple[str, np.ndarray]] = []
+        self.current_start_s = 0.0
+        self.current_stop_s = 1.0
+        self.selected_channels: set[str] = set()
+        self.raster_window_start_s = 0.0
+        self.raster_window_s = 5.0
+        self.map_state = {}
+        self.map_selector = None
+        self.map_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self.map_selected_electrode: str | None = None
+        self.position_lookup, self.electrode_positions = _channel_map_positions(self.channel_map)
+        self.channel_to_electrode_cache: dict[str, str | None] = {}
+        self.electrode_to_channels_cache: dict[str, list[str]] = {}
 
         self._setup_database_table()
-        self._set_records(records)
+        self.table.itemSelectionChanged.connect(self._active_file_changed)
 
-        controls_frame = QFrame()
-        controls_frame.setObjectName("Panel")
-        controls = QGridLayout(controls_frame)
-        controls.setContentsMargins(12, 10, 12, 10)
-        controls.setHorizontalSpacing(10)
-        controls.setVerticalSpacing(8)
-        controls.addWidget(QLabel("Basic function"), 0, 0)
-        controls.addWidget(self.analysis_type, 0, 1)
-        controls.addWidget(QLabel("Time windows"), 0, 2)
-        controls.addWidget(self.time_windows, 0, 3, 1, 3)
-        controls.addWidget(QLabel("Channels"), 1, 0)
-        controls.addWidget(self.channels, 1, 1, 1, 5)
-        controls.addWidget(QLabel("Name"), 2, 0)
-        controls.addWidget(self.dataset_name, 2, 1, 1, 2)
-        controls.addWidget(QLabel("Plot"), 2, 3)
-        controls.addWidget(self.plot_mode, 2, 4)
-        controls.addWidget(QLabel("X values"), 3, 0)
-        controls.addWidget(self.x_values, 3, 1, 1, 2)
-        controls.addWidget(QLabel("X label"), 3, 3)
-        controls.addWidget(self.x_label, 3, 4)
-        controls.addWidget(QLabel("Y label"), 4, 3)
-        controls.addWidget(self.y_label, 4, 4)
-        note = QLabel("Results are saved into the processed-data database and can be plotted immediately.")
+        self.start_s = QDoubleSpinBox()
+        self.start_s.setRange(0.0, 1_000_000.0)
+        self.start_s.setDecimals(4)
+        self.start_s.setSingleStep(0.1)
+        self.start_s.setSuffix(" s")
+        self.start_s.valueChanged.connect(self._time_range_changed)
+        self.stop_s = QDoubleSpinBox()
+        self.stop_s.setRange(0.0, 1_000_000.0)
+        self.stop_s.setDecimals(4)
+        self.stop_s.setSingleStep(0.1)
+        self.stop_s.setSuffix(" s")
+        self.stop_s.valueChanged.connect(self._time_range_changed)
+        self.channels_text = QLineEdit()
+        self.channels_text.setPlaceholderText("blank = all selected; e.g. chan1, chan2")
+        self.channels_text.returnPressed.connect(self._apply_manual_channels)
+        self.dataset_name = QLineEdit()
+        self.dataset_name.setPlaceholderText("optional dataset prefix")
+        self.box_select = QCheckBox("Box select")
+        self.box_select.setToolTip("When enabled, drag on the channel map. Left drag selects; right drag removes.")
+        self.box_select.toggled.connect(self._sync_map_selector)
+
+        self.channel_table = QTableWidget(0, 3)
+        self.channel_table.setHorizontalHeaderLabels(["Use", "Channel", "Spikes"])
+        self.channel_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.channel_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.channel_table.itemChanged.connect(self._channel_item_changed)
+
+        self.open_main_raster_button = QPushButton("Open Main Raster")
+        self.open_main_raster_button.setToolTip("Open the selected source file in the main Raw Data Raster window.")
+        self.open_main_raster_button.clicked.connect(self._open_main_raster)
+
+        self.map_canvas = FigureCanvas(Figure(figsize=(3.8, 3.8), tight_layout=True))
+        self.map_ax = self.map_canvas.figure.add_subplot(111)
+        self.map_canvas.mpl_connect("button_press_event", self._map_clicked)
+        self.map_canvas.mpl_connect("scroll_event", self._map_scrolled)
+        self.map_info = QLabel("")
+        self.map_info.setObjectName("MutedText")
+        self.map_info.setWordWrap(True)
+
+        all_button = QPushButton("All channels")
+        all_button.clicked.connect(self._select_all_channels)
+        clear_button = QPushButton("Clear channels")
+        clear_button.clicked.connect(self._clear_channels)
+        reset_map_button = QPushButton("Reset map view")
+        reset_map_button.clicked.connect(self._reset_map_view)
+        apply_channels = QPushButton("Apply text")
+        apply_channels.clicked.connect(self._apply_manual_channels)
+
+        params = QFrame()
+        params.setObjectName("Panel")
+        params_layout = QGridLayout(params)
+        params_layout.setContentsMargins(10, 10, 10, 10)
+        params_layout.setHorizontalSpacing(8)
+        params_layout.setVerticalSpacing(6)
+        params_layout.addWidget(QLabel("Start"), 0, 0)
+        params_layout.addWidget(self.start_s, 0, 1)
+        params_layout.addWidget(QLabel("End"), 0, 2)
+        params_layout.addWidget(self.stop_s, 0, 3)
+        params_layout.addWidget(QLabel("Name"), 1, 0)
+        params_layout.addWidget(self.dataset_name, 1, 1, 1, 3)
+        params_layout.addWidget(QLabel("Channels"), 2, 0)
+        params_layout.addWidget(self.channels_text, 2, 1, 1, 2)
+        params_layout.addWidget(apply_channels, 2, 3)
+
+        channel_buttons = QHBoxLayout()
+        channel_buttons.addWidget(all_button)
+        channel_buttons.addWidget(clear_button)
+        channel_buttons.addWidget(reset_map_button)
+        channel_buttons.addWidget(self.box_select)
+        channel_buttons.addStretch(1)
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Files"))
+        left.addWidget(self.table, 2)
+        left.addWidget(params)
+        left.addWidget(self.open_main_raster_button)
+        left.addLayout(channel_buttons)
+        left.addWidget(self.channel_table, 3)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Channel map"))
+        right.addWidget(self.map_canvas, 1)
+        right.addWidget(self.map_info)
+
+        body = QHBoxLayout()
+        body.addLayout(left, 3)
+        body.addLayout(right, 2)
+
+        note = QLabel(
+            "Select one or more files, define the time segment, then choose channels from text, table, or channel map. "
+            "Use Open Main Raster when you need the full raster interaction window. "
+            "The raw selection and feature data will be saved to the processed-data database."
+        )
         note.setObjectName("MutedText")
         note.setWordWrap(True)
-        controls.addWidget(note, 4, 0, 1, 3)
-
-        intro = QLabel(
-            "Build a custom dataset from loaded files by choosing files, channels, and time windows, "
-            "then run a basic analysis function such as firing-rate vectorization."
-        )
-        intro.setObjectName("MutedText")
-        intro.setWordWrap(True)
-
-        analyze = QPushButton("Run Custom Analysis")
-        analyze.setObjectName("PrimaryButton")
-        analyze.clicked.connect(self.accept)
+        run = QPushButton("Save Selection + Analyze")
+        run.setObjectName("PrimaryButton")
+        run.clicked.connect(self.accept)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         buttons.addWidget(cancel)
-        buttons.addWidget(analyze)
+        buttons.addWidget(run)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(intro)
-        layout.addWidget(controls_frame)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(note)
+        layout.addLayout(body, 1)
         layout.addLayout(buttons)
+        self.table.blockSignals(True)
+        self._set_records(records)
+        self.table.blockSignals(False)
+        self._active_file_changed()
         _fix_spinbox_hit_targets(self)
 
-    def _set_records(self, records) -> None:
-        super()._set_records(records)
+    def _active_record(self) -> dict | None:
+        rows = self._selected_rows()
+        row = rows[0] if rows else 0
+        if 0 <= row < len(self.records):
+            return self.records[row]
+        return None
+
+    def _active_file_changed(self) -> None:
+        record = self._active_record()
+        data = (record or {}).get("raw_data") if isinstance(record, dict) else None
+        if not isinstance(data, UnifiedMEAData):
+            self.current_spike_series = []
+            self.selected_channels = set()
+            self._refresh_channels()
+            self._refresh_map()
+            return
+        self.current_spike_series = [(str(label), np.asarray(times, dtype=float)) for label, times in _spike_series_from_unified(data)]
+        self._rebuild_channel_map_lookup()
+        start_s, stop_s = data.time_range()
+        if stop_s <= start_s:
+            finite = [times for _label, times in self.current_spike_series if np.asarray(times).size]
+            stop_s = max((float(np.nanmax(values)) for values in finite), default=start_s + 1.0)
+        stop_s = max(float(stop_s), float(start_s) + 0.001)
+        self.current_start_s = float(start_s)
+        self.current_stop_s = float(stop_s)
+        self.start_s.blockSignals(True)
+        self.stop_s.blockSignals(True)
+        self.start_s.setMaximum(max(float(stop_s), self.start_s.maximum()))
+        self.stop_s.setMaximum(max(float(stop_s), self.stop_s.maximum()))
+        self.start_s.setValue(float(start_s))
+        self.stop_s.setValue(float(stop_s))
+        self.start_s.blockSignals(False)
+        self.stop_s.blockSignals(False)
+        self.selected_channels = {str(label) for label, _times in self.current_spike_series}
+        self.raster_window_start_s = float(start_s)
+        self.raster_window_s = min(5.0, max(0.01, float(stop_s) - float(start_s)))
+        self.channels_text.setText("")
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _rebuild_channel_map_lookup(self) -> None:
+        self.channel_to_electrode_cache = {}
+        self.electrode_to_channels_cache = {}
+        for label, _times in self.current_spike_series:
+            found = _position_for_channel(label, self.position_lookup)
+            electrode = str(found[2]) if found is not None else None
+            self.channel_to_electrode_cache[str(label)] = electrode
+            if electrode is not None:
+                self.electrode_to_channels_cache.setdefault(electrode, []).append(str(label))
+
+    def _time_range_changed(self) -> None:
+        if float(self.stop_s.value()) <= float(self.start_s.value()):
+            return
+        self.current_start_s = float(self.start_s.value())
+        self.current_stop_s = float(self.stop_s.value())
+        self.raster_window_start_s = float(self.start_s.value())
+        self.raster_window_s = min(5.0, max(0.01, float(self.stop_s.value()) - float(self.start_s.value())))
+
+    def _refresh_channels(self) -> None:
+        self.channel_table.blockSignals(True)
+        self.channel_table.setRowCount(len(self.current_spike_series))
+        selected = set(self.selected_channels)
+        for row, (label, times) in enumerate(self.current_spike_series):
+            use_item = QTableWidgetItem("")
+            use_item.setFlags(use_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            use_item.setCheckState(Qt.CheckState.Checked if str(label) in selected else Qt.CheckState.Unchecked)
+            use_item.setData(Qt.ItemDataRole.UserRole, str(label))
+            self.channel_table.setItem(row, 0, use_item)
+            self.channel_table.setItem(row, 1, QTableWidgetItem(str(label)))
+            self.channel_table.setItem(row, 2, QTableWidgetItem(str(int(np.asarray(times).size))))
+        self.channel_table.resizeColumnsToContents()
+        self.channel_table.blockSignals(False)
+
+    def _channel_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is None or item.column() != 0:
+            return
+        label = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not label:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self.selected_channels.add(label)
+        else:
+            self.selected_channels.discard(label)
+        self._sync_channel_text_from_selection()
+        self._refresh_map()
+
+    def _selected_channel_series(self) -> list[tuple[str, np.ndarray]]:
+        selected = set(self.selected_channels)
+        return [(label, times) for label, times in self.current_spike_series if str(label) in selected]
+
+    def _sync_channel_text_from_selection(self) -> None:
+        all_channels = {str(label) for label, _times in self.current_spike_series}
+        if self.selected_channels == all_channels:
+            self.channels_text.setText("")
+        else:
+            self.channels_text.setText(", ".join(sorted(self.selected_channels, key=_natural_sort_key)))
+
+    def _select_all_channels(self) -> None:
+        self.selected_channels = {str(label) for label, _times in self.current_spike_series}
+        self._sync_channel_text_from_selection()
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _clear_channels(self) -> None:
+        self.selected_channels = set()
+        self._sync_channel_text_from_selection()
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _apply_manual_channels(self) -> None:
+        text = self.channels_text.text().strip()
+        if not text:
+            self._select_all_channels()
+            return
+        requested = {normalize_channel_name(token) for token in re.split(r"[,;\s]+", text) if token.strip()}
+        selected = set()
+        for label, _times in self.current_spike_series:
+            keys = {
+                normalize_channel_name(str(label)),
+                normalize_channel_name(_base_channel_from_raster_label(str(label))),
+            }
+            if keys & requested:
+                selected.add(str(label))
+        self.selected_channels = selected
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _channel_to_electrode(self, channel: str) -> str | None:
+        return self.channel_to_electrode_cache.get(str(channel))
+
+    def _refresh_map(self) -> None:
+        recording = []
+        metrics = {}
+        start = float(self.start_s.value()) if hasattr(self, "start_s") else self.current_start_s
+        stop = max(start + 0.001, float(self.stop_s.value()) if hasattr(self, "stop_s") else self.current_stop_s)
+        for label, times in self.current_spike_series:
+            electrode = self._channel_to_electrode(label)
+            if electrode is None:
+                continue
+            recording.append(electrode)
+            values = np.asarray(times, dtype=float)
+            count = int(np.count_nonzero((values >= start) & (values < stop)))
+            metrics[electrode] = {"channel": label, "spike_count": count, "firing_rate_hz": count / max(stop - start, 1e-9)}
+        selected_electrodes = [self._channel_to_electrode(label) for label in self.selected_channels]
+        selected_electrodes = [item for item in selected_electrodes if item]
+        self.map_state = draw_maxwell_channel_map(
+            self.map_ax,
+            self.channel_map,
+            recording_electrodes=recording,
+            stimulation_electrodes=selected_electrodes,
+            electrode_metrics=metrics,
+            selected_electrode=self.map_selected_electrode,
+            title="Channel map selection",
+        )
+        if self.map_view_limits is not None:
+            (xlim, ylim) = self.map_view_limits
+            self.map_ax.set_xlim(float(xlim[0]), float(xlim[1]))
+            self.map_ax.set_ylim(float(ylim[0]), float(ylim[1]))
+        self.map_canvas.draw_idle()
+        self._sync_map_selector()
+
+    def _map_scrolled(self, event) -> None:
+        if event is None or event.inaxes is not self.map_ax or event.xdata is None or event.ydata is None:
+            return
+        try:
+            step = float(getattr(event, "step", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            step = 0.0
+        button = str(getattr(event, "button", "") or "").lower()
+        zoom_in = step > 0 or button == "up"
+        factor = 0.82 if zoom_in else 1.22
+        x0, x1 = map(float, self.map_ax.get_xlim())
+        y0, y1 = map(float, self.map_ax.get_ylim())
+        cx = float(event.xdata)
+        cy = float(event.ydata)
+        new_x = self._zoom_axis_limits(x0, x1, cx, factor)
+        new_y = self._zoom_axis_limits(y0, y1, cy, factor)
+        self.map_ax.set_xlim(*new_x)
+        self.map_ax.set_ylim(*new_y)
+        self.map_view_limits = (tuple(new_x), tuple(new_y))
+        self.map_canvas.draw_idle()
+
+    @staticmethod
+    def _zoom_axis_limits(lo: float, hi: float, anchor: float, factor: float) -> tuple[float, float]:
+        if not np.isfinite([lo, hi, anchor, factor]).all() or hi == lo:
+            return (lo, hi)
+        span = max(0.02, abs(hi - lo) * max(0.2, float(factor)))
+        direction = 1.0 if hi >= lo else -1.0
+        low, high = (lo, hi) if lo <= hi else (hi, lo)
+        fraction = (anchor - low) / max(high - low, 1e-12)
+        fraction = min(1.0, max(0.0, fraction))
+        new_low = anchor - span * fraction
+        new_high = new_low + span
+        if direction >= 0:
+            return (new_low, new_high)
+        return (new_high, new_low)
+
+    def _reset_map_view(self) -> None:
+        self.map_view_limits = None
+        self._refresh_map()
+
+    def _nearest_map_electrode(self, event) -> str | None:
+        if event.inaxes is not self.map_ax or event.xdata is None or event.ydata is None:
+            return None
+        best = None
+        best_dist = 0.035
+        for point in list(self.map_state.get("point_lookup", [])):
+            dx = float(point.get("x", 0.0)) - float(event.xdata)
+            dy = float(point.get("y", 0.0)) - float(event.ydata)
+            dist = float((dx * dx + dy * dy) ** 0.5)
+            if dist <= best_dist:
+                best = str(point.get("electrode", ""))
+                best_dist = dist
+        return best or None
+
+    def _channels_for_electrode(self, electrode: str) -> list[str]:
+        return list(self.electrode_to_channels_cache.get(str(electrode), []))
+
+    def _map_clicked(self, event) -> None:
+        if bool(self.box_select.isChecked()) and int(getattr(event, "button", 0) or 0) in {1, 3}:
+            return
+        electrode = self._nearest_map_electrode(event)
+        if electrode is None:
+            return
+        self.map_selected_electrode = str(electrode)
+        labels = self._channels_for_electrode(electrode)
+        action = "remove" if int(getattr(event, "button", 1) or 1) == 3 else "add"
+        changed = self._apply_map_channel_selection(labels, action)
+        action_text = "removed" if action == "remove" else "selected"
+        self.map_info.setText(f"{electrode}: {action_text} {changed} channel(s)")
+        self._sync_channel_text_from_selection()
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _apply_map_channel_selection(self, labels, action: str) -> int:
+        before = set(self.selected_channels)
+        if str(action or "add") == "remove":
+            for label in labels:
+                self.selected_channels.discard(str(label))
+        else:
+            for label in labels:
+                self.selected_channels.add(str(label))
+        after = set(self.selected_channels)
+        return len(before.symmetric_difference(after))
+
+    @staticmethod
+    def _selector_event_button(start_event, stop_event) -> int:
+        for event in (start_event, stop_event):
+            button = getattr(event, "button", None)
+            if button is None:
+                continue
+            try:
+                return int(button)
+            except (TypeError, ValueError):
+                continue
+        return 1
+
+    def _sync_map_selector(self) -> None:
+        if not hasattr(self, "map_ax"):
+            return
+        enabled = bool(self.box_select.isChecked())
+        if enabled and self.map_selector is None:
+            self.map_selector = RectangleSelector(
+                self.map_ax,
+                self._map_box_selected,
+                useblit=False,
+                button=[1, 3],
+                minspanx=0.01,
+                minspany=0.01,
+                interactive=False,
+            )
+        if self.map_selector is not None:
+            self.map_selector.set_active(enabled)
+
+    def _map_box_selected(self, start_event, stop_event) -> None:
+        if start_event.xdata is None or stop_event.xdata is None or start_event.ydata is None or stop_event.ydata is None:
+            return
+        x0, x1 = sorted([float(start_event.xdata), float(stop_event.xdata)])
+        y0, y1 = sorted([float(start_event.ydata), float(stop_event.ydata)])
+        labels = []
+        for point in list(self.map_state.get("point_lookup", [])):
+            x = float(point.get("x", 0.0))
+            y = float(point.get("y", 0.0))
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                labels.extend(self._channels_for_electrode(str(point.get("electrode", ""))))
+        action = "remove" if self._selector_event_button(start_event, stop_event) == 3 else "add"
+        changed = self._apply_map_channel_selection(labels, action)
+        action_text = "removed" if action == "remove" else "selected"
+        self.map_info.setText(f"Box {action_text} {changed} channel(s)")
+        self._sync_channel_text_from_selection()
+        self._refresh_channels()
+        self._refresh_map()
+
+    def _open_main_raster(self) -> None:
+        if self.open_main_raster_callback is None:
+            return
+        paths = self._selected_paths()
+        path = paths[0] if paths else str((self._active_record() or {}).get("path", ""))
+        if path:
+            self.open_main_raster_callback(path)
 
     def values(self) -> tuple[list[str], dict]:
+        channels = sorted(self.selected_channels, key=_natural_sort_key)
         return self._selected_paths(), {
             "analysis_kind": "custom_basic",
-            "analysis_type": str(self.analysis_type.currentData() or "firing_rate_vector"),
-            "time_windows": self.time_windows.text().strip(),
-            "channels": self.channels.text().strip(),
+            "analysis_type": self.analysis_type,
+            "time_windows": f"{float(self.start_s.value()):g}-{float(self.stop_s.value()):g}",
+            "channels": ", ".join(channels),
             "display_name": self.dataset_name.text().strip(),
-            "x_values": self.x_values.text().strip(),
-            "x_label": self.x_label.text().strip() or "Time window",
-            "y_label": self.y_label.text().strip(),
-            "plot_mode": str(self.plot_mode.currentData() or "auto"),
+            "x_values": "",
+            "x_label": "Selected segment",
+            "y_label": "Firing rate (Hz)" if self.analysis_type == "firing_rate_vector" else "Spike count",
+            "plot_mode": "auto",
+            "custom_stage": "manual_selection",
         }
+
+
+class CustomPlotDialog(AppDialog):
+    def __init__(self, records, parent=None, save_extracted_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Plot")
+        self.resize(1180, 680)
+        self.records = list(records or [])
+        self.save_extracted_callback = save_extracted_callback
+        self.current_records: list[dict] = []
+        self.current_parameters: dict = {}
+        self.y_data_combos: list[QComboBox] = []
+
+        self.x_mode = NoWheelComboBox()
+        self.x_mode.addItem("Auto", "auto")
+        self.x_mode.addItem("Channel / feature labels", "features")
+        self.x_mode.addItem("Sample labels", "sample_labels")
+        self.x_mode.addItem("Generated start + step", "generated")
+        self.x_mode.addItem("Manual numeric values", "manual")
+        self.x_mode.currentIndexChanged.connect(self._update_x_controls)
+        self.x_values = QLineEdit()
+        self.x_values.setPlaceholderText("only used by Manual; e.g. 0, 10, 20")
+        self.x_start = QDoubleSpinBox()
+        self.x_start.setRange(-1_000_000.0, 1_000_000.0)
+        self.x_start.setDecimals(6)
+        self.x_start.setValue(1.0)
+        self.x_step = QDoubleSpinBox()
+        self.x_step.setRange(-1_000_000.0, 1_000_000.0)
+        self.x_step.setDecimals(6)
+        self.x_step.setValue(1.0)
+        self.x_step.setSingleStep(1.0)
+        self.x_label = QLineEdit()
+        self.x_label.setPlaceholderText("blank = auto")
+        self.y_label = QLineEdit("Value")
+        self.plot_mode = NoWheelComboBox()
+        self.plot_mode.addItem("Auto", "auto")
+        self.plot_mode.addItem("Line", "line")
+        self.plot_mode.addItem("Bar", "bar")
+        self.canvas = FigureCanvas(Figure(figsize=(7.2, 5.2), constrained_layout=True))
+        self.canvas.setMinimumSize(520, 420)
+        self.summary = QLabel("Select data and click Plot.")
+        self.summary.setObjectName("MutedText")
+
+        plot = QPushButton("Plot")
+        plot.setObjectName("PrimaryButton")
+        plot.clicked.connect(self._draw_preview)
+        save_plot = QPushButton("Save Plot")
+        save_plot.clicked.connect(self._save_plot)
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(save_plot)
+        buttons.addWidget(close)
+        buttons.addWidget(plot)
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Plot"))
+        top.addWidget(self.plot_mode)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        plot_grid = QGridLayout()
+        plot_grid.setColumnStretch(0, 0)
+        plot_grid.setColumnStretch(1, 1)
+        plot_grid.setRowStretch(0, 1)
+        y_panel = QFrame()
+        y_panel.setObjectName("Panel")
+        y_panel.setMaximumWidth(230)
+        y_panel.setMinimumWidth(190)
+        y_layout = QVBoxLayout(y_panel)
+        y_layout.setContentsMargins(8, 8, 8, 8)
+        y_layout.setSpacing(6)
+        y_layout.addWidget(QLabel("Y label"))
+        y_layout.addWidget(self.y_label)
+        y_layout.addWidget(QLabel("Y data"))
+        self.y_data_container = QVBoxLayout()
+        self.y_data_container.setSpacing(6)
+        y_layout.addLayout(self.y_data_container)
+        add_y = QPushButton("New Y data")
+        add_y.clicked.connect(self._add_y_data_combo)
+        y_layout.addWidget(add_y)
+        y_layout.addStretch(1)
+        canvas_column = QVBoxLayout()
+        canvas_column.addWidget(self.summary)
+        canvas_column.addWidget(self.canvas, 1)
+        x_panel = QFrame()
+        x_panel.setObjectName("Panel")
+        x_layout = QGridLayout(x_panel)
+        x_layout.setContentsMargins(10, 10, 10, 10)
+        x_layout.setHorizontalSpacing(8)
+        x_layout.setVerticalSpacing(6)
+        self.x_start_label = QLabel("X start")
+        self.x_step_label = QLabel("X step")
+        self.x_values_label = QLabel("Manual X")
+        x_layout.addWidget(QLabel("X label"), 0, 0)
+        x_layout.addWidget(self.x_label, 0, 1)
+        x_layout.addWidget(QLabel("X data"), 0, 2)
+        x_layout.addWidget(self.x_mode, 0, 3)
+        x_layout.addWidget(self.x_start_label, 1, 2)
+        x_layout.addWidget(self.x_start, 1, 3)
+        x_layout.addWidget(self.x_step_label, 2, 2)
+        x_layout.addWidget(self.x_step, 2, 3)
+        x_layout.addWidget(self.x_values_label, 2, 0)
+        x_layout.addWidget(self.x_values, 2, 1)
+        canvas_column.addWidget(x_panel)
+        canvas_column.addLayout(buttons)
+        plot_grid.addWidget(y_panel, 0, 0)
+        plot_grid.addLayout(canvas_column, 0, 1)
+        layout.addLayout(plot_grid, 1)
+        self._add_y_data_combo()
+        self._update_x_controls()
+        _fix_spinbox_hit_targets(self)
+
+    def _update_x_controls(self) -> None:
+        mode = str(self.x_mode.currentData() or "auto")
+        show_generated = mode == "generated"
+        show_manual = mode == "manual"
+        self.x_start.setVisible(show_generated)
+        self.x_step.setVisible(show_generated)
+        self.x_values.setVisible(show_manual)
+        if hasattr(self, "x_start_label"):
+            self.x_start_label.setVisible(show_generated)
+        if hasattr(self, "x_step_label"):
+            self.x_step_label.setVisible(show_generated)
+        if hasattr(self, "x_values_label"):
+            self.x_values_label.setVisible(show_manual)
+
+    def _form_label_for_widget(self, widget: QWidget):
+        def walk(layout):
+            if layout is None:
+                return None
+            if isinstance(layout, QFormLayout):
+                for row in range(layout.rowCount()):
+                    field = layout.itemAt(row, QFormLayout.ItemRole.FieldRole)
+                    if field is not None and field.widget() is widget:
+                        label = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                        return label.widget() if label is not None else None
+            for item_index in range(layout.count()):
+                item = layout.itemAt(item_index)
+                if item is None:
+                    continue
+                found = walk(item.layout())
+                if found is not None:
+                    return found
+                child = item.widget()
+                if child is not None and child.layout() is not None:
+                    found = walk(child.layout())
+                    if found is not None:
+                        return found
+            return None
+
+        return walk(self.layout())
+
+    def _clear_layout(self, layout: QLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            nested = item.layout() if item is not None else None
+            if nested is not None:
+                self._clear_layout(nested)
+            if widget is not None:
+                widget.deleteLater()
+
+    def _add_y_data_combo(self, selected_key: str | None = None) -> None:
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        label = QLabel(f"Y data{len(self.y_data_combos) + 1}")
+        label.setFixedWidth(48)
+        combo = NoWheelComboBox()
+        combo.setMinimumWidth(92)
+        combo.setMaximumWidth(140)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(8)
+        remove = QPushButton("-")
+        remove.setFixedWidth(24)
+        remove.clicked.connect(lambda _checked=False, combo=combo: self._remove_y_data_combo(combo))
+        row_layout.addWidget(label)
+        row_layout.addWidget(combo, 1)
+        row_layout.addWidget(remove)
+        self.y_data_container.addLayout(row_layout)
+        self.y_data_combos.append(combo)
+        self._fill_y_data_combo(combo, selected_key)
+        self._renumber_y_data_rows()
+
+    def _remove_y_data_combo(self, combo: QComboBox) -> None:
+        if len(self.y_data_combos) <= 1:
+            return
+        old_keys = [str(existing.currentData() or "all_features") for existing in self.y_data_combos if existing is not combo]
+        self._clear_layout(self.y_data_container)
+        self.y_data_combos = []
+        for key in old_keys:
+            self._add_y_data_combo(key)
+        self._renumber_y_data_rows()
+
+    def _fill_y_data_combo(self, combo: QComboBox, selected_key: str | None = None) -> None:
+        current = str(selected_key or combo.currentData() or "")
+        combo.blockSignals(True)
+        combo.clear()
+        for key, label in _custom_plot_dataset_y_options(self.records):
+            combo.addItem(label, key)
+            item_index = combo.count() - 1
+            combo.setItemData(item_index, label, Qt.ItemDataRole.ToolTipRole)
+        if combo.count() == 0:
+            combo.addItem("No Y data", "")
+        target = current or "all_features"
+        index = combo.findData(target)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _refresh_y_data_options(self) -> None:
+        keys = [str(combo.currentData() or "all_features") for combo in self.y_data_combos] or ["all_features"]
+        for combo, key in zip(self.y_data_combos, keys):
+            self._fill_y_data_combo(combo, key)
+
+    def _renumber_y_data_rows(self) -> None:
+        for index in range(self.y_data_container.count()):
+            row = self.y_data_container.itemAt(index)
+            nested = row.layout() if row is not None else None
+            if nested is None or nested.count() == 0:
+                continue
+            label = nested.itemAt(0).widget()
+            if isinstance(label, QLabel):
+                label.setText(f"Y data{index + 1}")
+
+    def selected_records(self) -> list[dict]:
+        return [dict(record) for record in self.records]
+
+    def values(self) -> dict:
+        return {
+            "x_mode": str(self.x_mode.currentData() or "auto"),
+            "x_values": self.x_values.text().strip(),
+            "x_start": float(self.x_start.value()),
+            "x_step": float(self.x_step.value()),
+            "x_label": self.x_label.text().strip(),
+            "y_label": self.y_label.text().strip() or "Value",
+            "plot_mode": str(self.plot_mode.currentData() or "auto"),
+            "sample_filter": "",
+            "feature_filter": "",
+            "save_extracted": False,
+            "extracted_name": "",
+            "y_data_keys": [str(combo.currentData() or "") for combo in self.y_data_combos if str(combo.currentData() or "")],
+            "plot_style": "multi_y",
+        }
+
+    def _draw_preview(self) -> None:
+        records = self.selected_records()
+        if not records:
+            _show_info_message(self, "Custom Plot", "Select at least one processed dataset.")
+            return
+        parameters = self.values()
+        self.current_records = records
+        self.current_parameters = parameters
+        self.summary.setText(f"Plotted datasets: {len(records)}")
+        plotted = _draw_custom_plot_figure(self.canvas.figure, records, parameters)
+        self.summary.setText(self.summary.text().replace(f"Plotted datasets: {len(records)}", f"Plotted datasets: {plotted}"))
+        self.canvas.draw_idle()
+
+    def _save_plot(self) -> None:
+        if not self.canvas.figure.axes:
+            self._draw_preview()
+        path, _ = QFileDialog.getSaveFileName(self, "Save custom plot", "custom_plot.png", "PNG image (*.png);;PDF (*.pdf);;All files (*)")
+        if not path:
+            return
+        self.canvas.figure.savefig(path, dpi=180)
+        _show_info_message(self, "Custom Plot", f"Saved plot: {path}")
+
+
+class CustomPlotWindow(AppDialog):
+    def __init__(self, records, parameters: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Plot Result")
+        self.resize(1120, 760)
+        self.records = list(records or [])
+        self.parameters = dict(parameters or {})
+        self.canvas = FigureCanvas(Figure(figsize=(10.5, 7.0), constrained_layout=True))
+        self.summary = QLabel("")
+        self.summary.setObjectName("MutedText")
+        save = QPushButton("Save Plot")
+        save.clicked.connect(self._save_plot)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(save)
+        buttons.addWidget(close)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.summary)
+        layout.addWidget(self.canvas, 1)
+        layout.addLayout(buttons)
+        self._draw()
+
+    def _draw(self) -> None:
+        plotted = _draw_custom_plot_figure(self.canvas.figure, self.records, self.parameters)
+        self.summary.setText(f"Plotted datasets: {plotted}")
+        self.canvas.draw_idle()
+
+    def _save_plot(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save custom plot", "custom_plot.png", "PNG image (*.png);;PDF (*.pdf);;All files (*)")
+        if not path:
+            return
+        self.canvas.figure.savefig(path, dpi=180)
+        _show_info_message(self, "Custom Plot", f"Saved plot: {path}")
 
 
 class StimulusResponseInputDialog(AppDialog):
@@ -5286,11 +6464,11 @@ class MultiFileFactorAnalysisInputDialog(AppDialog):
         self.window_ms.setDecimals(1)
         self.window_ms.setValue(300.0)
         self.window_ms.setSuffix(" ms")
-        self.analysis_scope = QComboBox()
+        self.analysis_scope = NoWheelComboBox()
         self.analysis_scope.addItem("Bursts", "burst")
         self.analysis_scope.addItem("All data windows", "all_windows")
         self.analysis_scope.setToolTip("Use detected bursts, or split each file into non-overlapping windows.")
-        self.normalize = QComboBox()
+        self.normalize = NoWheelComboBox()
         self.normalize.addItem("Channel z-score", "channel_zscore")
         self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
         self.normalize.addItem("Per time total", "per_time_total")
@@ -5545,9 +6723,9 @@ class StimulusResponseWindow(AppDialog):
         self.status = QLabel()
         self.status.setObjectName("MutedText")
         self.status.setWordWrap(True)
-        self.left_file_combo = QComboBox()
+        self.left_file_combo = NoWheelComboBox()
         self.left_file_combo.setObjectName("StimulusLeftFile")
-        self.right_file_combo = QComboBox()
+        self.right_file_combo = NoWheelComboBox()
         self.right_file_combo.setObjectName("StimulusRightFile")
         self.left_file_combo.currentIndexChanged.connect(lambda _index: self._file_changed("left"))
         self.right_file_combo.currentIndexChanged.connect(lambda _index: self._file_changed("right"))
@@ -5560,7 +6738,7 @@ class StimulusResponseWindow(AppDialog):
         self.display_window_ms.setSuffix(" ms")
         self.display_window_ms.valueChanged.connect(lambda *_: self._draw_rasters())
         self.display_window_ms.setToolTip("Visible raster window. Default shows pre-stimulus and post-stimulus together.")
-        self.row_order_combo = QComboBox()
+        self.row_order_combo = NoWheelComboBox()
         self.row_order_combo.addItem("Local response", "local_response")
         self.row_order_combo.addItem("Electrode sequence", "electrode")
         self.row_order_combo.currentIndexChanged.connect(lambda *_: self._draw_rasters())
@@ -5650,7 +6828,7 @@ class StimulusResponseWindow(AppDialog):
         display_window.setSuffix(" ms")
         display_window.setToolTip("Visible time span on the raster. Typically set to cover pre + after response.")
 
-        row_order = QComboBox()
+        row_order = NoWheelComboBox()
         row_order.addItem("Local response", "local_response")
         row_order.addItem("Electrode sequence", "electrode")
         row_order.setCurrentIndex(row_order.findData(self.row_order_combo.currentData()))
@@ -6144,9 +7322,9 @@ class StimulusPSTHWindow(AppDialog):
         self.setWindowTitle("Stimulus PSTH")
         self.resize(1180, 760)
 
-        self.left_file_combo = QComboBox()
-        self.right_file_combo = QComboBox()
-        self.channel_combo = QComboBox()
+        self.left_file_combo = NoWheelComboBox()
+        self.right_file_combo = NoWheelComboBox()
+        self.channel_combo = NoWheelComboBox()
         self.bin_ms = QDoubleSpinBox()
         self.bin_ms.setRange(0.1, 1000.0)
         self.bin_ms.setDecimals(1)
@@ -6324,8 +7502,8 @@ class StimulusActivationCurveWindow(AppDialog):
         self.setWindowTitle("Stimulus Activation Curve")
         self.resize(1120, 760)
 
-        self.site_combo = QComboBox()
-        self.channel_combo = QComboBox()
+        self.site_combo = NoWheelComboBox()
+        self.channel_combo = NoWheelComboBox()
         response_ms = max(1.0, float(payload.get("response_ms", 1.0)))
         artifact_ms = max(0.0, float(payload.get("artifact_ms", 0.0)))
         default_start = min(response_ms, max(1.0, artifact_ms))
@@ -6629,17 +7807,17 @@ class AutoSortingDialog(AppDialog):
         self.setWindowTitle("Auto Sorting")
         self.setMinimumWidth(520)
 
-        self.method = QComboBox()
+        self.method = NoWheelComboBox()
         self.method.addItem("Waveform clustering (NEV)")
         self.method.setEnabled(False)
 
-        self.reduction_method = QComboBox()
+        self.reduction_method = NoWheelComboBox()
         self.reduction_method.addItem("PCA", "pca")
         self.reduction_method.addItem("ICA", "ica")
         self.reduction_method.addItem("None (scaled waveform)", "none")
         self.reduction_method.currentIndexChanged.connect(self._update_parameter_visibility)
 
-        self.clustering_method = QComboBox()
+        self.clustering_method = NoWheelComboBox()
         self.clustering_method.addItem("KMeans", "kmeans")
         self.clustering_method.addItem("Gaussian Mixture", "gmm")
         self.clustering_method.addItem("Agglomerative", "agglomerative")
@@ -6670,7 +7848,7 @@ class AutoSortingDialog(AppDialog):
         self.min_spikes.setRange(2, 10000)
         self.min_spikes.setValue(25)
 
-        self.gmm_covariance_type = QComboBox()
+        self.gmm_covariance_type = NoWheelComboBox()
         self.gmm_covariance_type.addItems(["full", "tied", "diag", "spherical"])
 
         self.dbscan_eps = QDoubleSpinBox()
@@ -6774,7 +7952,7 @@ class MaxwellFootprintDialog(AppDialog):
         self.setWindowTitle("Maxwell Footprint Analysis")
         self.setMinimumWidth(520)
 
-        self.selection_preference = QComboBox()
+        self.selection_preference = NoWheelComboBox()
         self.selection_preference.addItem("Average Spike Amplitude", "amplitude")
         self.selection_preference.addItem("Firing Rate", "firing_rate")
 
@@ -6986,7 +8164,7 @@ class SettingsDialog(AppDialog):
         self.sampling_rate.setValue(config.sampling_rate)
         self.sampling_rate.setSuffix(" Hz")
 
-        self.filter_type = QComboBox()
+        self.filter_type = NoWheelComboBox()
         self.filter_type.addItems(["bandpass", "highpass", "lowpass", "none"])
         self.filter_type.setCurrentText(config.filter_type)
 
@@ -8574,7 +9752,7 @@ class ISIWindow(AppDialog):
         self.resize(760, 520)
         self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
         self.spike_lookup = {label: times for label, times in self.spike_series}
-        self.unit_combo = QComboBox()
+        self.unit_combo = NoWheelComboBox()
         self.unit_combo.addItems([label for label, _ in self.spike_series])
         self.unit_combo.currentIndexChanged.connect(self._draw)
         self.bin_ms = QSpinBox()
@@ -8846,18 +10024,18 @@ class BurstDelayWindow(AppDialog):
         self.max_map_pairs.setValue(30)
         self.max_map_pairs.valueChanged.connect(lambda *_: self._draw_channel_map())
 
-        self.delay_mode_combo = QComboBox()
+        self.delay_mode_combo = NoWheelComboBox()
         self.delay_mode_combo.addItem("Burst first spike", "burst_first")
         self.delay_mode_combo.addItem("Burst all spikes", "burst_all")
         self.delay_mode_combo.addItem("All spikes", "all_spikes")
         self.delay_mode_combo.currentIndexChanged.connect(self._mark_analysis_stale)
         self.delay_mode_combo.setToolTip("Delay definition. First spike is the strictest; all spikes is the most permissive.")
 
-        self.mode_combo = QComboBox()
+        self.mode_combo = NoWheelComboBox()
         self.mode_combo.addItem("Selected pair", "pair")
         self.mode_combo.currentIndexChanged.connect(self._draw_histogram)
 
-        self.map_pick_combo = QComboBox()
+        self.map_pick_combo = NoWheelComboBox()
         self.map_pick_combo.addItem("Source", "source")
         self.map_pick_combo.addItem("Target", "target")
 
@@ -8871,11 +10049,11 @@ class BurstDelayWindow(AppDialog):
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self._draw)
 
-        self.reference_combo = QComboBox()
+        self.reference_combo = NoWheelComboBox()
         self.reference_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("source"))
-        self.target_combo = QComboBox()
+        self.target_combo = NoWheelComboBox()
         self.target_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("target"))
-        self.raster_align_combo = QComboBox()
+        self.raster_align_combo = NoWheelComboBox()
         self.raster_align_combo.addItem("Burst onset", "onset")
         self.raster_align_combo.addItem("Source anchored", "source")
         self.raster_align_combo.currentIndexChanged.connect(self._draw_delay_raster)
@@ -10576,13 +11754,13 @@ class BurstTrajectoryWindow(AppDialog):
         self.window_ms.setValue(300)
         self.window_ms.setSuffix(" ms")
 
-        self.analysis_scope = QComboBox()
+        self.analysis_scope = NoWheelComboBox()
         self.analysis_scope.addItem("Bursts", "burst")
         self.analysis_scope.addItem("All data windows", "all_windows")
         self.analysis_scope.setToolTip("Use detected bursts, or split the whole recording into non-overlapping windows.")
         self.analysis_scope.currentIndexChanged.connect(lambda *_: self._update_settings_summary())
 
-        self.normalize = QComboBox()
+        self.normalize = NoWheelComboBox()
         self.normalize.addItem("Channel z-score", "channel_zscore")
         self.normalize.addItem("Log + channel z-score", "log_channel_zscore")
         self.normalize.addItem("Per time total", "per_time_total")
@@ -10590,7 +11768,7 @@ class BurstTrajectoryWindow(AppDialog):
         self.normalize.setToolTip("Preprocessing for the state vector before FA fitting.")
         self.normalize.currentIndexChanged.connect(lambda *_: self._update_settings_summary())
 
-        self.temporal_method = QComboBox()
+        self.temporal_method = NoWheelComboBox()
         self.temporal_method.addItem("Linear", "linear")
         self.temporal_method.addItem("RBF kernel ridge", "rbf")
         self.temporal_method.addItem("kNN local average", "knn")
@@ -10641,7 +11819,7 @@ class BurstTrajectoryWindow(AppDialog):
         }
 
         self.selected_burst_value = 1
-        self.display_param = QComboBox()
+        self.display_param = NoWheelComboBox()
         self.display_param.addItem("Burst", "burst")
         self.display_param.setToolTip("Select which burst the comparison views show.")
         self.display_value = QSpinBox()
@@ -10650,7 +11828,7 @@ class BurstTrajectoryWindow(AppDialog):
         self.display_param.currentIndexChanged.connect(lambda *_: self._update_settings_summary())
         self._display_param_changed()
 
-        self.rmse_order = QComboBox()
+        self.rmse_order = NoWheelComboBox()
         self.rmse_order.addItem("RMSE high to low", "desc")
         self.rmse_order.addItem("RMSE low to high", "asc")
         self.rmse_order.currentIndexChanged.connect(self._draw_all_views)
@@ -10864,7 +12042,7 @@ class BurstTrajectoryWindow(AppDialog):
 
         form = QFormLayout()
 
-        normalize_combo = QComboBox()
+        normalize_combo = NoWheelComboBox()
         for index in range(self.normalize.count()):
             normalize_combo.addItem(self.normalize.itemText(index), self.normalize.itemData(index))
         normalize_combo.setCurrentIndex(max(0, normalize_combo.findData(self.normalize.currentData())))
@@ -10876,7 +12054,7 @@ class BurstTrajectoryWindow(AppDialog):
         history_bins.setValue(int(self.history_bins.value()))
         history_bins.setToolTip("Number of previous latent-state bins used by the temporal model.")
 
-        rmse_order = QComboBox()
+        rmse_order = NoWheelComboBox()
         for index in range(self.rmse_order.count()):
             rmse_order.addItem(self.rmse_order.itemText(index), self.rmse_order.itemData(index))
         rmse_order.setCurrentIndex(max(0, rmse_order.findData(self.rmse_order.currentData())))
@@ -13124,7 +14302,7 @@ class MultiFileFactorAnalysisWindow(AppDialog):
         self.payload = payload if isinstance(payload, dict) else {}
         self.records = list(self.payload.get("records", []))
 
-        self.file_combo = QComboBox()
+        self.file_combo = NoWheelComboBox()
         for index, record in enumerate(self.records):
             label = f"{index + 1}. {record.get('condition') or record.get('file')}"
             self.file_combo.addItem(label, index)
@@ -13399,7 +14577,7 @@ class GenericAnalysisWindow(AppDialog):
         self.payload = payload if isinstance(payload, dict) else {}
         self.records = list(self.payload.get("records", []))
 
-        self.file_combo = QComboBox()
+        self.file_combo = NoWheelComboBox()
         for index, record in enumerate(self.records):
             label = f"{index + 1}. {record.get('condition') or record.get('file')}"
             self.file_combo.addItem(label, index)
@@ -13642,20 +14820,20 @@ class BurstClusteringWindow(AppDialog):
         self.cluster_count.valueChanged.connect(self._draw)
         self.cluster_count.valueChanged.connect(lambda *_: self._update_cluster_settings_summary())
 
-        self.reducer = QComboBox()
+        self.reducer = NoWheelComboBox()
         self.reducer.addItem("PCA", "pca")
         self.reducer.addItem("t-SNE", "tsne")
         self.reducer.currentIndexChanged.connect(self._draw)
         self.reducer.currentIndexChanged.connect(lambda *_: self._update_cluster_settings_summary())
 
-        self.normalize = QComboBox()
+        self.normalize = NoWheelComboBox()
         self.normalize.addItem("Per burst", "per_burst")
         self.normalize.addItem("Time-bin z-score", "unit_zscore")
         self.normalize.addItem("None", "none")
         self.normalize.currentIndexChanged.connect(self._draw)
         self.normalize.currentIndexChanged.connect(lambda *_: self._update_cluster_settings_summary())
 
-        self.trace_scale = QComboBox()
+        self.trace_scale = NoWheelComboBox()
         self.trace_scale.addItem("Shape (per burst peak)", "per_trace_peak")
         self.trace_scale.addItem("Log count", "log")
         self.trace_scale.addItem("Robust count", "robust")
@@ -13684,7 +14862,7 @@ class BurstClusteringWindow(AppDialog):
         self.recluster_clean_button.clicked.connect(self._recluster_clean_bursts)
         self.hide_noise = QCheckBox("Hide noise")
         self.hide_noise.stateChanged.connect(lambda *_: self._redraw_current())
-        self.cluster_filter = QComboBox()
+        self.cluster_filter = NoWheelComboBox()
         self.cluster_filter.currentIndexChanged.connect(lambda *_: self._redraw_current())
         self.undo_button = QPushButton("Undo")
         self.undo_button.clicked.connect(self._undo_manual_assignment)
@@ -13853,7 +15031,7 @@ class BurstClusteringWindow(AppDialog):
         window_field.setToolTip("Fixed burst window. Set to 0 to use each burst's native duration.")
         form.addRow("Analysis window", window_field)
 
-        trace_scale_field = QComboBox()
+        trace_scale_field = NoWheelComboBox()
         for index in range(self.trace_scale.count()):
             trace_scale_field.addItem(self.trace_scale.itemText(index), self.trace_scale.itemData(index))
         trace_scale_field.setCurrentIndex(max(0, trace_scale_field.findData(self.trace_scale.currentData())))
@@ -14132,7 +15310,7 @@ class BurstCorrelationWindow(AppDialog):
         self.selected_pair = None
         self.matrix_ax = None
 
-        self.method_combo = QComboBox()
+        self.method_combo = NoWheelComboBox()
         for label, key in [
             ("Global statistics", "global_stats"),
             ("Propagation latency", "latency"),
@@ -14218,7 +15396,7 @@ class BurstCorrelationWindow(AppDialog):
         self.embedding_bin_ms = self._double_spin(1.0, 100.0, 5.0, " ms")
         self.embedding_window_ms = self._spin(0, 5000, 0, " ms")
         self.embedding_count = self._spin(1, 20, 3, "")
-        self.embedding_reducer = QComboBox()
+        self.embedding_reducer = NoWheelComboBox()
         self.embedding_reducer.addItem("PCA", "pca")
         self.embedding_reducer.addItem("t-SNE", "tsne")
         self.embedding_reducer.currentIndexChanged.connect(self._draw)
@@ -14293,7 +15471,7 @@ class BurstCorrelationWindow(AppDialog):
         return field
 
     def _normalize_combo(self, current: str):
-        combo = QComboBox()
+        combo = NoWheelComboBox()
         combo.addItem("Per burst", "per_burst")
         combo.addItem("Unit z-score", "unit_zscore")
         combo.addItem("None", "none")
@@ -14667,7 +15845,7 @@ class SpikeRasterWindow(AppDialog):
         self.save_bursts_button.clicked.connect(self._save_bursts)
         self.export_heatmap_gif_button = QPushButton("Export GIF")
         self.export_heatmap_gif_button.clicked.connect(self._export_heatmap_gif)
-        self.raster_action_combo = QComboBox()
+        self.raster_action_combo = NoWheelComboBox()
         self.raster_action_combo.addItem("Choose action...", "")
         self.raster_action_combo.addItem("IBI", "ibi")
         self.raster_action_combo.addItem("ISI", "isi")
@@ -14682,7 +15860,7 @@ class SpikeRasterWindow(AppDialog):
 
         self.well_combo = None
         if self.channel_groups:
-            self.well_combo = QComboBox()
+            self.well_combo = NoWheelComboBox()
             self.well_combo.addItem("All wells", "")
             for well in sorted(self.channel_groups, key=_well_sort_key):
                 self.well_combo.addItem(str(well), str(well))
@@ -15870,7 +17048,7 @@ class SortingResultsWindow(AppDialog):
         self.setWindowTitle("Sorting Results")
         self.resize(1120, 760)
 
-        self.channel_combo = QComboBox()
+        self.channel_combo = NoWheelComboBox()
         self.sorted_channels = self._sorted_channels()
         self.channel_combo.addItems(self.sorted_channels)
         self.channel_combo.currentIndexChanged.connect(self._refresh_plots)
@@ -16013,7 +17191,7 @@ class MaxwellFootprintResultsWindow(AppDialog):
         self.setWindowTitle("Maxwell Footprint Analysis")
         self.resize(1400, 900)
 
-        self.unit_combo = QComboBox()
+        self.unit_combo = NoWheelComboBox()
         for neuron in result.get("units", result.get("neurons", [])):
             footprint = neuron.get("footprint", {})
             self.unit_combo.addItem(
@@ -16224,7 +17402,7 @@ class SortingWorkspaceWindow(AppDialog):
         self.analysis_windows = []
         self.dirty = False
 
-        self.channel_combo = QComboBox()
+        self.channel_combo = NoWheelComboBox()
         self.channel_combo.addItems(sorted(data.channels(), key=_channel_sort_key))
         self.channel_combo.currentIndexChanged.connect(self._load_channel)
 
@@ -16259,7 +17437,7 @@ class SortingWorkspaceWindow(AppDialog):
         self.noise_button.clicked.connect(self._start_noise_lasso)
         self.hide_noise = QCheckBox("Hide noise")
         self.hide_noise.stateChanged.connect(lambda *_: self._draw_all())
-        self.cluster_filter = QComboBox()
+        self.cluster_filter = NoWheelComboBox()
         self.cluster_filter.currentIndexChanged.connect(lambda *_: self._draw_all())
         self.undo_button = QPushButton("Undo")
         self.undo_button.clicked.connect(self._undo_manual_assignment)
@@ -16937,7 +18115,7 @@ class TemporalCouplingWindow(AppDialog):
         self.max_pairs.valueChanged.connect(self._resort_results)
         self.max_pairs.setToolTip("Maximum number of ranked directed pairs displayed.")
 
-        self.sort_by = QComboBox()
+        self.sort_by = NoWheelComboBox()
         for label, key in [
             ("Strength", "strength"),
             ("Match", "matched_ratio"),
@@ -16950,7 +18128,7 @@ class TemporalCouplingWindow(AppDialog):
         ]:
             self.sort_by.addItem(label, key)
         self.sort_by.currentIndexChanged.connect(self._resort_results)
-        self.sort_order = QComboBox()
+        self.sort_order = NoWheelComboBox()
         self.sort_order.addItem("High to low", "desc")
         self.sort_order.addItem("Low to high", "asc")
         self.sort_order.currentIndexChanged.connect(self._resort_results)
@@ -17250,44 +18428,31 @@ class TemporalCouplingWindow(AppDialog):
         self.aligned_canvas.draw_idle()
 
 
+@dataclass
+class StimulusBlockPhase:
+    name: str
+    electrode_group: str
+    protocol: str
+
+
 class StimulusGenerationDialog(AppDialog):
     def __init__(self, records: list[dict], parent=None, channel_map: ChannelMap | None = None):
         super().__init__(parent)
         self.setWindowTitle("Stimulus Generation")
-        self.resize(940, 640)
+        self.resize(1360, 820)
         self.records = list(records or [])
         self.channel_map = channel_map
         self.info = stimulus_builder.ExperimentInfo()
-        self.groups = [stimulus_builder.ElectrodeGroup("group_A", self._default_electrodes())]
-        self.protocols = [
-            stimulus_builder.StimulusProtocol("feedback_single_150mV", "single_pulse", amplitude_mv=150.0),
-            stimulus_builder.StimulusProtocol(
-                "train_burst_20hz",
-                "individual_burst",
-                amplitude_mv=150.0,
-                pulse_width_us=200.0,
-                pulse_frequency_hz=20.0,
-                pulses_per_burst=10,
-            ),
-            stimulus_builder.StimulusProtocol(
-                "poisson_random_safe",
-                "poisson_random_electrodes",
-                amplitude_mv=150.0,
-                pulse_width_us=200.0,
-                pulses_per_burst=1,
-                poisson_duration_s=300.0,
-                lambda_mode="scale",
-                random_seed=42,
-            ),
-        ]
+        self.groups: list[stimulus_builder.ElectrodeGroup] = []
+        self.protocols: list[stimulus_builder.StimulusProtocol] = []
         self.protocol_source_paths: dict[str, str] = {}
-        if self.records:
-            self.protocol_source_paths["poisson_random_safe"] = str(self.records[0].get("path", ""))
-        self.blocks = [stimulus_builder.ExperimentBlock("group_A_150mV", "group_A", "feedback_single_150mV")]
+        self.block_phases: list[StimulusBlockPhase] = []
+        self.blocks: list[stimulus_builder.ExperimentBlock] = []
         self.poisson_auto_groups: dict[str, str] = {}
         self.output_dir = Path("generated_visual_experiment")
         self.preview_map_selected = None
         self.preview_map_selection_artist = None
+        self.preview_map_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._preview_series_cache: dict[tuple, list[dict]] = {}
         self._preview_rate_cache: dict[tuple, tuple[list[int], list[float]]] = {}
         self._preview_recording_metrics_cache: dict[tuple, tuple[list[int], dict[int, dict]]] = {}
@@ -17328,23 +18493,35 @@ class StimulusGenerationDialog(AppDialog):
         self.blocks_tab = QWidget()
         self.preview_tab = QWidget()
         self.generate_tab = QWidget()
+        self.tabs.addTab(self.preview_tab, "Settings")
         self.tabs.addTab(self.experiment_tab, "Experiment")
-        self.tabs.addTab(self.groups_tab, "Electrodes")
-        self.tabs.addTab(self.protocols_tab, "Stimulus")
-        self.tabs.addTab(self.blocks_tab, "Blocks")
-        self.tabs.addTab(self.preview_tab, "Preview")
-        self.tabs.addTab(self.generate_tab, "Generate")
         self._build_experiment_tab()
         self._build_groups_tab()
         self._build_protocols_tab()
         self._build_blocks_tab()
         self._build_preview_tab()
         self._build_generate_tab()
+        self._integrate_experiment_workflow_sections()
+        self.tabs.setCurrentWidget(self.preview_tab)
+
+    @staticmethod
+    def _required_label(text: str) -> QLabel:
+        label = QLabel(f"{text} *")
+        label.setToolTip("Required. This value is used by the generated stimulation program.")
+        return label
 
     def _build_experiment_tab(self) -> None:
-        layout = QVBoxLayout(self.experiment_tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        outer = QVBoxLayout(self.experiment_tab)
+        outer.setContentsMargins(10, 10, 10, 10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll, 1)
+        panel = QWidget()
+        scroll.setWidget(panel)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
         summary = QLabel(
             "Set the experiment identity and output roots used by the generated MaxWell package. "
             "Hardware defaults are kept unless you edit them later in the generated config files."
@@ -17355,6 +18532,7 @@ class StimulusGenerationDialog(AppDialog):
         form = QFormLayout()
         layout.addLayout(form)
         self.info_fields: dict[str, QLineEdit] = {}
+        required_info = {"name", "recording_prefix", "cfg_path", "data_root"}
         for label, key in [
             ("Experiment name", "name"),
             ("Culture ID", "culture_id"),
@@ -17375,7 +18553,7 @@ class StimulusGenerationDialog(AppDialog):
                 browse = QPushButton("Browse")
                 browse.clicked.connect(self._browse_cfg)
                 row_layout.addWidget(browse)
-            form.addRow(label, row)
+            form.addRow(self._required_label(label) if key in required_info else QLabel(label), row)
         for key in ["device", "event_threshold", "amplifier_gain", "cpp_runner", "spike_step", "max_stims", "sequence_name"]:
             self.info_fields[key] = QLineEdit(str(getattr(self.info, key)))
 
@@ -17395,6 +18573,10 @@ class StimulusGenerationDialog(AppDialog):
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        self.experiment_blocks_container = QVBoxLayout()
+        layout.addLayout(self.experiment_blocks_container)
+        self.experiment_generate_container = QVBoxLayout()
+        layout.addLayout(self.experiment_generate_container)
         layout.addStretch(1)
 
     def _build_groups_tab(self) -> None:
@@ -17425,7 +18607,7 @@ class StimulusGenerationDialog(AppDialog):
         form.addRow("Electrodes", self.group_electrodes)
         edit_layout.addLayout(form)
         buttons = QHBoxLayout()
-        save = QPushButton("Add / Update")
+        save = QPushButton("Add")
         save.clicked.connect(self._save_group)
         remove = QPushButton("Remove")
         remove.clicked.connect(self._remove_group)
@@ -17464,29 +18646,50 @@ class StimulusGenerationDialog(AppDialog):
         explanation.setWordWrap(True)
         edit_layout.addWidget(explanation)
 
-        self.source_box = QGroupBox("Pipeline spontaneous source")
+        self.source_box = QGroupBox("Pipeline spontaneous source *")
+        self.source_box.setToolTip("Required for poisson_random_electrodes. This source determines firing-rate based random stimulation.")
         source_layout = QVBoxLayout(self.source_box)
         source_layout.setContentsMargins(8, 8, 8, 8)
         source_hint = QLabel("Use a loaded spontaneous spike dataset as the rate template for random-electrode stimulation.")
         source_hint.setObjectName("MutedText")
         source_hint.setWordWrap(True)
         source_layout.addWidget(source_hint)
-        self.source_combo = QComboBox()
+        self.source_combo = NoWheelComboBox()
         self.source_combo.currentIndexChanged.connect(self._source_selection_changed)
         source_layout.addWidget(self.source_combo)
         edit_layout.addWidget(self.source_box)
 
         main_box = QGroupBox("Protocol")
+        self.protocol_box = main_box
         form = QGridLayout(main_box)
         form.setContentsMargins(8, 8, 8, 8)
-        form.setHorizontalSpacing(10)
+        form.setHorizontalSpacing(4)
         form.setVerticalSpacing(5)
+        form.setColumnStretch(0, 0)
+        form.setColumnStretch(1, 1)
+        form.setColumnStretch(2, 0)
+        form.setColumnStretch(3, 1)
         self.protocol_fields: dict[str, QLineEdit] = {}
         self.protocol_field_labels: dict[str, QLabel] = {}
-        self.protocol_type = QComboBox()
+        self.protocol_type = NoWheelComboBox()
         self.protocol_type.addItems(list(stimulus_builder.PROTOCOL_TYPES))
-        form.addWidget(QLabel("Type"), 0, 0)
+        self.protocol_type_label = self._required_label("Type")
+        self.protocol_type_label.setMaximumWidth(92)
+        form.addWidget(self.protocol_type_label, 0, 0)
         form.addWidget(self.protocol_type, 0, 1)
+        required_protocol = {
+            "name",
+            "amplitude_mv",
+            "pulse_width_us",
+            "pulse_frequency_hz",
+            "pulses_per_burst",
+            "interpulse_interval_ms",
+            "burst_count",
+            "burst_interval_ms",
+            "start_ms",
+            "channel",
+            "poisson_duration_s",
+        }
         compact_rows = [
             ("Name", "name"),
             ("Amplitude mV", "amplitude_mv"),
@@ -17502,11 +18705,13 @@ class StimulusGenerationDialog(AppDialog):
         ]
         for index, (label, key) in enumerate(compact_rows, start=1):
             field = QLineEdit()
-            field.setMaximumWidth(150)
+            field.setMinimumWidth(150)
+            field.setMaximumWidth(240)
             self.protocol_fields[key] = field
             grid_row = index // 2
             grid_col = (index % 2) * 2
-            label_widget = QLabel(label)
+            label_widget = self._required_label(label) if key in required_protocol else QLabel(label)
+            label_widget.setMaximumWidth(112)
             self.protocol_field_labels[key] = label_widget
             form.addWidget(label_widget, grid_row, grid_col)
             form.addWidget(field, grid_row, grid_col + 1)
@@ -17521,11 +18726,12 @@ class StimulusGenerationDialog(AppDialog):
             "random_seed",
         ]:
             self.protocol_fields[key] = QLineEdit()
-        self.lambda_mode = QComboBox()
+        self.lambda_mode = NoWheelComboBox()
         self.lambda_mode.addItems(["scale", "normal"])
         self.lambda_mode.currentIndexChanged.connect(lambda *_: self._update_protocol_type_fields())
         lambda_row = (len(compact_rows) + 1) // 2
         self.lambda_mode_label = QLabel("Lambda mode")
+        self.lambda_mode_label.setMaximumWidth(112)
         form.addWidget(self.lambda_mode_label, lambda_row, 2)
         form.addWidget(self.lambda_mode, lambda_row, 3)
         edit_layout.addWidget(main_box)
@@ -17546,7 +18752,7 @@ class StimulusGenerationDialog(AppDialog):
             ("Random seed", "random_seed"),
             ("Inter-phase us", "inter_phase_interval_us"),
         ]:
-            advanced_form.addRow(label, self.protocol_fields[key])
+            advanced_form.addRow(self._required_label(label), self.protocol_fields[key])
             self.protocol_field_labels[key] = advanced_form.labelForField(self.protocol_fields[key])
             self.protocol_fields[key].setMaximumWidth(160)
         edit_layout.addWidget(self.advanced_toggle)
@@ -17558,12 +18764,8 @@ class StimulusGenerationDialog(AppDialog):
         self.custom_points_label = QLabel("Custom sequence")
         edit_layout.addWidget(self.custom_points_label)
         edit_layout.addWidget(self.custom_points)
-        self.protocol_notes = QTextEdit()
-        self.protocol_notes.setMaximumHeight(46)
-        edit_layout.addWidget(QLabel("Notes"))
-        edit_layout.addWidget(self.protocol_notes)
         buttons = QHBoxLayout()
-        save = QPushButton("Add / Update")
+        save = QPushButton("Add")
         save.clicked.connect(self._save_protocol)
         remove = QPushButton("Remove")
         remove.clicked.connect(self._remove_protocol)
@@ -17591,8 +18793,31 @@ class StimulusGenerationDialog(AppDialog):
         self.block_table.setHorizontalHeaderLabels(["Block", "Group", "Protocol"])
         self.block_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.block_table.itemSelectionChanged.connect(self._load_selected_block)
+        self.block_phase_table = QTableWidget(0, 3)
+        self.block_phase_table.setHorizontalHeaderLabels(["Phase", "Group", "Protocol"])
+        self.block_phase_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.block_phase_table.itemSelectionChanged.connect(self._load_selected_block_phase)
+        left.addWidget(QLabel("Block phases"))
+        left.addWidget(self.block_phase_table, 1)
+        left.addWidget(QLabel("Blocks"))
         left.addWidget(self.block_table, 1)
         layout.addLayout(left, 1)
+
+        phase_controls = QFrame()
+        phase_controls.setObjectName("Panel")
+        phase_controls_layout = QVBoxLayout(phase_controls)
+        phase_controls_layout.setContentsMargins(10, 10, 10, 10)
+        phase_controls_layout.setSpacing(8)
+        phase_hint = QLabel("Remove the selected block phase from the phase library.")
+        phase_hint.setObjectName("MutedText")
+        phase_hint.setWordWrap(True)
+        phase_controls_layout.addWidget(phase_hint)
+        remove_phase = QPushButton("Remove")
+        remove_phase.clicked.connect(self._remove_block_phase)
+        self.block_phase_remove_button = remove_phase
+        phase_controls_layout.addWidget(remove_phase)
+        phase_controls_layout.addStretch(1)
+        self.block_phase_controls = phase_controls
 
         editor = QFrame()
         editor.setObjectName("Panel")
@@ -17601,77 +18826,207 @@ class StimulusGenerationDialog(AppDialog):
         edit_layout.setSpacing(8)
         form = QFormLayout()
         self.block_name = QLineEdit()
-        self.block_group = QComboBox()
-        self.block_protocol = QComboBox()
-        form.addRow("Block name", self.block_name)
-        form.addRow("Electrode group", self.block_group)
-        form.addRow("Protocol", self.block_protocol)
+        self.block_group = NoWheelComboBox()
+        self.block_protocol = NoWheelComboBox()
+        self.block_phase_combo = NoWheelComboBox()
+        self.block_phase_combo.currentIndexChanged.connect(self._block_phase_combo_changed)
+        form.addRow("Stim block phase", self.block_phase_combo)
         self.phase_duration_fields: dict[str, QLineEdit] = {}
         self.phase_mode_combos: dict[str, QComboBox] = {}
+        phase_labels = {
+            "01_pre_spont": "Pre duration s",
+            "02_stim": "Stim duration s",
+            "03_post_spont": "Post duration s",
+        }
         for phase_id in stimulus_builder.PHASES:
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
             duration = QLineEdit("300")
-            mode = QComboBox()
-            mode.addItems(["open_loop", "closed_loop", "manual"])
             self.phase_duration_fields[phase_id] = duration
-            self.phase_mode_combos[phase_id] = mode
-            row_layout.addWidget(duration)
-            row_layout.addWidget(mode)
-            form.addRow(phase_id, row)
+            form.addRow(phase_labels.get(phase_id, phase_id), duration)
         edit_layout.addLayout(form)
         buttons = QHBoxLayout()
-        save = QPushButton("Add / Update")
+        save = QPushButton("Add")
         save.clicked.connect(self._save_block)
         remove = QPushButton("Remove")
         remove.clicked.connect(self._remove_block)
+        self.block_add_button = save
+        self.block_remove_button = remove
         buttons.addWidget(save)
         buttons.addWidget(remove)
         edit_layout.addLayout(buttons)
         edit_layout.addStretch(1)
+        self.block_editor = editor
         layout.addWidget(editor)
 
     def _build_preview_tab(self) -> None:
-        layout = QVBoxLayout(self.preview_tab)
+        layout = QHBoxLayout(self.preview_tab)
         layout.setContentsMargins(10, 10, 10, 10)
-        hint = QLabel("Preview shows the event timing pattern for the selected protocol before code generation.")
+        layout.setSpacing(12)
+
+        workflow_scroll = QScrollArea()
+        workflow_scroll.setWidgetResizable(True)
+        workflow_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        workflow_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        workflow_scroll.setMinimumWidth(620)
+        workflow_scroll.setMaximumWidth(820)
+        self.settings_workflow_scroll = workflow_scroll
+        workflow_panel = QFrame()
+        workflow_panel.setObjectName("Panel")
+        workflow_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        workflow = QVBoxLayout(workflow_panel)
+        workflow.setContentsMargins(8, 8, 8, 8)
+        workflow.setSpacing(6)
+
+        hint = QLabel("Configure the protocol and stimulation sites here, then inspect the generated sequence before building the package. Fields marked * are written into the stimulation program.")
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        workflow.addWidget(hint)
+
+        protocol_step = QLabel("1. Stimulus protocol")
+        protocol_step.setObjectName("SectionTitle")
+        workflow.addWidget(protocol_step)
+        if hasattr(self, "source_box"):
+            workflow.addWidget(self.source_box)
+        if hasattr(self, "protocol_type_label"):
+            self.protocol_type_label.setToolTip("Required. Protocol type controls which stimulation commands are generated.")
+        if hasattr(self, "advanced_toggle"):
+            workflow.addWidget(self.protocol_box)
+            workflow.addWidget(self.advanced_toggle)
+            workflow.addWidget(self.advanced_box)
+        if hasattr(self, "custom_points_label"):
+            workflow.addWidget(self.custom_points_label)
+            workflow.addWidget(self.custom_points)
+        protocol_library = QFrame()
+        protocol_library.setObjectName("Panel")
+        protocol_library_layout = QVBoxLayout(protocol_library)
+        protocol_library_layout.setContentsMargins(8, 8, 8, 8)
+        protocol_library_layout.addWidget(QLabel("Protocol library"))
+        self.protocol_table.setMinimumHeight(146)
+        self.protocol_table.setMaximumHeight(156)
+        self.protocol_table.setMaximumWidth(16777215)
+        protocol_library_layout.addWidget(self.protocol_table)
+        workflow.addWidget(protocol_library)
+        protocol_buttons = QHBoxLayout()
+        add_protocol = QPushButton("Add")
+        add_protocol.clicked.connect(self._save_protocol)
+        remove_protocol = QPushButton("Remove")
+        remove_protocol.clicked.connect(self._remove_protocol)
+        self.settings_protocol_add_button = add_protocol
+        self.settings_protocol_remove_button = remove_protocol
+        protocol_buttons.addWidget(add_protocol)
+        protocol_buttons.addWidget(remove_protocol)
+        protocol_buttons.addStretch(1)
+        workflow.addLayout(protocol_buttons)
+
+        site_step = QLabel("2. Stimulation sites")
+        site_step.setObjectName("SectionTitle")
+        workflow.addWidget(site_step)
+        site_box = QFrame()
+        site_box.setObjectName("Panel")
+        site_layout = QGridLayout(site_box)
+        site_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview_group_name = QLineEdit()
+        self.preview_group_name.setPlaceholderText("electrode group name")
+        self.preview_group_electrodes = QLineEdit()
+        self.preview_group_electrodes.setPlaceholderText("e.g. 7317, 7318, 7319")
+        self.preview_group_name.textChanged.connect(self._preview_site_fields_changed)
+        self.preview_group_electrodes.textChanged.connect(self._preview_site_fields_changed)
+        site_layout.addWidget(self._required_label("Group"), 0, 0)
+        site_layout.addWidget(self.preview_group_name, 0, 1)
+        site_layout.addWidget(self._required_label("Electrodes"), 1, 0)
+        site_layout.addWidget(self.preview_group_electrodes, 1, 1)
+        workflow.addWidget(site_box)
+        site_library = QFrame()
+        site_library.setObjectName("Panel")
+        site_library_layout = QVBoxLayout(site_library)
+        site_library_layout.setContentsMargins(8, 8, 8, 8)
+        site_library_layout.addWidget(QLabel("Site library"))
+        self.group_table.setMinimumHeight(146)
+        self.group_table.setMaximumHeight(156)
+        site_library_layout.addWidget(self.group_table)
+        workflow.addWidget(site_library)
+        site_buttons = QHBoxLayout()
+        add_site = QPushButton("Add")
+        add_site.clicked.connect(self._save_group_from_settings)
+        remove_site = QPushButton("Remove")
+        remove_site.clicked.connect(self._remove_group)
+        self.settings_site_add_button = add_site
+        self.settings_site_remove_button = remove_site
+        site_buttons.addWidget(add_site)
+        site_buttons.addWidget(remove_site)
+        site_buttons.addStretch(1)
+        workflow.addLayout(site_buttons)
+
+        action_row = QHBoxLayout()
+        save_phase = QPushButton("Save block phase")
+        save_phase.clicked.connect(self._save_block_phase_from_settings)
+        self.settings_save_block_phase_button = save_phase
+        preview = QPushButton("Preview")
+        preview.setObjectName("PrimaryButton")
+        preview.clicked.connect(self._preview_settings_workflow)
+        self.settings_preview_button = preview
+        action_row.addWidget(save_phase)
+        action_row.addWidget(preview)
+        action_row.addStretch(1)
+        workflow.addLayout(action_row)
+        workflow.addStretch(1)
+        workflow_scroll.setWidget(workflow_panel)
+        layout.addWidget(workflow_scroll, 3)
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
         controls = QHBoxLayout()
-        self.preview_combo = QComboBox()
+        controls.setSpacing(6)
+        self.preview_combo = NoWheelComboBox()
         controls.addWidget(self.preview_combo, 1)
         self.preview_window_label = QLabel("0.000 - 5.000 s / 5.000 s")
         self.preview_window_label.setObjectName("MutedText")
-        self.preview_window_label.setMinimumWidth(190)
+        self.preview_window_label.setMinimumWidth(142)
         self.preview_window_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         controls.addWidget(self.preview_window_label)
+        right.addLayout(controls)
+        preview_actions = QHBoxLayout()
+        preview_actions.setSpacing(6)
+        preview_actions.addStretch(1)
         reset_view = QPushButton("Reset")
         reset_view.clicked.connect(self._reset_preview_raster_view)
-        controls.addWidget(reset_view)
+        preview_actions.addWidget(reset_view)
+        reset_map = QPushButton("Reset map")
+        reset_map.clicked.connect(self._reset_preview_map_view)
+        preview_actions.addWidget(reset_map)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._draw_preview)
-        controls.addWidget(refresh)
-        layout.addLayout(controls)
-        plot_layout = QHBoxLayout()
-        plot_layout.setSpacing(10)
-        self.preview_canvas = FigureCanvas(Figure(figsize=(5.8, 4.2), tight_layout=True))
+        preview_actions.addWidget(refresh)
+        right.addLayout(preview_actions)
+        preview_stack = QVBoxLayout()
+        preview_stack.setContentsMargins(0, 0, 0, 0)
+        preview_stack.setSpacing(4)
+        self.settings_preview_stack = preview_stack
+        self.preview_canvas = FigureCanvas(Figure(figsize=(4.8, 2.35)))
+        self.preview_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_canvas.setMinimumHeight(210)
+        self.preview_canvas.setMaximumHeight(270)
         self.preview_canvas.mpl_connect("scroll_event", self._preview_raster_scrolled)
         self.preview_canvas.mpl_connect("button_press_event", self._preview_raster_mouse_pressed)
         self.preview_canvas.mpl_connect("motion_notify_event", self._preview_raster_mouse_moved)
         self.preview_canvas.mpl_connect("button_release_event", self._preview_raster_mouse_released)
-        self.preview_map_canvas = FigureCanvas(Figure(figsize=(3.8, 4.2), tight_layout=True))
+        self.preview_map_canvas = FigureCanvas(Figure(figsize=(4.8, 3.9)))
+        self.preview_map_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_map_canvas.setMinimumHeight(300)
+        self.preview_map_canvas.setMaximumHeight(420)
         self.preview_map_canvas.mpl_connect("button_press_event", self._preview_map_clicked)
+        self.preview_map_canvas.mpl_connect("scroll_event", self._preview_map_scrolled)
         self.preview_map_detail = QLabel("Click an electrode to inspect it.")
         self.preview_map_detail.setObjectName("MutedText")
         self.preview_map_detail.setWordWrap(True)
         map_panel = QVBoxLayout()
+        map_panel.setContentsMargins(0, 0, 0, 0)
+        map_panel.setSpacing(4)
         map_panel.addWidget(self.preview_map_canvas, 1)
         map_panel.addWidget(self.preview_map_detail)
-        plot_layout.addWidget(self.preview_canvas, 3)
-        plot_layout.addLayout(map_panel, 2)
-        layout.addLayout(plot_layout, 1)
+        preview_stack.addWidget(self.preview_canvas, 2)
+        preview_stack.addLayout(map_panel, 3)
+        right.addLayout(preview_stack, 1)
+        layout.addLayout(right, 2)
 
     def _build_generate_tab(self) -> None:
         layout = QVBoxLayout(self.generate_tab)
@@ -17683,8 +19038,11 @@ class StimulusGenerationDialog(AppDialog):
         )
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
+        self.generate_hint = hint
         layout.addWidget(hint)
-        form = QFormLayout()
+        self.generate_form_widget = QWidget()
+        form = QFormLayout(self.generate_form_widget)
+        self.generate_form = form
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
@@ -17694,10 +19052,13 @@ class StimulusGenerationDialog(AppDialog):
         browse.clicked.connect(self._browse_output)
         row_layout.addWidget(browse)
         form.addRow("Output directory", row)
-        layout.addLayout(form)
-        generate = QPushButton("Generate Code Package")
+        layout.addWidget(self.generate_form_widget)
+        generate = QPushButton("Generate")
         generate.setObjectName("PrimaryButton")
+        generate.setMaximumWidth(132)
+        generate.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         generate.clicked.connect(self._generate)
+        self.generate_button = generate
         layout.addWidget(generate)
         self.generate_status = QLabel("Ready")
         self.generate_status.setObjectName("MutedText")
@@ -17705,19 +19066,88 @@ class StimulusGenerationDialog(AppDialog):
         layout.addWidget(self.generate_status)
         layout.addStretch(1)
 
+    def _integrate_experiment_workflow_sections(self) -> None:
+        if not hasattr(self, "experiment_blocks_container"):
+            return
+        block_section = QFrame()
+        block_section.setObjectName("Panel")
+        block_layout = QVBoxLayout(block_section)
+        block_layout.setContentsMargins(10, 10, 10, 10)
+        title = QLabel("Blocks")
+        title.setObjectName("SectionTitle")
+        block_layout.addWidget(title)
+        block_hint = QLabel("Create execution blocks after the experiment metadata. Each block links one site group to one protocol and phase durations.")
+        block_hint.setObjectName("MutedText")
+        block_hint.setWordWrap(True)
+        block_layout.addWidget(block_hint)
+        self.block_phase_table.setMinimumHeight(120)
+        self.block_phase_table.setMaximumHeight(150)
+        self.block_table.setMinimumHeight(146)
+        self.block_table.setMaximumHeight(180)
+        phase_row = QHBoxLayout()
+        phase_list = QVBoxLayout()
+        phase_list.addWidget(QLabel("Block phases"))
+        phase_list.addWidget(self.block_phase_table, 1)
+        phase_row.addLayout(phase_list, 1)
+        phase_row.addWidget(self.block_phase_controls, 0)
+        block_layout.addLayout(phase_row)
+        block_row = QHBoxLayout()
+        block_list = QVBoxLayout()
+        block_list.addWidget(QLabel("Blocks"))
+        block_list.addWidget(self.block_table, 1)
+        block_row.addLayout(block_list, 1)
+        block_row.addWidget(self.block_editor, 0)
+        block_layout.addLayout(block_row)
+        self.experiment_blocks_container.addWidget(block_section)
+
+        generate_section = QFrame()
+        generate_section.setObjectName("Panel")
+        generate_layout = QVBoxLayout(generate_section)
+        generate_layout.setContentsMargins(10, 10, 10, 10)
+        generate_title = QLabel("Generate")
+        generate_title.setObjectName("SectionTitle")
+        generate_layout.addWidget(generate_title)
+        generate_layout.addWidget(self.generate_hint)
+        generate_row = QHBoxLayout()
+        generate_row.addWidget(self.generate_form_widget, 1)
+        generate_row.addWidget(self.generate_button, 0, Qt.AlignmentFlag.AlignTop)
+        generate_layout.addLayout(generate_row)
+        generate_layout.addWidget(self.generate_status)
+        self.experiment_generate_container.addWidget(generate_section)
+
     def _refresh_all(self) -> None:
         self._refresh_group_table()
         self._refresh_protocol_table()
+        self._refresh_block_phase_table()
         self._refresh_block_table()
         self._refresh_block_combos()
         self._refresh_preview_combo()
         self._refresh_source_combo()
         if self.protocols:
             self._fill_protocol_form(self.protocols[0])
+        else:
+            self._fill_default_protocol_form()
         if self.groups:
             self._fill_group_form(self.groups[0])
+        else:
+            self._fill_default_group_form()
         if self.blocks:
             self._fill_block_form(self.blocks[0])
+
+    def _fill_default_protocol_form(self) -> None:
+        self._fill_protocol_form(stimulus_builder.StimulusProtocol("new_protocol", "single_pulse"))
+
+    def _fill_default_group_form(self) -> None:
+        default_group = stimulus_builder.ElectrodeGroup("new_group", self._default_electrodes())
+        self.group_name.setText(default_group.name)
+        self.group_electrodes.setText(", ".join(str(item) for item in default_group.electrodes))
+        if hasattr(self, "preview_group_name"):
+            self.preview_group_name.blockSignals(True)
+            self.preview_group_electrodes.blockSignals(True)
+            self.preview_group_name.setText(default_group.name)
+            self.preview_group_electrodes.setText(", ".join(str(item) for item in default_group.electrodes))
+            self.preview_group_name.blockSignals(False)
+            self.preview_group_electrodes.blockSignals(False)
 
     def _refresh_group_table(self) -> None:
         self.group_table.setRowCount(len(self.groups))
@@ -17741,21 +19171,30 @@ class StimulusGenerationDialog(AppDialog):
                 self.block_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.block_table.resizeColumnsToContents()
 
+    def _refresh_block_phase_table(self) -> None:
+        self.block_phase_table.setRowCount(len(self.block_phases))
+        for row, phase in enumerate(self.block_phases):
+            for column, value in enumerate([phase.name, phase.electrode_group, phase.protocol]):
+                self.block_phase_table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.block_phase_table.resizeColumnsToContents()
+
     def _refresh_block_combos(self) -> None:
-        current_group = self.block_group.currentData()
-        current_protocol = self.block_protocol.currentData()
-        self.block_group.blockSignals(True)
-        self.block_protocol.blockSignals(True)
+        current_phase = self.block_phase_combo.currentData()
+        self.block_phase_combo.blockSignals(True)
+        self.block_phase_combo.clear()
+        for phase in self.block_phases:
+            self.block_phase_combo.addItem(phase.name, phase.name)
         self.block_group.clear()
         self.block_protocol.clear()
         for group in self.groups:
             self.block_group.addItem(group.name, group.name)
         for protocol in self.protocols:
             self.block_protocol.addItem(protocol.name, protocol.name)
-        self._set_combo_data(self.block_group, current_group)
-        self._set_combo_data(self.block_protocol, current_protocol)
-        self.block_group.blockSignals(False)
-        self.block_protocol.blockSignals(False)
+        self._set_combo_data(self.block_phase_combo, current_phase)
+        self.block_phase_combo.blockSignals(False)
+        if self.block_phase_combo.currentIndex() < 0 and self.block_phase_combo.count() > 0:
+            self.block_phase_combo.setCurrentIndex(0)
+        self._block_phase_combo_changed()
 
     def _refresh_preview_combo(self) -> None:
         current = self.preview_combo.currentData()
@@ -17818,9 +19257,29 @@ class StimulusGenerationDialog(AppDialog):
         if row is not None and 0 <= row < len(self.blocks):
             self._fill_block_form(self.blocks[row])
 
+    def _load_selected_block_phase(self) -> None:
+        row = self._selected_table_row(self.block_phase_table)
+        if row is not None and 0 <= row < len(self.block_phases):
+            self._apply_block_phase_to_block_form(self.block_phases[row])
+
+    def _block_phase_combo_changed(self, *_args) -> None:
+        name = str(self.block_phase_combo.currentData() or "")
+        if not name:
+            return
+        phase = next((item for item in self.block_phases if item.name == name), None)
+        if phase is not None:
+            self._apply_block_phase_to_block_form(phase)
+
     def _fill_group_form(self, group) -> None:
         self.group_name.setText(group.name)
         self.group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+        if hasattr(self, "preview_group_name"):
+            self.preview_group_name.blockSignals(True)
+            self.preview_group_electrodes.blockSignals(True)
+            self.preview_group_name.setText(group.name)
+            self.preview_group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+            self.preview_group_name.blockSignals(False)
+            self.preview_group_electrodes.blockSignals(False)
 
     def _fill_protocol_form(self, protocol) -> None:
         self.protocol_fields["name"].setText(protocol.name)
@@ -17834,19 +19293,212 @@ class StimulusGenerationDialog(AppDialog):
             f"{point['time_ms']}, {point['amplitude_mv']}, {point.get('duration_us', protocol.pulse_width_us)}, {point.get('channel', protocol.channel)}"
             for point in protocol.custom_points
         ))
-        self.protocol_notes.setPlainText(protocol.notes)
         self._set_combo_data(self.source_combo, self.protocol_source_paths.get(protocol.name, ""))
         self._update_protocol_type_fields()
 
     def _fill_block_form(self, block) -> None:
         self.block_name.setText(block.name)
+        matching_phase = next(
+            (phase for phase in self.block_phases if phase.electrode_group == block.electrode_group and phase.protocol == block.protocol),
+            None,
+        )
+        self._set_combo_data(self.block_phase_combo, matching_phase.name if matching_phase is not None else "")
         self._set_combo_data(self.block_group, block.electrode_group)
         self._set_combo_data(self.block_protocol, block.protocol)
+        group = next((item for item in self.groups if item.name == block.electrode_group), None)
+        if group is not None and hasattr(self, "preview_group_name"):
+            self.preview_group_name.blockSignals(True)
+            self.preview_group_electrodes.blockSignals(True)
+            self.preview_group_name.setText(group.name)
+            self.preview_group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+            self.preview_group_name.blockSignals(False)
+            self.preview_group_electrodes.blockSignals(False)
         for phase in block.phases:
             if phase.id in self.phase_duration_fields:
                 self.phase_duration_fields[phase.id].setText(str(phase.duration_s))
-            if phase.id in self.phase_mode_combos:
-                self._set_combo_text(self.phase_mode_combos[phase.id], phase.mode)
+
+    def _preview_site_fields_changed(self, *_args) -> None:
+        if not hasattr(self, "preview_map_detail"):
+            return
+        self.preview_map_detail.setText("Unsaved site changes. Click Preview to inspect the sequence.")
+
+    def _upsert_protocol(self, protocol) -> None:
+        for index, existing in enumerate(self.protocols):
+            if existing.name == protocol.name:
+                self.protocols[index] = protocol
+                return
+        self.protocols.append(protocol)
+
+    def _upsert_group(self, group) -> None:
+        for index, existing in enumerate(self.groups):
+            if existing.name == group.name:
+                self.groups[index] = group
+                return
+        self.groups.append(group)
+
+    def _upsert_block(self, block) -> None:
+        for index, existing in enumerate(self.blocks):
+            if existing.name == block.name:
+                self.blocks[index] = block
+                return
+        self.blocks.append(block)
+
+    def _upsert_block_phase(self, phase: StimulusBlockPhase) -> None:
+        for index, existing in enumerate(self.block_phases):
+            if existing.name == phase.name:
+                self.block_phases[index] = phase
+                return
+        self.block_phases.append(phase)
+
+    def _apply_block_phase_to_block_form(self, phase: StimulusBlockPhase) -> None:
+        self._set_combo_data(self.block_phase_combo, phase.name)
+        self._set_combo_data(self.block_group, phase.electrode_group)
+        self._set_combo_data(self.block_protocol, phase.protocol)
+
+    def _block_name_for_phase(self, phase_name: str) -> str:
+        base = re.sub(r"[^A-Za-z0-9_]+", "_", str(phase_name)).strip("_") or "block"
+        if base.endswith("_phase"):
+            base = base[:-6]
+        return self._unique_block_name(f"{base}_block")
+
+    def _unique_block_name(self, base: str) -> str:
+        existing = {block.name for block in self.blocks}
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "block"
+        if cleaned not in existing:
+            return cleaned
+        index = 2
+        while f"{cleaned}_{index}" in existing:
+            index += 1
+        return f"{cleaned}_{index}"
+
+    def _block_phase_name_for(self, protocol_name: str, group_name: str) -> str:
+        base = f"{protocol_name}_{group_name}_phase"
+        return self._unique_block_phase_name(base)
+
+    def _unique_block_phase_name(self, base: str) -> str:
+        existing = {phase.name for phase in self.block_phases}
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "block_phase"
+        if cleaned not in existing:
+            return cleaned
+        index = 2
+        while f"{cleaned}_{index}" in existing:
+            index += 1
+        return f"{cleaned}_{index}"
+
+    def _select_block_by_name(self, name: str) -> None:
+        self.block_table.blockSignals(True)
+        self.block_table.clearSelection()
+        for row, block in enumerate(self.blocks):
+            if block.name == name:
+                self.block_table.selectRow(row)
+                self.block_table.setCurrentCell(row, 0)
+                break
+        self.block_table.blockSignals(False)
+
+    def _save_preview_workflow(self) -> None:
+        self._save_settings_protocol_and_site()
+
+    def _save_block_phase_from_settings(self) -> None:
+        saved = self._save_settings_protocol_and_site()
+        if saved is None:
+            return
+        protocol, group_name = saved
+        phase = StimulusBlockPhase(self._block_phase_name_for(protocol.name, group_name), group_name, protocol.name)
+        self._upsert_block_phase(phase)
+        self._refresh_block_phase_table()
+        self._refresh_block_combos()
+        self._set_combo_data(self.block_phase_combo, phase.name)
+        self._apply_block_phase_to_block_form(phase)
+        self.generate_status.setText(f"Block phase saved: {phase.name}")
+
+    def _remove_block_phase(self) -> None:
+        row = self._selected_table_row(self.block_phase_table)
+        if row is None or not (0 <= row < len(self.block_phases)):
+            return
+        removed = self.block_phases[row]
+        del self.block_phases[row]
+        self.blocks = [
+            block
+            for block in self.blocks
+            if not (block.electrode_group == removed.electrode_group and block.protocol == removed.protocol)
+        ]
+        self._clear_preview_caches()
+        self._refresh_block_phase_table()
+        self._refresh_block_table()
+        self._refresh_block_combos()
+        self.generate_status.setText(f"Block phase removed: {removed.name}")
+
+    def _save_settings_protocol_and_site(self) -> tuple[object, str] | None:
+        try:
+            protocol = self._protocol_from_form()
+            if not protocol.name:
+                raise ValueError("Protocol name is required")
+            group = stimulus_builder.ElectrodeGroup(
+                self.preview_group_name.text().strip(),
+                stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
+            )
+            if not group.name:
+                raise ValueError("Electrode group name is required")
+            if not group.electrodes:
+                raise ValueError("At least one stimulation electrode is required")
+        except Exception as exc:
+            _show_error_message(self, "Invalid block phase", str(exc))
+            return None
+        source_path = str(self.source_combo.currentData() or "") if hasattr(self, "source_combo") else ""
+        if source_path:
+            self.protocol_source_paths[protocol.name] = source_path
+            protocol.spontaneous_data_path = source_path
+        else:
+            self.protocol_source_paths.pop(protocol.name, None)
+        self._upsert_protocol(protocol)
+        self._upsert_group(group)
+        self._clear_preview_caches()
+        self._sync_poisson_protocol_auto_group(protocol.name)
+        phase_group_name = self.poisson_auto_groups.get(protocol.name, group.name) if protocol.type == "poisson_random_electrodes" else group.name
+        self._refresh_group_table()
+        self._refresh_protocol_table()
+        self._refresh_block_table()
+        self._refresh_block_combos()
+        self._refresh_preview_combo()
+        self._set_combo_data(self.preview_combo, protocol.name)
+        self._draw_preview()
+        return protocol, phase_group_name
+
+    def _preview_settings_workflow(self) -> None:
+        try:
+            protocol = self._protocol_from_form()
+            if not protocol.name:
+                raise ValueError("Protocol name is required")
+            group = stimulus_builder.ElectrodeGroup(
+                self.preview_group_name.text().strip() or "preview_group",
+                stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
+            )
+            if not group.electrodes:
+                raise ValueError("At least one stimulation electrode is required")
+        except Exception as exc:
+            _show_error_message(self, "Invalid preview settings", str(exc))
+            return
+        source_path = str(self.source_combo.currentData() or "") if hasattr(self, "source_combo") else ""
+        if source_path:
+            protocol.spontaneous_data_path = source_path
+        series = self._preview_series_for_protocol(protocol)
+        if str(getattr(protocol, "type", "")) not in {"poisson_random_electrodes", "custom_sequence"}:
+            series = self._apply_preview_site_group_to_series(series, group.electrodes)
+        self._render_protocol_preview(protocol, series_override=series, stimulation_override=group.electrodes)
+
+    @staticmethod
+    def _apply_preview_site_group_to_series(series: list[dict], electrodes: list[int]) -> list[dict]:
+        target_electrodes = [int(value) for value in electrodes]
+        if not target_electrodes:
+            return list(series)
+        copied = []
+        for index, item in enumerate(series):
+            next_item = dict(item)
+            electrode = target_electrodes[index % len(target_electrodes)]
+            next_item["channel"] = electrode
+            next_item["label"] = str(electrode)
+            copied.append(next_item)
+        return copied
 
     def _save_group(self) -> None:
         try:
@@ -17867,6 +19519,27 @@ class StimulusGenerationDialog(AppDialog):
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_combos()
+
+    def _save_group_from_settings(self) -> None:
+        try:
+            group = stimulus_builder.ElectrodeGroup(
+                self.preview_group_name.text().strip(),
+                stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
+            )
+            if not group.name:
+                raise ValueError("Group name is required")
+            if not group.electrodes:
+                raise ValueError("At least one stimulation electrode is required")
+        except Exception as exc:
+            _show_error_message(self, "Invalid group", str(exc))
+            return
+        self._upsert_group(group)
+        self.group_name.setText(group.name)
+        self.group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+        self._clear_preview_caches()
+        self._refresh_group_table()
+        self._refresh_block_combos()
+        self._draw_preview()
 
     def _save_protocol(self) -> None:
         try:
@@ -17903,33 +19576,36 @@ class StimulusGenerationDialog(AppDialog):
 
     def _save_block(self) -> None:
         try:
+            phase_name = str(self.block_phase_combo.currentData() or "")
+            selected_phase = next((phase for phase in self.block_phases if phase.name == phase_name), None)
+            if selected_phase is None:
+                raise ValueError("Select a saved block phase for the stim phase")
+            electrode_group = selected_phase.electrode_group
+            protocol_name = selected_phase.protocol
             phases = [
                 stimulus_builder.Phase(
                     phase_id,
                     int(self.phase_duration_fields[phase_id].text() or 300),
-                    str(self.phase_mode_combos[phase_id].currentText() or "open_loop"),
+                    "open_loop",
                 )
                 for phase_id in stimulus_builder.PHASES
             ]
             block = stimulus_builder.ExperimentBlock(
-                self.block_name.text().strip(),
-                str(self.block_group.currentData() or ""),
-                str(self.block_protocol.currentData() or ""),
+                self._block_name_for_phase(selected_phase.name),
+                electrode_group,
+                protocol_name,
                 phases,
             )
-            if not block.name:
-                raise ValueError("Block name is required")
         except Exception as exc:
             _show_error_message(self, "Invalid block", str(exc))
             return
-        row = self._selected_table_row(self.block_table)
-        if row is None or row >= len(self.blocks):
-            self.blocks.append(block)
-        else:
-            self.blocks[row] = block
+        self._upsert_block(block)
         self._clear_preview_caches()
         self._sync_poisson_protocol_auto_group(block.protocol)
         self._refresh_block_table()
+        self._select_block_by_name(block.name)
+        self._refresh_block_combos()
+        self._fill_block_form(block)
 
     def _remove_group(self) -> None:
         row = self._selected_table_row(self.group_table)
@@ -17958,6 +19634,12 @@ class StimulusGenerationDialog(AppDialog):
             del self.blocks[row]
             self._clear_preview_caches()
             self._refresh_block_table()
+            if self.blocks:
+                next_row = min(row, len(self.blocks) - 1)
+                self.block_table.selectRow(next_row)
+                self._fill_block_form(self.blocks[next_row])
+            else:
+                self.block_name.clear()
 
     def _update_protocol_from_form_if_possible(self, protocol_name: str) -> None:
         try:
@@ -17981,7 +19663,7 @@ class StimulusGenerationDialog(AppDialog):
         if source_path:
             protocol.spontaneous_data_path = source_path
         manual_group = self._manual_group_for_poisson_blocks(related_blocks)
-        fallback = list(manual_group.electrodes) if manual_group is not None else self._default_electrodes()
+        fallback = list(manual_group.electrodes) if manual_group is not None else self._settings_site_electrodes_or_default()
         try:
             candidates = self._poisson_candidate_electrodes_for_ui(protocol, fallback)
         except Exception as exc:
@@ -17989,7 +19671,7 @@ class StimulusGenerationDialog(AppDialog):
             return
         group_name = self.poisson_auto_groups.get(protocol.name)
         if not group_name:
-            base_group = manual_group.name if manual_group is not None else "poisson"
+            base_group = manual_group.name if manual_group is not None else self._settings_site_name_or_default()
             group_name = self._unique_group_name(f"{base_group}_{protocol.name}_auto")
             self.poisson_auto_groups[protocol.name] = group_name
         auto_group = next((group for group in self.groups if group.name == group_name), None)
@@ -18004,6 +19686,23 @@ class StimulusGenerationDialog(AppDialog):
         self._refresh_block_table()
         self._refresh_block_combos()
         self.generate_status.setText(f"Poisson auto electrodes updated: {group_name} ({len(candidates)})")
+
+    def _settings_site_name_or_default(self) -> str:
+        if hasattr(self, "preview_group_name"):
+            name = self.preview_group_name.text().strip()
+            if name:
+                return name
+        return "poisson"
+
+    def _settings_site_electrodes_or_default(self) -> list[int]:
+        if hasattr(self, "preview_group_electrodes"):
+            try:
+                electrodes = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
+                if electrodes:
+                    return electrodes
+            except Exception:
+                pass
+        return self._default_electrodes()
 
     def _poisson_candidate_electrodes_for_ui(self, protocol, fallback: list[int]) -> list[int]:
         source_path = self._preview_source_path_for_protocol(protocol)
@@ -18040,12 +19739,29 @@ class StimulusGenerationDialog(AppDialog):
             group = group_lookup.get(block.electrode_group)
             if group is not None:
                 return group
+        settings_group = self._settings_manual_group()
+        if settings_group is not None:
+            return settings_group
         row = self._selected_table_row(self.group_table) if hasattr(self, "group_table") else None
         if row is not None and 0 <= row < len(self.groups):
             group = self.groups[row]
             if group.name not in auto_group_names:
                 return group
         return next((group for group in self.groups if group.name not in auto_group_names), None)
+
+    def _settings_manual_group(self) -> object | None:
+        if not hasattr(self, "preview_group_name") or not hasattr(self, "preview_group_electrodes"):
+            return None
+        name = self.preview_group_name.text().strip()
+        if not name:
+            return None
+        try:
+            electrodes = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
+        except Exception:
+            return None
+        if not electrodes:
+            return None
+        return stimulus_builder.ElectrodeGroup(name, electrodes)
 
     def _unique_group_name(self, base: str) -> str:
         existing = {group.name for group in self.groups}
@@ -18081,7 +19797,7 @@ class StimulusGenerationDialog(AppDialog):
             lambda_mean_hz=float(self.protocol_fields["lambda_mean_hz"].text() or 1.0),
             lambda_std_hz=float(self.protocol_fields["lambda_std_hz"].text() or 0.25),
             random_seed=int(self.protocol_fields["random_seed"].text() or 42),
-            notes=self.protocol_notes.toPlainText().strip(),
+            notes="",
         )
 
     def _protocol_type_changed(self, *_args) -> None:
@@ -18196,11 +19912,15 @@ class StimulusGenerationDialog(AppDialog):
         if protocol is not None:
             self._render_protocol_preview(protocol)
 
-    def _render_protocol_preview(self, protocol) -> None:
-        series = self._preview_series_for_protocol(protocol)
+    def _render_protocol_preview(self, protocol, *, series_override: list[dict] | None = None, stimulation_override: list[int] | None = None) -> None:
+        series = self._copy_preview_series(series_override) if series_override is not None else self._preview_series_for_protocol(protocol)
         arrays = self._preview_raster_arrays_for_series(series)
         total_ms = self._preview_total_ms(protocol, arrays)
-        view_key = (self._protocol_preview_signature(protocol), self._preview_source_path_for_protocol(protocol))
+        view_key = (
+            self._protocol_preview_signature(protocol),
+            self._preview_source_path_for_protocol(protocol),
+            tuple(int(value) for value in (stimulation_override or [])),
+        )
         if self._preview_view_key != view_key:
             self.preview_window_start_ms = 0.0
             self.preview_window_ms = min(5000.0, total_ms)
@@ -18211,7 +19931,7 @@ class StimulusGenerationDialog(AppDialog):
         self.preview_raster_arrays = arrays
         self._clamp_preview_raster_window()
         self._draw_preview_raster_window()
-        self._draw_preview_channel_map(protocol, series)
+        self._draw_preview_channel_map(protocol, series, stimulation_override=stimulation_override)
 
     def _draw_preview_raster_window(self) -> None:
         protocol = self.preview_raster_protocol
@@ -18220,6 +19940,7 @@ class StimulusGenerationDialog(AppDialog):
         figure = self.preview_canvas.figure
         figure.clear()
         ax = figure.add_subplot(111)
+        figure.subplots_adjust(left=0.16, right=0.985, top=0.86, bottom=0.22)
         self.preview_raster_axis = ax
         start_ms = float(self.preview_window_start_ms)
         stop_ms = start_ms + float(self.preview_window_ms)
@@ -18261,8 +19982,11 @@ class StimulusGenerationDialog(AppDialog):
         axis_left = start_ms - axis_pad_ms if start_ms <= 0.0 else start_ms
         axis_right = stop_ms + axis_pad_ms if stop_ms >= float(self.preview_total_ms) else stop_ms
         ax.set_xlim(axis_left, axis_right)
-        ax.set_yticks(offsets)
-        ax.set_yticklabels([item["label"] for item in series])
+        label_stride = max(1, int(np.ceil(len(series) / 14.0)))
+        tick_offsets = offsets[::label_stride]
+        tick_labels = [item["label"] for item in series][::label_stride]
+        ax.set_yticks(tick_offsets)
+        ax.set_yticklabels(tick_labels, fontsize=8)
         ax.grid(True, axis="x", color="#d7deea", linewidth=0.8)
         ax.set_ylim(0.5, max(len(series), 1) + 0.5)
         self._update_preview_window_label()
@@ -18444,11 +20168,12 @@ class StimulusGenerationDialog(AppDialog):
         self._preview_series_cache[cache_key] = self._copy_preview_series(series)
         return self._copy_preview_series(series)
 
-    def _draw_preview_channel_map(self, protocol, series: list[dict]) -> None:
+    def _draw_preview_channel_map(self, protocol, series: list[dict], *, stimulation_override: list[int] | None = None) -> None:
         figure = self.preview_map_canvas.figure
         figure.clear()
         ax = figure.add_subplot(111)
-        stimulation = self._stimulus_electrodes_for_preview(protocol, series)
+        figure.subplots_adjust(left=0.01, right=0.99, top=0.92, bottom=0.01)
+        stimulation = [int(value) for value in stimulation_override] if stimulation_override is not None else self._stimulus_electrodes_for_preview(protocol, series)
         recording, metrics = self._recording_electrode_metrics_for_preview(protocol)
         selected = getattr(self, "preview_map_selected", None)
         state = draw_maxwell_channel_map(
@@ -18460,6 +20185,10 @@ class StimulusGenerationDialog(AppDialog):
             selected_electrode=None,
             title="Stim sites",
         )
+        if self.preview_map_view_limits is not None:
+            xlim, ylim = self.preview_map_view_limits
+            ax.set_xlim(float(xlim[0]), float(xlim[1]))
+            ax.set_ylim(float(ylim[0]), float(ylim[1]))
         self.preview_map_selection_artist = None
         self.preview_map_state = state
         self.preview_map_protocol = protocol
@@ -18489,6 +20218,50 @@ class StimulusGenerationDialog(AppDialog):
         else:
             self.preview_map_detail.setText(f"Recording electrodes: {len(recording)}")
         self.preview_map_canvas.draw_idle()
+
+    def _preview_map_scrolled(self, event) -> None:
+        if event is None or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        figure = self.preview_map_canvas.figure
+        if not figure.axes or event.inaxes is not figure.axes[0]:
+            return
+        ax = figure.axes[0]
+        try:
+            step = float(getattr(event, "step", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            step = 0.0
+        button = str(getattr(event, "button", "") or "").lower()
+        factor = 0.82 if step > 0 or button == "up" else 1.22
+        x0, x1 = map(float, ax.get_xlim())
+        y0, y1 = map(float, ax.get_ylim())
+        cx = float(event.xdata)
+        cy = float(event.ydata)
+        new_x = self._zoom_axis_limits(x0, x1, cx, factor)
+        new_y = self._zoom_axis_limits(y0, y1, cy, factor)
+        ax.set_xlim(*new_x)
+        ax.set_ylim(*new_y)
+        self.preview_map_view_limits = (tuple(new_x), tuple(new_y))
+        self.preview_map_canvas.draw_idle()
+
+    @staticmethod
+    def _zoom_axis_limits(lo: float, hi: float, anchor: float, factor: float) -> tuple[float, float]:
+        if not np.isfinite([lo, hi, anchor, factor]).all() or hi == lo:
+            return (lo, hi)
+        span = max(0.02, abs(hi - lo) * max(0.2, float(factor)))
+        direction = 1.0 if hi >= lo else -1.0
+        low, high = (lo, hi) if lo <= hi else (hi, lo)
+        fraction = (anchor - low) / max(high - low, 1e-12)
+        fraction = min(1.0, max(0.0, fraction))
+        new_low = anchor - span * fraction
+        new_high = new_low + span
+        return (new_low, new_high) if direction >= 0 else (new_high, new_low)
+
+    def _reset_preview_map_view(self) -> None:
+        self.preview_map_view_limits = None
+        protocol = getattr(self, "preview_map_protocol", None) or getattr(self, "preview_raster_protocol", None)
+        series = getattr(self, "preview_map_series", None) or getattr(self, "preview_raster_series", [])
+        if protocol is not None:
+            self._draw_preview_channel_map(protocol, list(series))
 
     def _update_preview_map_selection_artist(self, electrode, *, draw: bool = True) -> str | None:
         artist = getattr(self, "preview_map_selection_artist", None)
@@ -18887,6 +20660,7 @@ class MainWindow(QMainWindow):
         self.multi_file_fa_payload = None
         self.generic_analysis_dialog = None
         self.generic_analysis_payload = None
+        self.custom_data_selection_dialog = None
         self.stimulus_generation_dialog = None
         self.active_processed_index = -1
 
@@ -19258,20 +21032,87 @@ class MainWindow(QMainWindow):
 
     def _start_generic_analysis_from_dialog(self):
         dialog = self._generic_analysis_dialog()
+        _paths, parameters = dialog.values()
+        action = str(parameters.get("action", "") or "")
+        if action in {"firing_rate_vector", "spike_count_vector"}:
+            self._open_custom_data_selection(action)
+            return
+        if action == "plot":
+            self._open_custom_plot_dialog()
+            return
+        if action == "pipeline":
+            self._open_custom_pipeline_dialog()
+            return
+        dialog.show()
+
+    def _open_custom_data_selection(self, analysis_type: str):
+        if self.custom_data_selection_dialog is not None:
+            self.custom_data_selection_dialog.close()
+        dialog = CustomDataSelectionDialog(
+            self.file_database,
+            analysis_type,
+            self.channel_map,
+            self,
+            open_main_raster_callback=self._open_main_raster_for_database_path,
+        )
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.accepted.connect(lambda d=dialog: self._finish_custom_data_selection(d, open_plot=False))
+        dialog.rejected.connect(self._return_to_generic_analysis_dialog)
+        dialog.finished.connect(lambda _result, d=dialog: self._forget_custom_data_selection_dialog(d))
+        self.custom_data_selection_dialog = dialog
+        self._show_child(dialog)
+        if self.generic_analysis_dialog is not None:
+            _defer_hide(self.generic_analysis_dialog, 0)
+
+    def _open_custom_pipeline_dialog(self):
+        if self.custom_data_selection_dialog is not None:
+            self.custom_data_selection_dialog.close()
+        dialog = CustomDataSelectionDialog(
+            self.file_database,
+            "firing_rate_vector",
+            self.channel_map,
+            self,
+            open_main_raster_callback=self._open_main_raster_for_database_path,
+        )
+        dialog.setWindowTitle("Custom Pipeline")
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.accepted.connect(lambda d=dialog: self._finish_custom_data_selection(d, open_plot=True))
+        dialog.rejected.connect(self._return_to_generic_analysis_dialog)
+        dialog.finished.connect(lambda _result, d=dialog: self._forget_custom_data_selection_dialog(d))
+        self.custom_data_selection_dialog = dialog
+        self._show_child(dialog)
+        if self.generic_analysis_dialog is not None:
+            _defer_hide(self.generic_analysis_dialog, 0)
+
+    def _finish_custom_data_selection(self, dialog: CustomDataSelectionDialog, *, open_plot: bool) -> None:
         paths, parameters = dialog.values()
+        self._run_custom_analysis_records(paths, parameters, open_result=False)
+        if open_plot:
+            self._open_custom_plot_dialog()
+        else:
+            self._return_to_generic_analysis_dialog()
+
+    def _forget_custom_data_selection_dialog(self, dialog: CustomDataSelectionDialog) -> None:
+        if self.custom_data_selection_dialog is dialog:
+            self.custom_data_selection_dialog = None
+
+    def _run_custom_analysis_records(self, paths: list[str], parameters: dict, *, open_result: bool = True) -> dict:
         if not paths:
             _show_info_message(self, "Custom Analysis", "Select at least one database file.")
-            dialog.show()
-            return
+            return {"records": [], "errors": ["No files selected"], "parameters": dict(parameters or {})}
         selected_lookup = set(paths)
         records = []
         errors = []
         processed_records = []
+        raw_records = []
         for record in self.file_database:
             path_text = str(record.get("path", ""))
             if path_text not in selected_lookup:
                 continue
             try:
+                raw_record = self._build_custom_raw_selection_record(record, parameters)
+                self._upsert_processed_record(raw_record)
+                raw_records.append(raw_record)
                 processed = self._build_custom_analysis_record(record, parameters)
                 self._upsert_processed_record(processed)
                 processed_records.append(processed)
@@ -19290,15 +21131,73 @@ class MainWindow(QMainWindow):
         if not records:
             details = "\n".join(errors[:12]) if errors else "No files could be analyzed."
             _show_warning_message(self, "Custom Analysis", details)
-            dialog.show()
-            return
+            return payload
         self._refresh_processed_database_table()
         if self.generic_analysis_dialog is not None and hasattr(self.generic_analysis_dialog, "_set_records"):
             self.generic_analysis_dialog._set_records(self.file_database)
         self._update_analysis_action_states()
-        self._set_app_status("Custom analysis ready", f"{len(processed_records)} processed dataset(s) added.")
+        self._set_app_status("Custom analysis ready", f"{len(raw_records)} raw selection(s), {len(processed_records)} feature dataset(s) added.")
         self.generic_analysis_payload = payload
-        self._open_generic_analysis_window(payload)
+        if open_result:
+            self._open_generic_analysis_window(payload)
+        else:
+            message = f"Saved {len(raw_records)} raw selection(s) and {len(processed_records)} feature dataset(s) into the processed-data database."
+            if errors:
+                message += "\n\nSkipped:\n" + "\n".join(errors[:8])
+            _show_info_message(self, "Custom Analysis", message)
+        return payload
+
+    def _open_custom_plot_dialog(self):
+        if not self.processed_database:
+            _show_info_message(self, "Custom Plot", "No processed data is available. Run a basic function first.")
+            if self.generic_analysis_dialog is not None:
+                self.generic_analysis_dialog.show()
+            return
+        dialog = CustomPlotDialog(self.processed_database, self, save_extracted_callback=self._save_custom_extracted_records)
+        dialog.finished.connect(lambda _result: self._return_to_generic_analysis_dialog())
+        self._show_child(dialog)
+        if self.generic_analysis_dialog is not None:
+            _defer_hide(self.generic_analysis_dialog, 0)
+
+    def _save_custom_extracted_records(self, records, parameters: dict | None = None) -> int:
+        saved = 0
+        params = dict(parameters or {})
+        stamp = int(time.time() * 1000)
+        for index, record in enumerate(list(records or [])):
+            saved_record = dict(record)
+            source_path = str(saved_record.get("custom_extraction", {}).get("source_processed_path") or saved_record.get("path", ""))
+            saved_record["path"] = f"{source_path}::extracted::{stamp}::{index}"
+            base_type = str(saved_record.get("dataset_type", "processed"))
+            saved_record["dataset_type"] = base_type if base_type.endswith("_extracted") else f"{base_type}_extracted"
+            saved_record["dataset_group"] = "custom_extracted"
+            saved_record["dataset_origin"] = "custom_plot_extraction"
+            saved_record["commit"] = "custom | extracted processed data"
+            saved_record["commit_detail"] = str(saved_record.get("description", "Extracted processed data"))
+            if params.get("extracted_name"):
+                saved_record["name"] = str(params.get("extracted_name"))
+            self._upsert_processed_record(saved_record)
+            saved += 1
+        if saved:
+            self._refresh_processed_database_table()
+            self._update_analysis_action_states()
+            self._set_app_status("Extracted data saved", f"{saved} processed subset(s) added.")
+        return saved
+
+    def _open_main_raster_for_database_path(self, path_text: str) -> None:
+        target = str(path_text or "")
+        if not target:
+            return
+        for row, record in enumerate(self.file_database):
+            if str(record.get("path", "")) != target:
+                continue
+            if hasattr(self, "database_table"):
+                self.database_table.clearSelection()
+                self.database_table.selectRow(row)
+                self.database_table.setCurrentCell(row, 0)
+            self._set_active_database_index(row)
+            self.preview_raw()
+            return
+        _show_warning_message(self, "Custom Analysis", f"Selected file is no longer in the database:\n{target}")
 
     def _open_generic_analysis_window(self, payload: dict):
         window = GenericAnalysisWindow(payload, self)
@@ -19306,6 +21205,55 @@ class MainWindow(QMainWindow):
         window.finished.connect(lambda _result: self._return_to_generic_analysis_dialog())
         self._show_child(window)
         _defer_hide(dialog, 0)
+
+    def _build_custom_raw_selection_record(self, record: dict, parameters: dict) -> dict:
+        data = (record or {}).get("raw_data")
+        if not isinstance(data, UnifiedMEAData):
+            raise ValueError("Custom raw selection requires loaded spike-event data")
+        path_text = str((record or {}).get("path", ""))
+        spike_series = _spike_series_from_unified(data)
+        selected_channels = _custom_channel_filter(spike_series, str(parameters.get("channels", "")))
+        if not selected_channels:
+            raise ValueError("No selected channels matched this file")
+        windows = _parse_custom_time_windows(str(parameters.get("time_windows", "full")), data)
+        matrix, sample_labels, feature_labels, description = _custom_spike_vector_matrix(selected_channels, windows, "spike_count_vector")
+        safe_stamp = int(time.time() * 1000)
+        display_prefix = str(parameters.get("display_name", "") or "").strip()
+        display_name = display_prefix or f"{Path(path_text).name} | selected raw segment"
+        selection = {
+            "source_path": path_text,
+            "windows": [{"start_s": float(start), "stop_s": float(stop), "label": str(label)} for start, stop, label in windows],
+            "channels": [str(label) for label, _times in selected_channels],
+            "data_type": "raw_spike_segment",
+        }
+        return {
+            "path": f"{path_text}::custom::raw_segment::{safe_stamp}",
+            "source_path": path_text,
+            "origin_name": Path(path_text).name,
+            "name": display_name,
+            "source_label": _loaded_data_activity_label(path_text, data),
+            "dataset_type": "custom_raw_segment",
+            "dataset_group": "custom_raw",
+            "dataset_origin": "custom_analysis",
+            "commit": "custom | raw segment",
+            "commit_detail": f"Custom raw spike segment selection | windows={len(windows)} | channels={len(selected_channels)}",
+            "view_mode": "custom_raw_segment",
+            "description": f"Raw spike segment selection stored with spike-count preview | {description}",
+            "matrix": matrix,
+            "sample_labels": list(sample_labels),
+            "feature_labels": list(feature_labels),
+            "parameters": dict(parameters or {}),
+            "custom_selection": selection,
+            "plot_payload": {
+                "kind": "auto_xy",
+                "plot_mode": "auto",
+                "x": list(range(1, len(sample_labels) + 1)),
+                "x_labels": list(sample_labels),
+                "y_label": "Spike count",
+                "x_label": "Selected segment",
+                "series_labels": list(feature_labels),
+            },
+        }
 
     def _build_custom_analysis_record(self, record: dict, parameters: dict) -> dict:
         data = (record or {}).get("raw_data")
@@ -19333,7 +21281,10 @@ class MainWindow(QMainWindow):
         }
         safe_stamp = int(time.time() * 1000)
         dataset_type = str(analysis_type)
-        display_name = str(parameters.get("display_name", "") or "").strip() or f"{Path(path_text).name} | {dataset_type}"
+        window_tag = f"{len(sample_labels)} window{'s' if len(sample_labels) != 1 else ''}"
+        channel_tag = f"{len(feature_labels)} channel{'s' if len(feature_labels) != 1 else ''}"
+        default_name = f"{Path(path_text).name} | {dataset_type} | {window_tag} | {channel_tag}"
+        display_name = str(parameters.get("display_name", "") or "").strip() or default_name
         return {
             "path": f"{path_text}::custom::{dataset_type}::{safe_stamp}",
             "source_path": path_text,
@@ -20791,3 +22742,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

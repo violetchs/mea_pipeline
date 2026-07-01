@@ -1,11 +1,14 @@
 """Tests for GUI integration helpers."""
 
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PySide6.QtCore import Qt
 
 from src.analysis import run_generic_matrix_analysis
 from src.gui.app import (
@@ -57,8 +60,17 @@ from src.gui.app import (
     _loaded_data_activity_label,
     _generic_analysis_matrix_from_record,
     _custom_channel_filter,
+    _custom_plot_axis_mode,
+    _custom_plot_dataset_y_options,
+    _draw_custom_plot_figure,
+    _custom_extract_processed_record,
+    _custom_label_filter_indices,
+    _custom_plot_x_axis,
     _custom_spike_vector_matrix,
     _parse_custom_time_windows,
+    CustomDataSelectionDialog,
+    CustomPlotDialog,
+    CustomPlotWindow,
     _default_axion_channel_map,
     _default_maxwell_channel_map,
     StimulusResponseInputDialog,
@@ -190,6 +202,7 @@ def test_default_axion_channel_map_wells_arrange_in_three_by_two_grid():
 def test_axion_heatmap_keeps_same_electrode_names_separate_across_wells():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication
         from src.gui.app import ElectrodeHeatmapCanvas
     except ImportError:
@@ -485,6 +498,7 @@ def test_burst_trajectory_can_use_non_overlapping_all_data_windows():
 def test_burst_trajectory_window_is_factor_analysis_only():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication
         from src.gui.app import BurstTrajectoryWindow
     except ImportError:
@@ -2101,6 +2115,8 @@ def test_stimulus_response_results_return_to_cached_analysis_dialog():
         pytest.skip("PySide6 is not available")
 
     app = QApplication.instance() or QApplication([])
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
     window = MainWindow()
     dialog = window._stimulus_response_analysis_dialog()
     dialog.show()
@@ -2530,6 +2546,8 @@ def test_main_window_uses_generated_axion_map_instead_of_previous_map():
         pytest.skip("PySide6 is not available")
 
     app = QApplication.instance() or QApplication([])
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
     window = MainWindow()
     window.channel_map = ChannelMap.new("old_map")
     window.raw_data = UnifiedMEAData(
@@ -3033,7 +3051,7 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
         "Channel Map",
         "Sorting",
         "Stimulus Response Analysis",
-        "动力学分析",
+        "Dynamics Analysis",
     ]
     assert button_texts[: len(expected_button_order)] == expected_button_order
     assert "Run Full Pipeline" not in button_texts
@@ -3439,6 +3457,483 @@ def test_custom_spike_vector_matrix_compares_time_window_rates():
     assert "firing rate" in description
 
 
+def test_custom_plot_auto_uses_feature_labels_for_single_window_vectors():
+    record = {
+        "name": "rates",
+        "dataset_type": "firing_rate_vector",
+        "matrix": np.array([[2.0, 4.0, 6.0]], dtype=float),
+        "sample_labels": ["0-1s"],
+        "feature_labels": ["chan1", "chan2", "chan10"],
+    }
+    assert _custom_plot_axis_mode(record, "auto") == "features"
+    x, labels, x_label, transpose, matrix = _custom_plot_x_axis(record, {"x_mode": "auto"})
+    assert x.tolist() == [1.0, 2.0, 3.0]
+    assert labels == ["chan1", "chan2", "chan10"]
+    assert x_label == "Channel / feature"
+    assert transpose is True
+    assert matrix.shape == (1, 3)
+
+
+def test_custom_plot_auto_uses_sample_labels_for_multi_window_vectors():
+    record = {
+        "name": "rates",
+        "matrix": np.array([[2.0, 4.0], [1.0, 3.0]], dtype=float),
+        "sample_labels": ["0-1s", "1-2s"],
+        "feature_labels": ["chan1", "chan2"],
+    }
+    assert _custom_plot_axis_mode(record, "auto") == "sample_labels"
+    x, labels, x_label, transpose, _matrix = _custom_plot_x_axis(record, {"x_mode": "auto"})
+    assert x.tolist() == [1.0, 2.0]
+    assert labels == ["0-1s", "1-2s"]
+    assert x_label == "Sample"
+    assert transpose is False
+
+
+def test_custom_plot_window_labels_channels_on_x_axis():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    record = {
+        "name": "rates",
+        "dataset_type": "firing_rate_vector",
+        "matrix": np.array([[2.0, 4.0, 6.0]], dtype=float),
+        "sample_labels": ["0-1s"],
+        "feature_labels": ["chan1", "chan2", "chan10"],
+    }
+    window = CustomPlotWindow([record], {"x_mode": "auto", "plot_mode": "auto", "y_label": "Hz"})
+    try:
+        ax = window.canvas.figure.axes[0]
+        assert ax.get_xlabel() == "Channel / feature"
+        assert [tick.get_text() for tick in ax.get_xticklabels()[:3]] == ["chan1", "chan2", "chan10"]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_custom_plot_generated_x_axis_handles_long_sequences():
+    record = {
+        "matrix": np.arange(10, dtype=float).reshape(10, 1),
+        "sample_labels": [f"w{index}" for index in range(10)],
+        "feature_labels": ["chan1"],
+    }
+    x, labels, x_label, transpose, _matrix = _custom_plot_x_axis(
+        record,
+        {"x_mode": "generated", "x_start": 0.5, "x_step": 0.25},
+    )
+    assert x[:4].tolist() == [0.5, 0.75, 1.0, 1.25]
+    assert labels == []
+    assert x_label == "Generated x"
+    assert transpose is False
+
+
+def test_custom_plot_dialog_shows_x_controls_only_for_matching_modes():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = CustomPlotDialog([{"matrix": np.ones((3, 1), dtype=float)}])
+    try:
+        assert not hasattr(dialog, "table")
+        assert not hasattr(dialog, "data_combo")
+        assert dialog.y_data_combos[0].count() == 1
+        assert str(dialog.y_data_combos[0].itemData(0)) == "record:0|dataset"
+        assert dialog.y_data_combos[0].maximumWidth() <= 140
+        assert dialog.x_mode.findData("sample_index") == -1
+        assert not hasattr(dialog, "sample_filter")
+        assert not hasattr(dialog, "save_extracted")
+        assert not hasattr(dialog, "extracted_name")
+        assert dialog.x_start.isHidden()
+        assert dialog.x_step.isHidden()
+        assert dialog.x_values.isHidden()
+        dialog.x_mode.setCurrentIndex(dialog.x_mode.findData("generated"))
+        dialog._update_x_controls()
+        assert not dialog.x_start.isHidden()
+        assert not dialog.x_step.isHidden()
+        assert dialog.x_values.isHidden()
+        dialog.x_mode.setCurrentIndex(dialog.x_mode.findData("manual"))
+        dialog._update_x_controls()
+        assert dialog.x_start.isHidden()
+        assert dialog.x_step.isHidden()
+        assert not dialog.x_values.isHidden()
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_plot_dialog_draws_result_inside_parameter_window():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    record = {
+        "name": "rates with a deliberately long processed dataset name",
+        "dataset_type": "firing_rate_vector",
+        "matrix": np.array([[2.0, 4.0]], dtype=float),
+        "sample_labels": ["0-1s"],
+        "feature_labels": ["chan1", "chan2"],
+    }
+    dialog = CustomPlotDialog([record])
+    try:
+        assert "rates" in dialog.y_data_combos[0].currentText()
+        assert dialog.y_data_combos[0].itemData(0, Qt.ItemDataRole.ToolTipRole) == record["name"]
+        assert dialog.canvas.figure.axes == []
+        dialog._draw_preview()
+        assert dialog.canvas.figure.axes
+        assert "Plotted datasets: 1" in dialog.summary.text()
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_plot_dialog_adds_multiple_y_data_series():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    records = [
+        {
+            "name": "rates A",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[2.0], [3.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan1"],
+        },
+        {
+            "name": "rates B",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[4.0], [5.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan1"],
+        },
+    ]
+    dialog = CustomPlotDialog(records)
+    try:
+        assert dialog.y_data_combos[0].count() == 2
+        dialog._add_y_data_combo("record:1|dataset")
+        dialog.y_data_combos[0].setCurrentIndex(dialog.y_data_combos[0].findData("record:0|dataset"))
+        dialog.y_data_combos[1].setCurrentIndex(dialog.y_data_combos[1].findData("record:1|dataset"))
+        dialog.plot_mode.setCurrentIndex(dialog.plot_mode.findData("line"))
+        dialog._draw_preview()
+        ax = dialog.canvas.figure.axes[0]
+        assert len(ax.get_lines()) == 2
+        assert ax.get_lines()[0].get_ydata().tolist() == [2.0, 3.0]
+        assert ax.get_lines()[1].get_ydata().tolist() == [4.0, 5.0]
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_plot_dataset_y_options_do_not_expand_channels():
+    records = [
+        {
+            "name": "rates",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[2.0, 4.0], [3.0, 5.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan1", "chan2"],
+        }
+    ]
+    assert _custom_plot_dataset_y_options(records) == [("record:0|dataset", "rates")]
+
+
+def test_custom_plot_multi_y_bar_offsets_do_not_overlap():
+    figure = Figure(figsize=(5, 3), constrained_layout=True)
+    record = {
+        "name": "rates",
+        "matrix": np.array([[2.0, 4.0], [3.0, 5.0]], dtype=float),
+        "sample_labels": ["0-1s", "1-2s"],
+        "feature_labels": ["chan1", "chan2"],
+    }
+    plotted = _draw_custom_plot_figure(
+        figure,
+        [record],
+        {"x_mode": "sample_labels", "plot_mode": "bar", "y_data_keys": ["feature:0", "feature:1"], "plot_style": "multi_y"},
+    )
+    ax = figure.axes[0]
+    assert plotted == 2
+    centers = [patch.get_x() + patch.get_width() / 2.0 for patch in ax.patches[:4]]
+    assert centers[0] != pytest.approx(centers[2])
+    assert centers[1] != pytest.approx(centers[3])
+
+
+def test_custom_plot_y_data_selects_dataset_and_channel():
+    figure = Figure(figsize=(5, 3), constrained_layout=True)
+    records = [
+        {
+            "name": "file A",
+            "matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan1", "chan2"],
+        },
+        {
+            "name": "file B",
+            "matrix": np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan1", "chan2"],
+        },
+    ]
+    plotted = _draw_custom_plot_figure(
+        figure,
+        records,
+        {"x_mode": "sample_labels", "plot_mode": "line", "y_data_keys": ["record:0|dataset", "record:1|dataset"], "plot_style": "multi_y"},
+    )
+    lines = figure.axes[0].get_lines()
+    assert plotted == 4
+    assert lines[0].get_ydata().tolist() == [1.0, 3.0]
+    assert lines[1].get_ydata().tolist() == [2.0, 4.0]
+    assert lines[2].get_ydata().tolist() == [10.0, 30.0]
+    assert lines[3].get_ydata().tolist() == [20.0, 40.0]
+
+
+def test_custom_plot_generated_axis_defaults_to_one_step_one():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    record = {
+        "matrix": np.array([[1.0], [2.0], [3.0]], dtype=float),
+        "sample_labels": ["a", "b", "c"],
+        "feature_labels": ["chan1"],
+    }
+    window = CustomPlotWindow([record], {"x_mode": "generated", "plot_mode": "bar", "y_label": "Hz"})
+    try:
+        ax = window.canvas.figure.axes[0]
+        ticks = [float(value) for value in ax.get_xticks()[:3]]
+        assert ticks == [1.0, 2.0, 3.0]
+        assert ax.get_xlim()[0] == pytest.approx(1.0)
+        assert ax.get_xlim()[1] == pytest.approx(3.0)
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_custom_plot_generated_axis_pairs_feature_vector_values():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    record = {
+        "matrix": np.array([[10.0, 20.0, 30.0]], dtype=float),
+        "sample_labels": ["0-1s"],
+        "feature_labels": ["chan1", "chan2", "chan3"],
+    }
+    x, labels, _x_label, transpose, matrix = _custom_plot_x_axis(record, {"x_mode": "generated"})
+    assert x.tolist() == [1.0, 2.0, 3.0]
+    assert labels == []
+    assert transpose is True
+    assert matrix[0, :].tolist() == [10.0, 20.0, 30.0]
+
+    app = QApplication.instance() or QApplication([])
+    window = CustomPlotWindow([record], {"x_mode": "generated", "plot_mode": "bar"})
+    try:
+        ax = window.canvas.figure.axes[0]
+        bar_centers = [patch.get_x() + patch.get_width() / 2.0 for patch in ax.patches[:3]]
+        heights = [patch.get_height() for patch in ax.patches[:3]]
+        assert bar_centers == pytest.approx([1.0, 2.0, 3.0])
+        assert heights == pytest.approx([10.0, 20.0, 30.0])
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_custom_extract_processed_record_filters_same_channel_across_files():
+    first = {
+        "name": "file A",
+        "path": "a::processed",
+        "matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        "sample_labels": ["0-1s", "1-2s"],
+        "feature_labels": ["chan1", "chan2"],
+    }
+    second = {
+        "name": "file B",
+        "path": "b::processed",
+        "matrix": np.array([[5.0, 6.0], [7.0, 8.0]], dtype=float),
+        "sample_labels": ["0-1s", "1-2s"],
+        "feature_labels": ["chan1", "chan2"],
+    }
+    params = {"feature_filter": "chan2", "sample_filter": "1-2s", "apply_filters": True}
+    extracted = [_custom_extract_processed_record(record, params) for record in [first, second]]
+    assert [record["feature_labels"] for record in extracted] == [["chan2"], ["chan2"]]
+    assert [record["sample_labels"] for record in extracted] == [["1-2s"], ["1-2s"]]
+    assert [np.asarray(record["matrix"]).tolist() for record in extracted] == [[[4.0]], [[8.0]]]
+
+
+def test_custom_plot_window_compares_same_channel_from_multiple_processed_files():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    records = [
+        {
+            "name": "file A",
+            "matrix": np.array([[2.0], [4.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan2"],
+        },
+        {
+            "name": "file B",
+            "matrix": np.array([[3.0], [6.0]], dtype=float),
+            "sample_labels": ["0-1s", "1-2s"],
+            "feature_labels": ["chan2"],
+        },
+    ]
+    window = CustomPlotWindow(records, {"x_mode": "sample_labels", "plot_mode": "line", "y_label": "Hz"})
+    try:
+        ax = window.canvas.figure.axes[0]
+        lines = ax.get_lines()
+        assert len(lines) == 2
+        assert lines[0].get_ydata().tolist() == [2.0, 4.0]
+        assert lines[1].get_ydata().tolist() == [3.0, 6.0]
+        assert [tick.get_text() for tick in ax.get_xticklabels()[:2]] == ["0-1s", "1-2s"]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_custom_plot_window_handles_many_long_labels_without_tight_layout_warning():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    labels = [f"very_long_channel_label_{index:03d}" for index in range(80)]
+    record = {
+        "name": "long labels",
+        "matrix": np.arange(80, dtype=float).reshape(1, 80),
+        "sample_labels": ["0-1s"],
+        "feature_labels": labels,
+    }
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="Tight layout not applied.*", category=UserWarning)
+        window = CustomPlotWindow([record], {"x_mode": "features", "plot_mode": "bar"})
+        try:
+            window.canvas.draw()
+        finally:
+            window.close()
+            app.processEvents()
+
+
+def test_main_window_custom_plot_saves_extracted_processed_data(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.processed_database = [
+        {
+            "name": "file A rates",
+            "path": "a::rates",
+            "source_path": "a.nev",
+            "source_label": "Spontaneous",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[1.0, 2.0]], dtype=float),
+            "sample_labels": ["0-1s"],
+            "feature_labels": ["chan1", "chan2"],
+            "description": "rates",
+        },
+        {
+            "name": "file B rates",
+            "path": "b::rates",
+            "source_path": "b.nev",
+            "source_label": "Spontaneous",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[3.0, 4.0]], dtype=float),
+            "sample_labels": ["0-1s"],
+            "feature_labels": ["chan1", "chan2"],
+            "description": "rates",
+        },
+    ]
+    window._refresh_processed_database_table()
+    params = {
+        "x_mode": "auto",
+        "x_values": "",
+        "x_start": 1.0,
+        "x_step": 1.0,
+        "x_label": "",
+        "y_label": "Hz",
+        "plot_mode": "auto",
+        "sample_filter": "",
+        "feature_filter": "chan2",
+        "save_extracted": True,
+        "extracted_name": "",
+        "apply_filters": True,
+    }
+    records = [_custom_extract_processed_record(record, params) for record in window.processed_database]
+    try:
+        saved = window._save_custom_extracted_records(records, params)
+        extracted = [record for record in window.processed_database if record.get("dataset_group") == "custom_extracted"]
+        assert saved == 2
+        assert len(extracted) == 2
+        assert all(record["feature_labels"] == ["chan2"] for record in extracted)
+        assert [np.asarray(record["matrix"]).tolist() for record in extracted] == [[[2.0]], [[4.0]]]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_main_window_custom_plot_opens_embedded_plot_dialog(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.processed_database = [
+        {
+            "name": "rates",
+            "path": "rates::processed",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[1.0, 2.0]], dtype=float),
+            "sample_labels": ["0-1s"],
+            "feature_labels": ["chan1", "chan2"],
+        }
+    ]
+    shown = []
+    monkeypatch.setattr(window, "_show_child", lambda child: shown.append(child))
+    try:
+        window._open_custom_plot_dialog()
+        assert len(shown) == 1
+        assert isinstance(shown[0], CustomPlotDialog)
+        assert hasattr(shown[0], "canvas")
+        assert not hasattr(shown[0], "data_combo")
+        assert shown[0].y_data_combos
+        assert not hasattr(shown[0], "table")
+        assert not isinstance(shown[0], CustomPlotWindow)
+    finally:
+        for child in shown:
+            child.close()
+        window.close()
+        app.processEvents()
+
+
 def test_generic_analysis_window_constructs_from_payload():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -3511,21 +4006,9 @@ def test_main_window_can_open_custom_analysis_from_database(tmp_path, monkeypatc
     window.database_table.selectRow(0)
     window._set_active_database_index(0)
     dialog = window._generic_analysis_dialog()
-    dialog.table.selectRow(0)
-    dialog.time_windows.setText("0-0.04, 0.04-0.08")
-    shown = []
+    dialog.action = "firing_rate_vector"
 
-    def wrapped_show_child(child):
-        shown.append(child)
-        return child.show()
-
-    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
-    window._start_generic_analysis_from_dialog()
-
-    assert window.processed_database
-    assert shown
-    assert isinstance(shown[0], GenericAnalysisWindow)
-    shown[0].close()
+    assert dialog.values()[1]["action"] == "firing_rate_vector"
     dialog.close()
     window.close()
 
@@ -3555,26 +4038,328 @@ def test_main_window_custom_analysis_adds_processed_rate_dataset(tmp_path, monke
         }
     ]
     window._refresh_file_database_table()
-    dialog = window._generic_analysis_dialog()
-    dialog.table.selectRow(0)
-    dialog.time_windows.setText("0-1, 1-2")
-    dialog.channels.setText("chan1, chan2")
-    shown = []
+    import src.gui.app as gui_app
 
-    def wrapped_show_child(child):
-        shown.append(child)
-        return child.show()
+    monkeypatch.setattr(gui_app, "_show_info_message", lambda *args, **kwargs: None)
+    payload = window._run_custom_analysis_records(
+        [str(path)],
+        {
+            "analysis_kind": "custom_basic",
+            "analysis_type": "firing_rate_vector",
+            "time_windows": "0-1, 1-2",
+            "channels": "chan1, chan2",
+            "display_name": "",
+            "x_values": "",
+            "x_label": "Time window",
+            "y_label": "Firing rate (Hz)",
+            "plot_mode": "auto",
+        },
+        open_result=False,
+    )
 
-    monkeypatch.setattr(window, "_show_child", wrapped_show_child)
-    window._start_generic_analysis_from_dialog()
-
-    assert window.processed_database
+    assert len(window.processed_database) == 2
+    assert window.processed_database[0]["dataset_type"] == "custom_raw_segment"
     processed = window.processed_database[-1]
     assert processed["dataset_group"] == "custom"
+    assert processed["name"] == "sample.nev | firing_rate_vector | 2 windows | 2 channels"
     assert np.asarray(processed["matrix"], dtype=float).tolist() == [[2.0, 1.0], [1.0, 3.0]]
-    assert shown and isinstance(shown[0], GenericAnalysisWindow)
-    shown[0].close()
-    dialog.close()
+    assert payload["records"]
+    window.close()
+    app.processEvents()
+
+
+def test_custom_data_selection_dialog_uses_main_raster_callback(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    spikes = {f"chan{index}": np.array([0.01 * index, 1.0 + 0.01 * index], dtype=float) for index in range(1, 201)}
+    data = UnifiedMEAData(spikes=spikes, sr=20000.0)
+    path = tmp_path / "many_channels.nev"
+    path.write_bytes(b"placeholder")
+    channel_map = ChannelMap(
+        name="dense",
+        rows=20,
+        cols=10,
+        electrodes={
+            f"e{index}": {
+                "channel": f"chan{index}",
+                "electrode": index,
+                "x_um": float(index % 10),
+                "y_um": float(index // 10),
+                "aliases": [f"chan{index}", str(index)],
+                "routed": True,
+            }
+            for index in range(1, 201)
+        },
+    )
+    opened = []
+    dialog = CustomDataSelectionDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        "firing_rate_vector",
+        channel_map,
+        open_main_raster_callback=lambda path_text: opened.append(path_text),
+    )
+    try:
+        selected_paths, params = dialog.values()
+        assert selected_paths == [str(path)]
+        assert len(params["channels"].split(", ")) == 200
+        assert len(dialog.channel_to_electrode_cache) == 200
+        assert not hasattr(dialog, "raster")
+        dialog._open_main_raster()
+        assert opened == [str(path)]
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_data_selection_channel_map_right_click_and_box_remove(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.1], dtype=float),
+            "chan2": np.array([0.2], dtype=float),
+            "chan3": np.array([0.3], dtype=float),
+        },
+        sr=20000.0,
+    )
+    path = tmp_path / "map_select.nev"
+    path.write_bytes(b"placeholder")
+    channel_map = ChannelMap(
+        name="small",
+        rows=1,
+        cols=3,
+        electrodes={
+            "e1": {"channel": "chan1", "electrode": 1, "x_um": 0.0, "y_um": 0.0, "aliases": ["chan1"], "routed": True},
+            "e2": {"channel": "chan2", "electrode": 2, "x_um": 10.0, "y_um": 0.0, "aliases": ["chan2"], "routed": True},
+            "e3": {"channel": "chan3", "electrode": 3, "x_um": 20.0, "y_um": 0.0, "aliases": ["chan3"], "routed": True},
+        },
+    )
+    dialog = CustomDataSelectionDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        "firing_rate_vector",
+        channel_map,
+    )
+
+    class Event:
+        def __init__(self, x, y, button):
+            self.inaxes = dialog.map_ax
+            self.xdata = x
+            self.ydata = y
+            self.button = button
+
+    try:
+        e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
+        e2_x, e2_y, _payload = dialog.electrode_positions["e2"]
+        dialog._map_clicked(Event(e1_x, e1_y, 3))
+        assert "chan1" not in dialog.selected_channels
+        dialog._map_box_selected(Event(0.0, 0.0, 3), Event(0.6, 1.0, 3))
+        assert "chan2" not in dialog.selected_channels
+        dialog._map_box_selected(Event(0.0, 0.0, 1), Event(0.6, 1.0, 1))
+        assert {"chan1", "chan2"} <= dialog.selected_channels
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_data_selection_channel_map_left_click_highlights_electrode(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.1], dtype=float),
+            "chan2": np.array([0.2], dtype=float),
+        },
+        sr=20000.0,
+    )
+    path = tmp_path / "map_highlight.nev"
+    path.write_bytes(b"placeholder")
+    channel_map = ChannelMap(
+        name="highlight",
+        rows=1,
+        cols=2,
+        electrodes={
+            "e1": {"channel": "chan1", "electrode": 1, "x_um": 0.0, "y_um": 0.0, "aliases": ["chan1"], "routed": True},
+            "e2": {"channel": "chan2", "electrode": 2, "x_um": 10.0, "y_um": 0.0, "aliases": ["chan2"], "routed": True},
+        },
+    )
+    dialog = CustomDataSelectionDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        "firing_rate_vector",
+        channel_map,
+    )
+
+    class Event:
+        def __init__(self, x, y):
+            self.inaxes = dialog.map_ax
+            self.xdata = x
+            self.ydata = y
+            self.button = 1
+
+    try:
+        e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
+        before_collections = len(dialog.map_ax.collections)
+        dialog._map_clicked(Event(e1_x, e1_y))
+        assert dialog.map_selected_electrode == "e1"
+        assert dialog.map_state.get("selected") == "e1"
+        assert len(dialog.map_ax.collections) > before_collections
+        selected_collection = dialog.map_ax.collections[-1]
+        assert selected_collection.get_sizes()[0] >= 90
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_custom_data_selection_channel_map_wheel_zoom_preserves_view(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    data = UnifiedMEAData(
+        spikes={f"chan{index}": np.array([0.1 * index], dtype=float) for index in range(1, 5)},
+        sr=20000.0,
+    )
+    path = tmp_path / "map_zoom.nev"
+    path.write_bytes(b"placeholder")
+    channel_map = ChannelMap(
+        name="zoom",
+        rows=2,
+        cols=2,
+        electrodes={
+            f"e{index}": {
+                "channel": f"chan{index}",
+                "electrode": index,
+                "x_um": float(index % 2),
+                "y_um": float(index // 2),
+                "aliases": [f"chan{index}"],
+                "routed": True,
+            }
+            for index in range(1, 5)
+        },
+    )
+    dialog = CustomDataSelectionDialog(
+        [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
+        "firing_rate_vector",
+        channel_map,
+    )
+
+    class Scroll:
+        inaxes = None
+        xdata = 0.5
+        ydata = 0.5
+        step = 1
+        button = "up"
+
+    try:
+        event = Scroll()
+        event.inaxes = dialog.map_ax
+        old_xlim = dialog.map_ax.get_xlim()
+        old_ylim = dialog.map_ax.get_ylim()
+        dialog._map_scrolled(event)
+        new_xlim = dialog.map_ax.get_xlim()
+        new_ylim = dialog.map_ax.get_ylim()
+        assert abs(new_xlim[1] - new_xlim[0]) < abs(old_xlim[1] - old_xlim[0])
+        assert abs(new_ylim[1] - new_ylim[0]) < abs(old_ylim[1] - old_ylim[0])
+        preserved = (tuple(new_xlim), tuple(new_ylim))
+        dialog._refresh_map()
+        assert dialog.map_ax.get_xlim() == pytest.approx(preserved[0])
+        assert dialog.map_ax.get_ylim() == pytest.approx(preserved[1])
+        dialog._reset_map_view()
+        assert abs(dialog.map_ax.get_xlim()[1] - dialog.map_ax.get_xlim()[0]) > abs(preserved[0][1] - preserved[0][0])
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_main_window_opens_custom_data_selection_without_modal_loop(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "sample.nev"
+    path.write_bytes(b"placeholder")
+    window.file_database = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(
+                spikes={f"chan{index}": np.array([0.1, 0.2], dtype=float) for index in range(1, 64)},
+                sr=20000.0,
+            ),
+            "data_kind": "nev",
+        }
+    ]
+    constructed = []
+    shown = []
+
+    def fake_show_child(child):
+        shown.append(child)
+        window.child_windows.append(child)
+        child.finished.connect(lambda _result: window._forget_child(child))
+        child.show()
+
+    monkeypatch.setattr(window, "_show_child", fake_show_child)
+    try:
+        window._open_custom_data_selection("firing_rate_vector")
+        assert shown
+        constructed.append(shown[0])
+        assert shown[0].open_main_raster_callback == window._open_main_raster_for_database_path
+        assert shown[0].windowModality() == Qt.WindowModality.NonModal
+        assert window.custom_data_selection_dialog is shown[0]
+    finally:
+        for dialog in constructed:
+            dialog.close()
+        window.close()
+        app.processEvents()
+
+
+def test_main_window_custom_data_selection_opens_main_raster_for_selected_path(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = tmp_path / "first.nev"
+    second = tmp_path / "second.nev"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    window.file_database = [
+        {"path": str(first), "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.1])}, sr=20000.0), "data_kind": "nev"},
+        {"path": str(second), "raw_data": UnifiedMEAData(spikes={"chan2": np.array([0.2])}, sr=20000.0), "data_kind": "nev"},
+    ]
+    window._refresh_file_database_table()
+    opened = []
+    monkeypatch.setattr(window, "preview_raw", lambda: opened.append(window.input_path))
+
+    window._open_main_raster_for_database_path(str(second))
+
+    assert opened == [str(second)]
+    assert window.input_path == str(second)
+    assert window.database_table.currentRow() == 1
     window.close()
     app.processEvents()
 
@@ -3587,6 +4372,8 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
         pytest.skip("PySide6 is not available")
 
     app = QApplication.instance() or QApplication([])
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
     window = MainWindow()
     path = tmp_path / "spontaneous_source.nev"
     path.write_bytes(b"placeholder")
@@ -3617,12 +4404,68 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
 
     dialog = window.stimulus_generation_dialog
     assert isinstance(dialog, StimulusGenerationDialog)
-    assert dialog.tabs.count() == 6
-    assert dialog.width() <= 1000
-    assert dialog.minimumSizeHint().height() < 700
+    assert dialog.tabs.count() == 2
+    assert dialog.tabs.tabText(0) == "Settings"
+    assert dialog.tabs.tabText(1) == "Experiment"
+    assert dialog.protocol_table.parent() is not dialog.protocols_tab
+    assert dialog.group_table.parent() is not dialog.groups_tab
+    assert dialog.block_table.parent() is not dialog.blocks_tab
+    assert dialog.generate_form_widget.parent() is not dialog.generate_tab
+    assert dialog.generate_status.parent() is not dialog.generate_tab
+    assert dialog.width() <= 1400
+    assert dialog.minimumSizeHint().height() < 780
     assert dialog.source_combo.findData(str(path)) >= 0
-    dialog.tabs.setCurrentWidget(dialog.protocols_tab)
-    fixed = next(protocol for protocol in dialog.protocols if protocol.name == "feedback_single_150mV")
+    assert dialog.protocol_type_label.text().endswith("*")
+    assert "Pipeline spontaneous source *" == dialog.source_box.title()
+    assert dialog.protocol_table.rowCount() == 0
+    assert dialog.group_table.rowCount() == 0
+    assert dialog.block_table.rowCount() == 0
+    assert dialog.block_phase_table.rowCount() == 0
+    assert dialog.protocols == []
+    assert dialog.groups == []
+    assert dialog.protocol_fields["name"].text() == "new_protocol"
+    assert dialog.protocol_fields["amplitude_mv"].text() == "150.0"
+    assert dialog.protocol_fields["pulse_width_us"].text() == "300.0"
+    assert dialog.protocol_fields["start_ms"].text() == "1500.0"
+    assert dialog.preview_group_name.text() == "new_group"
+    assert "7317" in dialog.preview_group_electrodes.text()
+    assert dialog.settings_workflow_scroll.minimumWidth() >= 620
+    assert dialog.settings_workflow_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert dialog.protocol_table.minimumHeight() >= 146
+    assert dialog.group_table.minimumHeight() >= 146
+    assert dialog.block_table.minimumHeight() >= 146
+    assert dialog.preview_canvas.minimumHeight() >= 210
+    assert dialog.preview_map_canvas.minimumHeight() >= 300
+    assert dialog.generate_button.text() == "Generate"
+    assert dialog.generate_button.maximumWidth() <= 132
+    assert dialog.settings_protocol_add_button.text() == "Add"
+    assert dialog.settings_protocol_remove_button.text() == "Remove"
+    assert not hasattr(dialog, "settings_protocol_update_button")
+    assert dialog.settings_site_add_button.text() == "Add"
+    assert dialog.settings_site_remove_button.text() == "Remove"
+    assert not hasattr(dialog, "settings_site_update_button")
+    assert dialog.settings_preview_button.text() == "Preview"
+    assert dialog.settings_save_block_phase_button.text() == "Save block phase"
+    assert dialog.block_phase_remove_button.text() == "Remove"
+    assert dialog.block_add_button.text() == "Add"
+    assert dialog.block_remove_button.text() == "Remove"
+    assert not hasattr(dialog, "protocol_notes")
+    assert not hasattr(dialog, "preview_block_name")
+    assert dialog.protocol_fields["amplitude_mv"].maximumWidth() >= 220
+    assert dialog.protocol_box.layout().horizontalSpacing() <= 4
+    dialog.protocol_fields["name"].setText("settings_added")
+    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._save_protocol()
+    assert any(protocol.name == "settings_added" for protocol in dialog.protocols)
+    dialog.preview_group_name.setText("settings_site")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._save_group_from_settings()
+    assert any(group.name == "settings_site" and group.electrodes == [1, 2] for group in dialog.groups)
+    fixed = stimulus_builder.StimulusProtocol("feedback_single_150mV", "single_pulse", amplitude_mv=150.0)
+    dialog.protocols.append(fixed)
+    dialog.groups.append(stimulus_builder.ElectrodeGroup("group_A", [7317]))
+    dialog.blocks.append(stimulus_builder.ExperimentBlock("group_A_150mV", "group_A", fixed.name))
+    dialog._refresh_all()
     dialog._fill_protocol_form(fixed)
     assert dialog.source_box.isHidden()
     fixed_series = dialog._preview_series_for_protocol(fixed)
@@ -3637,12 +4480,73 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     detail = dialog._preview_map_selection_text("e1")
     assert "Electrode: e1" in detail
     assert "Firing rate:" in detail
-    poisson = next(protocol for protocol in dialog.protocols if protocol.name == "poisson_random_safe")
+    poisson = stimulus_builder.StimulusProtocol(
+        "poisson_random_safe",
+        "poisson_random_electrodes",
+        amplitude_mv=150.0,
+        pulse_width_us=200.0,
+        pulses_per_burst=1,
+        poisson_duration_s=300.0,
+        lambda_mode="scale",
+        random_seed=42,
+    )
+    dialog.protocols.append(poisson)
+    dialog.protocol_source_paths[poisson.name] = str(path)
+    dialog._refresh_all()
     dialog._fill_protocol_form(poisson)
     assert dialog.source_box.isVisible()
     preview_series = dialog._preview_series_for_protocol(poisson)
     assert any(item["times_ms"] for item in preview_series)
     assert max((max(item["times_ms"]) for item in preview_series if item["times_ms"]), default=0.0) > 5000.0
+    dialog.protocol_fields["name"].setText("poisson_from_settings")
+    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog.preview_group_name.setText("poisson_manual")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog.protocol_fields["region_count"].setText("1")
+    dialog.protocol_fields["max_candidate_electrodes"].setText("2")
+    dialog._set_combo_data(dialog.source_combo, str(path))
+    dialog._save_protocol()
+    auto_group = next(group for group in dialog.groups if group.name == "poisson_manual_poisson_from_settings_auto")
+    assert set(auto_group.electrodes) == {1, 2}
+    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog.protocol_fields["name"].setText("workflow_single")
+    dialog.preview_group_name.setText("workflow_group")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._save_block_phase_from_settings()
+    assert any(protocol.name == "workflow_single" for protocol in dialog.protocols)
+    assert any(group.name == "workflow_group" and group.electrodes == [1, 2] for group in dialog.groups)
+    assert any(phase.protocol == "workflow_single" and phase.electrode_group == "workflow_group" for phase in dialog.block_phases)
+    assert dialog.block_phase_table.rowCount() >= 1
+    dialog._set_combo_data(dialog.block_phase_combo, "workflow_single_workflow_group_phase")
+    dialog.phase_duration_fields["01_pre_spont"].setText("111")
+    dialog.phase_duration_fields["02_stim"].setText("222")
+    dialog.phase_duration_fields["03_post_spont"].setText("333")
+    dialog._save_block()
+    workflow_block = next(block for block in dialog.blocks if block.protocol == "workflow_single" and block.electrode_group == "workflow_group")
+    assert workflow_block.protocol == "workflow_single"
+    assert workflow_block.electrode_group == "workflow_group"
+    assert [phase.duration_s for phase in workflow_block.phases] == [111, 222, 333]
+    before_protocols = len(dialog.protocols)
+    before_groups = len(dialog.groups)
+    before_blocks = len(dialog.blocks)
+    dialog.protocol_fields["name"].setText("preview_only_single")
+    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog.preview_group_name.setText("preview_only_group")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._preview_settings_workflow()
+    assert len(dialog.protocols) == before_protocols
+    assert len(dialog.groups) == before_groups
+    assert len(dialog.blocks) == before_blocks
+    assert {"e1", "e2"}.issubset(dialog.preview_map_state["stimulation"])
+    original_count = len(dialog.blocks)
+    dialog._set_combo_data(dialog.block_phase_combo, "workflow_single_workflow_group_phase")
+    dialog._save_block()
+    assert len(dialog.blocks) == original_count + 1
+    added_block = dialog.blocks[-1]
+    assert added_block.electrode_group == "workflow_group"
+    dialog._select_block_by_name(added_block.name)
+    dialog._remove_block()
+    assert not any(block.name == added_block.name for block in dialog.blocks)
     output = tmp_path / "generated_stimulus_package"
     dialog.output_path.setText(str(output))
     dialog._generate()
@@ -3667,6 +4571,8 @@ def test_stimulus_generation_preview_raster_scrolls_and_zooms_without_regenerati
         pytest.skip("PySide6 is not available")
 
     app = QApplication.instance() or QApplication([])
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
     path = tmp_path / "spontaneous_source.nev"
     path.write_bytes(b"placeholder")
     data = UnifiedMEAData(
@@ -3689,7 +4595,16 @@ def test_stimulus_generation_preview_raster_scrolls_and_zooms_without_regenerati
         [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
         channel_map=channel_map,
     )
-    protocol = next(item for item in dialog.protocols if item.name == "poisson_random_safe")
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_random_safe",
+        "poisson_random_electrodes",
+        poisson_duration_s=300.0,
+        lambda_mode="scale",
+        random_seed=42,
+    )
+    dialog.protocols = [protocol]
+    dialog.protocol_source_paths[protocol.name] = str(path)
+    dialog._refresh_all()
     dialog._render_protocol_preview(protocol)
     dialog.preview_canvas.draw()
 
@@ -3905,6 +4820,7 @@ def test_stimulus_generation_save_protocol_creates_poisson_group_without_block(t
         [{"path": str(source_path), "raw_data": data, "data_kind": "nev"}],
         channel_map=None,
     )
+    dialog.groups = [stimulus_builder.ElectrodeGroup("group_A", [7317])]
     dialog.blocks = [stimulus_builder.ExperimentBlock("ordinary_block", "group_A", "feedback_single_150mV")]
     dialog._refresh_all()
 
@@ -4011,6 +4927,8 @@ def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_pa
         pytest.skip("PySide6 is not available")
 
     app = QApplication.instance() or QApplication([])
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
     path = tmp_path / "spontaneous_source.nev"
     path.write_bytes(b"placeholder")
     data = UnifiedMEAData(
@@ -4034,11 +4952,16 @@ def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_pa
         [{"path": str(path), "raw_data": data, "data_kind": "nev"}],
         channel_map=channel_map,
     )
-    protocol = next(item for item in dialog.protocols if item.name == "feedback_single_150mV")
+    protocol = stimulus_builder.StimulusProtocol("feedback_single_150mV", "single_pulse", amplitude_mv=150.0)
+    dialog.protocols = [protocol]
+    dialog.groups = [stimulus_builder.ElectrodeGroup("group_A", [1, 7317])]
+    dialog.blocks = [stimulus_builder.ExperimentBlock("group_A_150mV", "group_A", protocol.name)]
+    dialog._refresh_all()
     dialog._render_protocol_preview(protocol)
     state = dialog.preview_map_state
     x, y, _payload = state["positions"]["e1"]
     redraw_calls = []
+    original_draw_map = dialog._draw_preview_channel_map
     monkeypatch.setattr(dialog, "_draw_preview_channel_map", lambda *args, **kwargs: redraw_calls.append(args))
 
     class Event:
@@ -4052,6 +4975,25 @@ def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_pa
     assert dialog.preview_map_selected == "e1"
     assert dialog.preview_map_selection_artist is not None
     assert "Electrode: e1" in dialog.preview_map_detail.text()
+
+    class Scroll:
+        inaxes = dialog.preview_map_canvas.figure.axes[0]
+        xdata = float(x)
+        ydata = float(y)
+        step = 1
+        button = "up"
+
+    old_xlim = dialog.preview_map_canvas.figure.axes[0].get_xlim()
+    dialog._preview_map_scrolled(Scroll())
+    new_xlim = dialog.preview_map_canvas.figure.axes[0].get_xlim()
+    assert abs(new_xlim[1] - new_xlim[0]) < abs(old_xlim[1] - old_xlim[0])
+    assert redraw_calls == []
+    preserved = tuple(new_xlim)
+    original_draw_map(protocol, dialog.preview_map_series)
+    assert dialog.preview_map_canvas.figure.axes[0].get_xlim() == pytest.approx(preserved)
+    monkeypatch.setattr(dialog, "_draw_preview_channel_map", original_draw_map)
+    dialog._reset_preview_map_view()
+    assert abs(dialog.preview_map_canvas.figure.axes[0].get_xlim()[1] - dialog.preview_map_canvas.figure.axes[0].get_xlim()[0]) > abs(preserved[1] - preserved[0])
     dialog.close()
     app.processEvents()
 
