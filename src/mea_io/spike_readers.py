@@ -1470,6 +1470,8 @@ def read_maxwell_h5(
 
     stim_times = np.concatenate(event_times) if event_times else np.array([], dtype=float)
     stim_times = np.asarray(sorted(set(float(value) for value in stim_times if np.isfinite(value))), dtype=float)
+    if stim_times.size == 0:
+        stim_times = _load_maxwell_stim_sidecar_times(path)
     artifact_window_s = max(0.0, float(stim_artifact_window_ms) / 1000.0)
     spike_filters: Dict[str, Dict[str, np.ndarray]] = {}
     artifacts_removed_by_channel: Dict[str, int] = {}
@@ -1560,6 +1562,39 @@ def read_maxwell_h5(
         stim_times=stim_times,
         meta=meta,
     )
+
+
+def _load_maxwell_stim_sidecar_times(path: Path) -> np.ndarray:
+    candidates = [
+        path.with_name("stim_times.txt"),
+        path.with_name("segment_time_meta.json"),
+        path.parent / "stim_times.txt",
+        path.parent / "segment_time_meta.json",
+    ]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.suffix.lower() == ".txt":
+                values = []
+                for raw_line in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        values.append(float(line))
+                    except ValueError:
+                        continue
+                if values:
+                    return np.asarray(sorted(set(float(value) for value in values if np.isfinite(value))), dtype=float)
+            elif candidate.suffix.lower() == ".json":
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                values = payload.get("stim_times_sec", [])
+                if isinstance(values, list) and values:
+                    return np.asarray(sorted(set(float(value) for value in values if np.isfinite(value))), dtype=float)
+        except Exception:
+            continue
+    return np.array([], dtype=float)
 
 
 def _nev_type_label(file_type_id: bytes) -> str:

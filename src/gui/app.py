@@ -304,6 +304,32 @@ def _show_error_message(parent: QWidget | None, title: str, text: str):
     return _show_message_dialog(parent, title, text, "critical")
 
 
+def _record_value(record, key: str):
+    if isinstance(record, dict):
+        return record.get(key, "")
+    return getattr(record, key, "")
+
+
+def _database_key_exists(records, value: str, *, key: str = "name", exclude_index: int | None = None) -> bool:
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return False
+    for index, record in enumerate(list(records or [])):
+        if exclude_index is not None and index == exclude_index:
+            continue
+        if str(_record_value(record, key) or "").strip().lower() == candidate:
+            return True
+    return False
+
+
+def _show_duplicate_database_warning(parent: QWidget | None, database_label: str, name: str):
+    return _show_warning_message(
+        parent,
+        "Duplicate name",
+        f'"{str(name).strip()}" already exists in {database_label}. Choose a different name.',
+    )
+
+
 def _prefer_waveform_channel(spike_series, waveform_series) -> str:
     if not spike_series:
         return ""
@@ -1580,6 +1606,42 @@ def _channel_map_positions(channel_map: ChannelMap | None):
     return lookup, electrode_positions
 
 
+def _channel_map_grid_positions(channel_map: ChannelMap) -> tuple[dict[str, int], dict[str, int]]:
+    row_lookup: dict[str, int] = {}
+    col_lookup: dict[str, int] = {}
+    if channel_map is None:
+        return row_lookup, col_lookup
+    used_rows: dict[int, list[str]] = {}
+    used_cols: dict[int, list[str]] = {}
+    for electrode, payload in channel_map.electrodes.items():
+        if not isinstance(payload, dict):
+            continue
+        row = payload.get("grid_row")
+        col = payload.get("grid_col")
+        try:
+            row_i = int(row)
+            col_i = int(col)
+        except (TypeError, ValueError):
+            continue
+        row_lookup[str(electrode)] = row_i
+        col_lookup[str(electrode)] = col_i
+        used_rows.setdefault(row_i, []).append(str(electrode))
+        used_cols.setdefault(col_i, []).append(str(electrode))
+    if row_lookup and col_lookup:
+        row_ranks = {row_value: rank for rank, row_value in enumerate(sorted(set(row_lookup.values())))}
+        col_ranks = {col_value: rank for rank, col_value in enumerate(sorted(set(col_lookup.values())))}
+        return (
+            {electrode: row_ranks.get(row_lookup[electrode], 0) for electrode in row_lookup},
+            {electrode: col_ranks.get(col_lookup[electrode], 0) for electrode in col_lookup},
+        )
+
+    electrodes = [str(electrode) for electrode in channel_map.electrodes.keys()]
+    for index, electrode in enumerate(electrodes):
+        row_lookup[electrode] = index // max(1, int(getattr(channel_map, "cols", 8) or 8))
+        col_lookup[electrode] = index % max(1, int(getattr(channel_map, "cols", 8) or 8))
+    return row_lookup, col_lookup
+
+
 def _position_for_channel(channel: str, position_lookup: dict):
     candidates = [
         str(channel),
@@ -1626,6 +1688,7 @@ def draw_maxwell_channel_map(
     title="Channel map",
 ):
     lookup, positions = _channel_map_positions(channel_map)
+    grid_rows, grid_cols = _channel_map_grid_positions(channel_map)
     figure = ax.figure
     figure.patch.set_facecolor("#ffffff")
     ax.clear()
@@ -1634,6 +1697,7 @@ def draw_maxwell_channel_map(
 
     state = {
         "positions": positions,
+        "display_positions": positions,
         "lookup": lookup,
         "point_lookup": [],
         "recording": set(),
@@ -1647,6 +1711,30 @@ def draw_maxwell_channel_map(
         return state
 
     entries = [(electrode, float(x), float(y), payload) for electrode, (x, y, payload) in positions.items()]
+    if grid_rows and grid_cols:
+        ordered = sorted(entries, key=lambda item: (grid_rows.get(item[0], 0), grid_cols.get(item[0], 0), item[0]))
+        row_values = sorted(set(grid_rows.values()))
+        col_values = sorted(set(grid_cols.values()))
+        row_span = max(1, len(row_values) - 1)
+        col_span = max(1, len(col_values) - 1)
+        pad_x = 0.08
+        pad_y = 0.08
+        usable_x = 1.0 - pad_x * 2.0
+        usable_y = 1.0 - pad_y * 2.0
+        unit = min(usable_x / max(1, col_span), usable_y / max(1, row_span))
+        x_offset = pad_x + (usable_x - unit * col_span) * 0.5
+        y_offset = pad_y + (usable_y - unit * row_span) * 0.5
+        remapped = []
+        for electrode, _x, _y, payload in ordered:
+            col_grid = grid_cols.get(electrode, 0)
+            row_grid = grid_rows.get(electrode, 0)
+            x = x_offset + col_grid * unit if len(col_values) > 1 else 0.5
+            y = y_offset + row_grid * unit if len(row_values) > 1 else 0.5
+            remapped.append((electrode, x, y, payload))
+        entries = remapped
+        positions = {electrode: (x, y, payload) for electrode, x, y, payload in entries}
+        state["positions"] = positions
+        state["display_positions"] = positions
     point_count = max(len(entries), 1)
     if point_count >= 5000:
         all_size, recording_size, stimulation_size, selected_size = 1.8, 10, 18, 42
@@ -1656,7 +1744,7 @@ def draw_maxwell_channel_map(
         all_size, recording_size, stimulation_size, selected_size = 5, 24, 50, 92
     xs = [entry[1] for entry in entries]
     ys = [entry[2] for entry in entries]
-    ax.scatter(xs, ys, s=all_size, color="#cbd5e1", alpha=0.72, marker="o", linewidths=0, zorder=2)
+    ax.scatter(xs, ys, s=all_size, color="#94a3b8", alpha=0.9, marker="o", linewidths=0, zorder=2)
 
     for electrode, x, y, payload in entries:
         state["point_lookup"].append({"electrode": electrode, "x": x, "y": y, "payload": payload})
@@ -3546,7 +3634,7 @@ class ElectrodeMapCanvas(QWidget):
 
         radius = max(1.6, min(3.8, rect.width() / 520.0))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#475569"))
+        painter.setBrush(QColor("#64748b"))
         background_radius = max(0.75, radius * 0.55)
         for point, _, _ in background_points:
             painter.drawEllipse(
@@ -3614,10 +3702,10 @@ class ElectrodeMapCanvas(QWidget):
         y = 10
         painter.setFont(QFont("Segoe UI", 8))
         painter.setPen(QPen(QColor("#94a3b8"), 1))
-        painter.setBrush(QColor("#18b7ff"))
+        painter.setBrush(QColor("#16a34a"))
         painter.drawEllipse(QRectF(x, y + 3, 8, 8))
         painter.drawText(QRectF(x + 14, y, 90, 16), Qt.AlignmentFlag.AlignLeft, "recording")
-        painter.setBrush(QColor("#334155"))
+        painter.setBrush(QColor("#94a3b8"))
         painter.drawEllipse(QRectF(x + 104, y + 4, 7, 7))
         painter.drawText(QRectF(x + 116, y, 110, 16), Qt.AlignmentFlag.AlignLeft, "non-recording")
 
@@ -4472,6 +4560,33 @@ def _custom_plot_resolve_y(record: dict, y_key: str, parameters: dict | None = N
     return x, matrix, x_tick_labels, resolved_x_label, "All features", False
 
 
+def _custom_plot_aligned_points(x, y_values, x_tick_labels) -> list[tuple[tuple[str, object], str, float]]:
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    x_array = np.asarray(x, dtype=float).reshape(-1)
+    labels = [str(label) for label in list(x_tick_labels or [])]
+    points: list[tuple[tuple[str, object], str, float]] = []
+    if labels and len(labels) == y_array.size:
+        for label, value in zip(labels, y_array):
+            key_text = normalize_channel_name(label) or str(label).strip().lower()
+            points.append((("label", key_text), str(label), float(value)))
+        return points
+    if x_array.size == y_array.size:
+        for value_x, value_y in zip(x_array, y_array):
+            x_float = float(value_x)
+            points.append((("numeric", round(x_float, 12)), f"{x_float:g}", float(value_y)))
+        return points
+    for index, value in enumerate(y_array):
+        points.append((("index", index), str(index + 1), float(value)))
+    return points
+
+
+def _custom_plot_label(default_label: str, custom_label: str = "", suffix: str = "") -> str:
+    custom = str(custom_label or "").strip()
+    if custom:
+        return f"{custom} {suffix}".strip()
+    return str(default_label or suffix or "series").strip()
+
+
 def _draw_custom_plot_figure(figure: Figure, records, parameters: dict | None = None):
     params = dict(parameters or {})
     record_list = list(records or [])
@@ -4485,11 +4600,13 @@ def _draw_custom_plot_figure(figure: Figure, records, parameters: dict | None = 
     if len(y_keys) > 1 or params.get("plot_style") == "multi_y":
         plotted = 0
         resolved_axis_label = str(params.get("x_label", "") or "").strip()
-        numeric_x_for_axis = None
-        first_tick_labels: list[str] = []
-        bar_series: list[tuple[np.ndarray, np.ndarray, str]] = []
+        series_items: list[dict] = []
+        axis_keys: list[tuple[str, object]] = []
+        axis_labels: dict[tuple[str, object], str] = {}
         local_mode = "line" if mode == "auto" else mode
-        for y_key in y_keys:
+        legend_labels = [str(value or "").strip() for value in list(params.get("legend_labels") or [])]
+        for y_index, y_key in enumerate(y_keys):
+            custom_legend = legend_labels[y_index] if y_index < len(legend_labels) else ""
             record_index, inner_key = _custom_plot_split_y_key(y_key)
             if record_index is None:
                 target_records = list(enumerate(record_list))
@@ -4503,47 +4620,70 @@ def _draw_custom_plot_figure(figure: Figure, records, parameters: dict | None = 
                 y_array = np.asarray(y_values, dtype=float)
                 if y_array.ndim == 2:
                     for col in range(y_array.shape[1]):
-                        label = f"{base_label}: {y_name} {col + 1}" if len(record_list) > 1 else f"{y_name} {col + 1}"
+                        default_label = f"{base_label}: {y_name} {col + 1}" if len(record_list) > 1 else f"{y_name} {col + 1}"
+                        label = _custom_plot_label(default_label, custom_legend, str(col + 1) if y_array.shape[1] > 1 else "")
                         series = y_array[:, col]
-                        if local_mode == "bar":
-                            bar_series.append((x, series, label))
-                        else:
-                            ax.plot(x, series, marker="o", linewidth=1.4, label=label)
+                        points = _custom_plot_aligned_points(x, series, x_tick_labels)
+                        series_items.append({"label": label, "points": points})
+                        for key, display, _value in points:
+                            if key not in axis_labels:
+                                axis_keys.append(key)
+                                axis_labels[key] = display
                         plotted += 1
                 elif y_array.size:
-                    label = f"{base_label}: {y_name}" if len(record_list) > 1 else y_name
-                    if local_mode == "bar":
-                        bar_series.append((x, y_array, label))
-                    else:
-                        ax.plot(x, y_array, marker="o", linewidth=1.5, label=label)
+                    default_label = f"{base_label}: {y_name}" if len(record_list) > 1 else y_name
+                    label = _custom_plot_label(default_label, custom_legend)
+                    points = _custom_plot_aligned_points(x, y_array, x_tick_labels)
+                    series_items.append({"label": label, "points": points})
+                    for key, display, _value in points:
+                        if key not in axis_labels:
+                            axis_keys.append(key)
+                            axis_labels[key] = display
                     plotted += 1
-                if not x_tick_labels and numeric_x_for_axis is None and x.size:
-                    numeric_x_for_axis = np.asarray(x, dtype=float)
-                if x_tick_labels and not first_tick_labels:
-                    first_tick_labels = list(x_tick_labels)
-                    numeric_x_for_axis = np.asarray(x, dtype=float)
                 if not resolved_axis_label:
                     resolved_axis_label = resolved_x_label
-        if local_mode == "bar" and bar_series:
-            series_count = len(bar_series)
+        all_numeric_axis = bool(axis_keys) and all(key[0] == "numeric" for key in axis_keys)
+        if all_numeric_axis:
+            axis_keys = sorted(axis_keys, key=lambda key: float(key[1]))
+        if all_numeric_axis:
+            x_positions = np.asarray([float(key[1]) for key in axis_keys], dtype=float)
+        else:
+            x_positions = np.arange(1, len(axis_keys) + 1, dtype=float)
+        if local_mode == "bar" and series_items:
+            series_count = len(series_items)
             width = 0.78 / max(1, series_count)
             offsets = (np.arange(series_count) - (series_count - 1) / 2.0) * width
-            for index, (x, y_array, label) in enumerate(bar_series):
-                ax.bar(np.asarray(x, dtype=float) + offsets[index], y_array, width=width, alpha=0.82, label=label)
+            for index, item in enumerate(series_items):
+                y_by_key = {point_key: value for point_key, _display, value in item["points"]}
+                y_values = np.asarray([y_by_key.get(key, np.nan) for key in axis_keys], dtype=float)
+                mask = np.isfinite(y_values)
+                if np.any(mask):
+                    ax.bar(x_positions[mask] + offsets[index], y_values[mask], width=width, alpha=0.82, label=str(item["label"]))
+        elif series_items:
+            for item in series_items:
+                y_by_key = {point_key: value for point_key, _display, value in item["points"]}
+                y_values = np.asarray([y_by_key.get(key, np.nan) for key in axis_keys], dtype=float)
+                mask = np.isfinite(y_values)
+                if np.any(mask):
+                    ax.plot(x_positions[mask], y_values[mask], marker="o", linewidth=1.5, label=str(item["label"]))
         if plotted == 0:
             ax.text(0.5, 0.5, "No plottable data", ha="center", va="center")
             ax.set_xticks([])
             ax.set_yticks([])
         else:
-            if first_tick_labels and numeric_x_for_axis is not None and len(first_tick_labels) == numeric_x_for_axis.size:
-                ax.set_xticks(numeric_x_for_axis)
-                rotation = 70 if len(first_tick_labels) > 20 else 35
-                ax.set_xticklabels(first_tick_labels, rotation=rotation, ha="right", fontsize=7 if len(first_tick_labels) > 20 else 8)
-            elif numeric_x_for_axis is not None and numeric_x_for_axis.size:
-                ax.set_xticks(numeric_x_for_axis)
-                if x_mode == "generated":
-                    x0 = float(numeric_x_for_axis[0])
-                    x1 = float(numeric_x_for_axis[-1]) if numeric_x_for_axis.size > 1 else x0 + 1.0
+            if axis_keys:
+                ax.set_xticks(x_positions)
+                if not all_numeric_axis:
+                    tick_labels = [axis_labels.get(key, str(index + 1)) for index, key in enumerate(axis_keys)]
+                    rotation = 70 if len(tick_labels) > 20 else 35
+                    ax.set_xticklabels(tick_labels, rotation=rotation, ha="right", fontsize=7 if len(tick_labels) > 20 else 8)
+                    if len(tick_labels) > 60:
+                        stride = max(1, int(np.ceil(len(tick_labels) / 40)))
+                        for index, label in enumerate(ax.get_xticklabels()):
+                            label.set_visible(index % stride == 0)
+                elif x_mode == "generated":
+                    x0 = float(x_positions[0])
+                    x1 = float(x_positions[-1]) if x_positions.size > 1 else x0 + 1.0
                     ax.set_xlim(x0, x1)
             ax.set_xlabel(resolved_axis_label or "Sample")
             ax.set_ylabel(str(params.get("y_label") or "Value"))
@@ -5575,11 +5715,14 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         self.map_selector = None
         self.map_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
         self.map_selected_electrode: str | None = None
+        self.linked_raster_window = None
+        self._syncing_raster_map = False
         self.position_lookup, self.electrode_positions = _channel_map_positions(self.channel_map)
         self.channel_to_electrode_cache: dict[str, str | None] = {}
         self.electrode_to_channels_cache: dict[str, list[str]] = {}
 
         self._setup_database_table()
+        self.table.setMaximumWidth(440)
         self.table.itemSelectionChanged.connect(self._active_file_changed)
 
         self.start_s = QDoubleSpinBox()
@@ -5608,12 +5751,14 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         self.channel_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.channel_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.channel_table.itemChanged.connect(self._channel_item_changed)
+        self.channel_table.setMaximumWidth(360)
 
         self.open_main_raster_button = QPushButton("Open Main Raster")
         self.open_main_raster_button.setToolTip("Open the selected source file in the main Raw Data Raster window.")
         self.open_main_raster_button.clicked.connect(self._open_main_raster)
 
-        self.map_canvas = FigureCanvas(Figure(figsize=(3.8, 3.8), tight_layout=True))
+        self.map_canvas = FigureCanvas(Figure(figsize=(5.2, 5.2), tight_layout=True))
+        self.map_canvas.setMinimumSize(520, 520)
         self.map_ax = self.map_canvas.figure.add_subplot(111)
         self.map_canvas.mpl_connect("button_press_event", self._map_clicked)
         self.map_canvas.mpl_connect("scroll_event", self._map_scrolled)
@@ -5632,6 +5777,7 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
 
         params = QFrame()
         params.setObjectName("Panel")
+        params.setMaximumWidth(440)
         params_layout = QGridLayout(params)
         params_layout.setContentsMargins(10, 10, 10, 10)
         params_layout.setHorizontalSpacing(8)
@@ -5654,6 +5800,7 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         channel_buttons.addStretch(1)
 
         left = QVBoxLayout()
+        left.setSpacing(6)
         left.addWidget(QLabel("Files"))
         left.addWidget(self.table, 2)
         left.addWidget(params)
@@ -5662,13 +5809,15 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         left.addWidget(self.channel_table, 3)
 
         right = QVBoxLayout()
+        right.setSpacing(6)
         right.addWidget(QLabel("Channel map"))
-        right.addWidget(self.map_canvas, 1)
+        right.addWidget(self.map_canvas, 8)
         right.addWidget(self.map_info)
 
         body = QHBoxLayout()
-        body.addLayout(left, 3)
-        body.addLayout(right, 2)
+        body.setSpacing(10)
+        body.addLayout(left, 2)
+        body.addLayout(right, 5)
 
         note = QLabel(
             "Select one or more files, define the time segment, then choose channels from text, table, or channel map. "
@@ -5825,7 +5974,15 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         self._refresh_map()
 
     def _channel_to_electrode(self, channel: str) -> str | None:
-        return self.channel_to_electrode_cache.get(str(channel))
+        cached = self.channel_to_electrode_cache.get(str(channel))
+        if cached is not None:
+            return cached
+        found = _position_for_channel(str(channel), self.position_lookup)
+        if found is not None:
+            return str(found[2])
+        base = _base_channel_from_raster_label(str(channel))
+        found = _position_for_channel(base, self.position_lookup)
+        return str(found[2]) if found is not None else None
 
     def _refresh_map(self) -> None:
         recording = []
@@ -5856,7 +6013,7 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
             self.map_ax.set_xlim(float(xlim[0]), float(xlim[1]))
             self.map_ax.set_ylim(float(ylim[0]), float(ylim[1]))
         self.map_canvas.draw_idle()
-        self._sync_map_selector()
+        self._rebuild_map_selector()
 
     def _map_scrolled(self, event) -> None:
         if event is None or event.inaxes is not self.map_ax or event.xdata is None or event.ydata is None:
@@ -5923,12 +6080,18 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
             return
         self.map_selected_electrode = str(electrode)
         labels = self._channels_for_electrode(electrode)
-        action = "remove" if int(getattr(event, "button", 1) or 1) == 3 else "add"
-        changed = self._apply_map_channel_selection(labels, action)
-        action_text = "removed" if action == "remove" else "selected"
-        self.map_info.setText(f"{electrode}: {action_text} {changed} channel(s)")
-        self._sync_channel_text_from_selection()
-        self._refresh_channels()
+        metric = (self.map_state.get("metrics", {}) or {}).get(str(electrode), {}) if isinstance(self.map_state, dict) else {}
+        parts = [f"{electrode}: {len(labels)} channel(s)"]
+        channel = str(metric.get("channel", "") or (labels[0] if labels else "")).strip()
+        if channel:
+            parts.append(f"channel {channel}")
+        if "firing_rate_hz" in metric:
+            parts.append(f"{float(metric.get('firing_rate_hz', 0.0)):.3g} Hz")
+        if "spike_count" in metric:
+            parts.append(f"{int(metric.get('spike_count', 0))} spikes")
+        self.map_info.setText(" | ".join(parts))
+        if labels:
+            self._select_linked_raster_channel(labels[0], from_map=True)
         self._refresh_map()
 
     def _apply_map_channel_selection(self, labels, action: str) -> int:
@@ -5958,18 +6121,55 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         if not hasattr(self, "map_ax"):
             return
         enabled = bool(self.box_select.isChecked())
-        if enabled and self.map_selector is None:
+        if enabled:
+            self._rebuild_map_selector()
+        else:
+            self._destroy_map_selector()
+
+    def _destroy_map_selector(self) -> None:
+        selector = getattr(self, "map_selector", None)
+        if selector is None:
+            return
+        try:
+            selector.set_active(False)
+        except Exception:
+            pass
+        try:
+            selector.disconnect_events()
+        except Exception:
+            pass
+        self.map_selector = None
+
+    def _rebuild_map_selector(self) -> None:
+        if not hasattr(self, "map_ax"):
+            return
+        enabled = bool(self.box_select.isChecked())
+        self._destroy_map_selector()
+        if not enabled:
+            return
+        selector_kwargs = {
+            "useblit": False,
+            "button": [1, 3],
+            "minspanx": 0.01,
+            "minspany": 0.01,
+            "interactive": False,
+        }
+        selector_props = {"facecolor": "#2563eb", "edgecolor": "#1d4ed8", "alpha": 0.16, "linewidth": 1.2}
+        try:
             self.map_selector = RectangleSelector(
                 self.map_ax,
                 self._map_box_selected,
-                useblit=False,
-                button=[1, 3],
-                minspanx=0.01,
-                minspany=0.01,
-                interactive=False,
+                props=selector_props,
+                **selector_kwargs,
             )
-        if self.map_selector is not None:
-            self.map_selector.set_active(enabled)
+        except TypeError:
+            self.map_selector = RectangleSelector(
+                self.map_ax,
+                self._map_box_selected,
+                rectprops=selector_props,
+                **selector_kwargs,
+            )
+        self.map_selector.set_active(True)
 
     def _map_box_selected(self, start_event, stop_event) -> None:
         if start_event.xdata is None or stop_event.xdata is None or start_event.ydata is None or stop_event.ydata is None:
@@ -5996,7 +6196,40 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         paths = self._selected_paths()
         path = paths[0] if paths else str((self._active_record() or {}).get("path", ""))
         if path:
-            self.open_main_raster_callback(path)
+            window = self.open_main_raster_callback(path, channel_selected_callback=self._raster_channel_selected)
+            self.linked_raster_window = window
+            if window is not None and self.map_selected_electrode:
+                labels = self._channels_for_electrode(self.map_selected_electrode)
+                if labels:
+                    self._select_linked_raster_channel(labels[0], from_map=True)
+
+    def _raster_channel_selected(self, channel: str) -> None:
+        if self._syncing_raster_map:
+            return
+        self._syncing_raster_map = True
+        try:
+            channel_text = str(channel or "")
+            electrode = self._channel_to_electrode(channel_text)
+            if electrode is not None:
+                self.map_selected_electrode = str(electrode)
+                self.map_info.setText(f"{electrode}: linked from raster | channel {channel_text}")
+                self._refresh_map()
+        finally:
+            self._syncing_raster_map = False
+
+    def _select_linked_raster_channel(self, channel: str, *, from_map: bool = False) -> None:
+        window = getattr(self, "linked_raster_window", None)
+        if window is None or not hasattr(window, "_select_channel"):
+            return
+        if self._syncing_raster_map:
+            return
+        self._syncing_raster_map = True
+        try:
+            window._select_channel(str(channel))
+            if hasattr(window, "raise_"):
+                window.raise_()
+        finally:
+            self._syncing_raster_map = False
 
     def values(self) -> tuple[list[str], dict]:
         channels = sorted(self.selected_channels, key=_natural_sort_key)
@@ -6024,6 +6257,7 @@ class CustomPlotDialog(AppDialog):
         self.current_records: list[dict] = []
         self.current_parameters: dict = {}
         self.y_data_combos: list[QComboBox] = []
+        self.y_legend_edits: list[QLineEdit] = []
 
         self.x_mode = NoWheelComboBox()
         self.x_mode.addItem("Auto", "auto")
@@ -6081,8 +6315,8 @@ class CustomPlotDialog(AppDialog):
         plot_grid.setRowStretch(0, 1)
         y_panel = QFrame()
         y_panel.setObjectName("Panel")
-        y_panel.setMaximumWidth(230)
-        y_panel.setMinimumWidth(190)
+        y_panel.setMaximumWidth(330)
+        y_panel.setMinimumWidth(250)
         y_layout = QVBoxLayout(y_panel)
         y_layout.setContentsMargins(8, 8, 8, 8)
         y_layout.setSpacing(6)
@@ -6185,28 +6419,44 @@ class CustomPlotDialog(AppDialog):
         label.setFixedWidth(48)
         combo = NoWheelComboBox()
         combo.setMinimumWidth(92)
-        combo.setMaximumWidth(140)
+        combo.setMaximumWidth(125)
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(8)
+        legend = QLineEdit()
+        legend.setPlaceholderText("legend")
+        legend.setMinimumWidth(72)
+        legend.setMaximumWidth(105)
         remove = QPushButton("-")
         remove.setFixedWidth(24)
         remove.clicked.connect(lambda _checked=False, combo=combo: self._remove_y_data_combo(combo))
         row_layout.addWidget(label)
         row_layout.addWidget(combo, 1)
+        row_layout.addWidget(legend)
         row_layout.addWidget(remove)
         self.y_data_container.addLayout(row_layout)
         self.y_data_combos.append(combo)
+        self.y_legend_edits.append(legend)
         self._fill_y_data_combo(combo, selected_key)
         self._renumber_y_data_rows()
 
     def _remove_y_data_combo(self, combo: QComboBox) -> None:
         if len(self.y_data_combos) <= 1:
             return
-        old_keys = [str(existing.currentData() or "all_features") for existing in self.y_data_combos if existing is not combo]
+        old_rows = [
+            (
+                str(existing.currentData() or "all_features"),
+                self.y_legend_edits[index].text().strip() if index < len(self.y_legend_edits) else "",
+            )
+            for index, existing in enumerate(self.y_data_combos)
+            if existing is not combo
+        ]
         self._clear_layout(self.y_data_container)
         self.y_data_combos = []
-        for key in old_keys:
+        self.y_legend_edits = []
+        for key, legend_text in old_rows:
             self._add_y_data_combo(key)
+            if self.y_legend_edits:
+                self.y_legend_edits[-1].setText(legend_text)
         self._renumber_y_data_rows()
 
     def _fill_y_data_combo(self, combo: QComboBox, selected_key: str | None = None) -> None:
@@ -6256,6 +6506,7 @@ class CustomPlotDialog(AppDialog):
             "save_extracted": False,
             "extracted_name": "",
             "y_data_keys": [str(combo.currentData() or "") for combo in self.y_data_combos if str(combo.currentData() or "")],
+            "legend_labels": [edit.text().strip() for edit in self.y_legend_edits[: len(self.y_data_combos)]],
             "plot_style": "multi_y",
         }
 
@@ -15754,10 +16005,14 @@ class SpikeRasterWindow(AppDialog):
         channel_map: ChannelMap | None = None,
         stim_times=None,
         channel_groups: dict[str, list[str]] | None = None,
+        channel_selected_callback=None,
+        safe_window: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1280, 820)
+        self.channel_selected_callback = channel_selected_callback
+        self.safe_window = bool(safe_window)
         self.raw_spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
         self.raw_waveform_series = {label: np.asarray(values) for label, values in (waveform_series or {}).items()}
         self._filtered_spike_series_all = list(self.raw_spike_series)
@@ -16069,7 +16324,10 @@ class SpikeRasterWindow(AppDialog):
         if self.selected_channel:
             self._select_channel(self.selected_channel)
         _fix_spinbox_hit_targets(self)
-        self.showMaximized()
+        if self.safe_window:
+            _set_balanced_normal_geometry(self, width_fraction=0.86, height_fraction=0.82)
+        else:
+            self.showMaximized()
 
     def _start_progress(self, title: str, message: str, maximum: int = 0) -> QProgressDialog:
         return _create_progress_dialog(self, title, message, maximum)
@@ -16345,6 +16603,19 @@ class SpikeRasterWindow(AppDialog):
             self.row_label.setText(f"Rows {offset + 1}-{min(total_rows, offset + visible_rows)} / {total_rows}")
         else:
             self.row_label.setText("Rows 0 / 0")
+
+    def _scroll_channel_into_view(self, channel: str) -> None:
+        labels = [str(label) for label, _times in self.spike_series]
+        try:
+            index = labels.index(str(channel))
+        except ValueError:
+            return
+        visible_rows = max(1, min(self.visible_rows.value(), max(1, len(labels))))
+        current = int(self.row_scroll.value())
+        if current <= index < current + visible_rows:
+            return
+        target = max(0, min(index - visible_rows // 2, max(0, len(labels) - visible_rows)))
+        self.row_scroll.setValue(target)
 
     def _apply_stim_tail_filter(self):
         if not hasattr(self, "hide_stim_tail"):
@@ -16809,14 +17080,19 @@ class SpikeRasterWindow(AppDialog):
         self.slider.setValue(min(self.slider.maximum(), max(self.slider.minimum(), target_slider)))
 
     def _select_channel(self, channel: str) -> None:
+        self._scroll_channel_into_view(str(channel))
         if channel == self.selected_channel and self._last_waveform_view is not None:
             if self.canvas.selected_channel != channel:
                 self.canvas.set_selected_channel(channel)
+            if self.channel_selected_callback is not None:
+                self.channel_selected_callback(channel)
             return
         self.selected_channel = channel
         self._last_waveform_view = None
         self.canvas.set_selected_channel(channel)
         self._refresh_waveforms_for_window(force=True)
+        if self.channel_selected_callback is not None:
+            self.channel_selected_callback(channel)
 
     def _set_slider_value_internal(self, value: int) -> None:
         self._internal_slider_update = True
@@ -18726,6 +19002,7 @@ class StimulusGenerationDialog(AppDialog):
             "random_seed",
         ]:
             self.protocol_fields[key] = QLineEdit()
+        self._protocol_name_auto = True
         self.lambda_mode = NoWheelComboBox()
         self.lambda_mode.addItems(["scale", "normal"])
         self.lambda_mode.currentIndexChanged.connect(lambda *_: self._update_protocol_type_fields())
@@ -18778,6 +19055,7 @@ class StimulusGenerationDialog(AppDialog):
         scroll.setWidget(editor)
         layout.addWidget(scroll, 1)
         self.protocol_type.currentIndexChanged.connect(self._protocol_type_changed)
+        self.protocol_fields["name"].textChanged.connect(self._protocol_name_changed)
         self._update_protocol_type_fields()
 
     def _build_blocks_tab(self) -> None:
@@ -19135,7 +19413,7 @@ class StimulusGenerationDialog(AppDialog):
             self._fill_block_form(self.blocks[0])
 
     def _fill_default_protocol_form(self) -> None:
-        self._fill_protocol_form(stimulus_builder.StimulusProtocol("new_protocol", "single_pulse"))
+        self._fill_protocol_form(stimulus_builder.StimulusProtocol(stimulus_builder._default_protocol_name("single_pulse"), "single_pulse"))
 
     def _fill_default_group_form(self) -> None:
         default_group = stimulus_builder.ElectrodeGroup("new_group", self._default_electrodes())
@@ -19350,6 +19628,14 @@ class StimulusGenerationDialog(AppDialog):
                 return
         self.block_phases.append(phase)
 
+    def _protocol_by_name(self, name: str):
+        target = str(name or "").strip().lower()
+        return next((protocol for protocol in self.protocols if str(protocol.name).strip().lower() == target), None)
+
+    def _group_by_name(self, name: str):
+        target = str(name or "").strip().lower()
+        return next((group for group in self.groups if str(group.name).strip().lower() == target), None)
+
     def _apply_block_phase_to_block_form(self, phase: StimulusBlockPhase) -> None:
         self._set_combo_data(self.block_phase_combo, phase.name)
         self._set_combo_data(self.block_group, phase.electrode_group)
@@ -19403,7 +19689,21 @@ class StimulusGenerationDialog(AppDialog):
         if saved is None:
             return
         protocol, group_name = saved
+        existing_phase = next(
+            (
+                item
+                for item in self.block_phases
+                if item.protocol == protocol.name and item.electrode_group == group_name
+            ),
+            None,
+        )
+        if existing_phase is not None:
+            _show_duplicate_database_warning(self, "block phase library", existing_phase.name)
+            return
         phase = StimulusBlockPhase(self._block_phase_name_for(protocol.name, group_name), group_name, protocol.name)
+        if _database_key_exists(self.block_phases, phase.name):
+            _show_duplicate_database_warning(self, "block phase library", phase.name)
+            return
         self._upsert_block_phase(phase)
         self._refresh_block_phase_table()
         self._refresh_block_combos()
@@ -19445,24 +19745,36 @@ class StimulusGenerationDialog(AppDialog):
             _show_error_message(self, "Invalid block phase", str(exc))
             return None
         source_path = str(self.source_combo.currentData() or "") if hasattr(self, "source_combo") else ""
+        if protocol.type == "poisson_random_electrodes" and not source_path:
+            _show_error_message(self, "Invalid block phase", "Select a spontaneous source before saving a poisson random block phase")
+            return None
+        existing_protocol = self._protocol_by_name(protocol.name)
+        existing_group = self._group_by_name(group.name)
         if source_path:
             self.protocol_source_paths[protocol.name] = source_path
             protocol.spontaneous_data_path = source_path
         else:
             self.protocol_source_paths.pop(protocol.name, None)
-        self._upsert_protocol(protocol)
-        self._upsert_group(group)
+        if existing_protocol is None:
+            self.protocols.append(protocol)
+            active_protocol = protocol
+        else:
+            active_protocol = existing_protocol
+            if source_path:
+                active_protocol.spontaneous_data_path = source_path
+        if existing_group is None:
+            self.groups.append(group)
         self._clear_preview_caches()
-        self._sync_poisson_protocol_auto_group(protocol.name)
-        phase_group_name = self.poisson_auto_groups.get(protocol.name, group.name) if protocol.type == "poisson_random_electrodes" else group.name
+        self._sync_poisson_protocol_auto_group(active_protocol.name)
+        phase_group_name = group.name
         self._refresh_group_table()
         self._refresh_protocol_table()
         self._refresh_block_table()
         self._refresh_block_combos()
         self._refresh_preview_combo()
-        self._set_combo_data(self.preview_combo, protocol.name)
+        self._set_combo_data(self.preview_combo, active_protocol.name)
         self._draw_preview()
-        return protocol, phase_group_name
+        return active_protocol, phase_group_name
 
     def _preview_settings_workflow(self) -> None:
         try:
@@ -19511,11 +19823,10 @@ class StimulusGenerationDialog(AppDialog):
         except Exception as exc:
             _show_error_message(self, "Invalid group", str(exc))
             return
-        row = self._selected_table_row(self.group_table)
-        if row is None or row >= len(self.groups):
-            self.groups.append(group)
-        else:
-            self.groups[row] = group
+        if _database_key_exists(self.groups, group.name):
+            _show_duplicate_database_warning(self, "site library", group.name)
+            return
+        self.groups.append(group)
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_combos()
@@ -19533,7 +19844,10 @@ class StimulusGenerationDialog(AppDialog):
         except Exception as exc:
             _show_error_message(self, "Invalid group", str(exc))
             return
-        self._upsert_group(group)
+        if _database_key_exists(self.groups, group.name):
+            _show_duplicate_database_warning(self, "site library", group.name)
+            return
+        self.groups.append(group)
         self.group_name.setText(group.name)
         self.group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
         self._clear_preview_caches()
@@ -19551,19 +19865,17 @@ class StimulusGenerationDialog(AppDialog):
         except Exception as exc:
             _show_error_message(self, "Invalid protocol", str(exc))
             return
-        row = self._selected_table_row(self.protocol_table)
-        if row is None or row >= len(self.protocols):
-            self.protocols.append(protocol)
-        else:
-            old_name = self.protocols[row].name
-            self.protocols[row] = protocol
-            if old_name != protocol.name and old_name in self.protocol_source_paths:
-                self.protocol_source_paths[protocol.name] = self.protocol_source_paths.pop(old_name)
-            if old_name != protocol.name and old_name in self.poisson_auto_groups:
-                self.poisson_auto_groups[protocol.name] = self.poisson_auto_groups.pop(old_name)
+        if _database_key_exists(self.protocols, protocol.name):
+            _show_duplicate_database_warning(self, "protocol library", protocol.name)
+            return
         source_path = str(self.source_combo.currentData() or "")
+        if protocol.type == "poisson_random_electrodes" and not source_path:
+            _show_error_message(self, "Invalid protocol", "Select a spontaneous source before adding a poisson random protocol")
+            return
+        self.protocols.append(protocol)
         if source_path:
             self.protocol_source_paths[protocol.name] = source_path
+            protocol.spontaneous_data_path = source_path
         else:
             self.protocol_source_paths.pop(protocol.name, None)
         self._clear_preview_caches()
@@ -19669,18 +19981,26 @@ class StimulusGenerationDialog(AppDialog):
         except Exception as exc:
             self.generate_status.setText(f"Poisson auto electrodes unavailable: {exc}")
             return
+        candidate_list = [int(value) for value in candidates]
+        protocol.poisson_candidate_electrodes = candidate_list
         group_name = self.poisson_auto_groups.get(protocol.name)
+        if manual_group is not None and manual_group.name.endswith(f"_{protocol.name}_auto"):
+            group_name = manual_group.name
         if not group_name:
             base_group = manual_group.name if manual_group is not None else self._settings_site_name_or_default()
             group_name = self._unique_group_name(f"{base_group}_{protocol.name}_auto")
-            self.poisson_auto_groups[protocol.name] = group_name
+        self.poisson_auto_groups[protocol.name] = group_name
         auto_group = next((group for group in self.groups if group.name == group_name), None)
         if auto_group is None:
             auto_group = stimulus_builder.ElectrodeGroup(group_name, [])
             self.groups.append(auto_group)
-        auto_group.electrodes = [int(value) for value in candidates]
-        for block in related_blocks:
-            block.electrode_group = group_name
+        auto_group.electrodes = candidate_list
+        if manual_group is not None:
+            for block in related_blocks:
+                block.electrode_group = manual_group.name
+        else:
+            for block in related_blocks:
+                block.electrode_group = group_name
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_table()
@@ -19802,7 +20122,16 @@ class StimulusGenerationDialog(AppDialog):
 
     def _protocol_type_changed(self, *_args) -> None:
         self._clear_preview_caches()
+        if getattr(self, "_protocol_name_auto", True):
+            self._protocol_name_auto = True
+            self.protocol_fields["name"].blockSignals(True)
+            self.protocol_fields["name"].setText(stimulus_builder._default_protocol_name(self.protocol_type.currentText()))
+            self.protocol_fields["name"].blockSignals(False)
         self._update_protocol_type_fields()
+
+    def _protocol_name_changed(self, text: str) -> None:
+        default_name = stimulus_builder._default_protocol_name(self.protocol_type.currentText())
+        self._protocol_name_auto = not str(text or "").strip() or str(text).strip() == default_name
 
     def _protocol_field_sets_for_type(self, protocol_type: str) -> tuple[set[str], set[str], bool, bool, bool]:
         protocol_type = str(protocol_type or "")
@@ -19838,12 +20167,25 @@ class StimulusGenerationDialog(AppDialog):
                 "channel",
             })
             advanced.add("inter_phase_interval_us")
+        elif protocol_type == "sequence_with_poisson_burst":
+            visible.update({
+                "amplitude_mv",
+                "pulse_width_us",
+                "pulse_frequency_hz",
+                "pulses_per_burst",
+                "interpulse_interval_ms",
+                "burst_count",
+                "burst_interval_ms",
+                "start_ms",
+                "channel",
+            })
+            advanced.add("inter_phase_interval_us")
         elif protocol_type == "custom_sequence":
             visible.update({"pulse_width_us", "channel"})
             advanced.add("inter_phase_interval_us")
             show_custom = True
         elif protocol_type == "poisson_random_electrodes":
-            visible.update({"amplitude_mv", "pulse_width_us", "pulses_per_burst", "poisson_duration_s"})
+            visible.update({"amplitude_mv", "pulse_width_us", "poisson_duration_s"})
             advanced.update({
                 "region_count",
                 "max_candidate_electrodes",
@@ -19879,6 +20221,11 @@ class StimulusGenerationDialog(AppDialog):
         self.source_box.setVisible(show_source)
         self.custom_points.setVisible(show_custom)
         self.custom_points_label.setVisible(show_custom)
+        if self.protocol_type.currentText() == "poisson_random_electrodes":
+            self.protocol_fields["pulses_per_burst"].setVisible(False)
+            label = self.protocol_field_labels.get("pulses_per_burst")
+            if label is not None:
+                label.setVisible(False)
         self._update_protocol_advanced_visibility()
 
     def _update_protocol_advanced_visibility(self) -> None:
@@ -20489,7 +20836,7 @@ class StimulusGenerationDialog(AppDialog):
                 firing_rate_hz=np.asarray(rates, dtype=float),
                 source_path=str(source_path),
             )
-            protocol.spontaneous_data_path = str(rate_path)
+            protocol.spontaneous_data_path = str(Path("config") / "pipeline_rate_sources" / rate_path.name).replace("\\", "/")
 
     def _rate_table_from_record(self, record: dict | None) -> tuple[list[int], list[float]]:
         if not isinstance(record, dict):
@@ -20580,10 +20927,24 @@ class StimulusGenerationDialog(AppDialog):
         return electrodes or [7317]
 
     def _record_by_path(self, path: str) -> dict | None:
+        target = self._normalized_record_path(path)
         for record in self.records:
-            if str(record.get("path", "")) == str(path):
+            record_path = str(record.get("path", ""))
+            if str(record_path) == str(path):
+                return record
+            if target and self._normalized_record_path(record_path) == target:
                 return record
         return None
+
+    @staticmethod
+    def _normalized_record_path(path: str) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        try:
+            return str(Path(text).expanduser().resolve()).casefold()
+        except Exception:
+            return str(Path(text)).replace("\\", "/").casefold()
 
     def _record_label(self, record: dict) -> str:
         path = Path(str(record.get("path", "")))
@@ -20608,8 +20969,13 @@ class StimulusGenerationDialog(AppDialog):
             self.output_path.setText(path)
 
     def _set_combo_data(self, combo: QComboBox, value) -> None:
+        normalized_value = self._normalized_record_path(str(value))
         for index in range(combo.count()):
-            if str(combo.itemData(index)) == str(value):
+            item_value = str(combo.itemData(index))
+            if item_value == str(value):
+                combo.setCurrentIndex(index)
+                return
+            if normalized_value and self._normalized_record_path(item_value) == normalized_value:
                 combo.setCurrentIndex(index)
                 return
         if combo.count():
@@ -21105,15 +21471,30 @@ class MainWindow(QMainWindow):
         errors = []
         processed_records = []
         raw_records = []
+        existing_names = {str(record.get("name", "") or "").strip().lower() for record in self.processed_database}
+        batch_names: set[str] = set()
         for record in self.file_database:
             path_text = str(record.get("path", ""))
             if path_text not in selected_lookup:
                 continue
             try:
                 raw_record = self._build_custom_raw_selection_record(record, parameters)
+                if _database_key_exists(self.processed_database, str(raw_record.get("name", ""))):
+                    _show_duplicate_database_warning(self, "processed-data database", str(raw_record.get("name", "")))
+                    continue
+                raw_record["name"] = self._unique_processed_record_name(str(raw_record.get("name", "")), existing_names | batch_names)
+                batch_names.add(str(raw_record.get("name", "")).strip().lower())
+                processed = self._build_custom_analysis_record(record, parameters)
+                if _database_key_exists(self.processed_database, str(processed.get("name", ""))):
+                    _show_duplicate_database_warning(self, "processed-data database", str(processed.get("name", "")))
+                    continue
+                processed["name"] = self._unique_processed_record_name(str(processed.get("name", "")), existing_names | batch_names)
+                batch_names.add(str(processed.get("name", "")).strip().lower())
+                if str(raw_record.get("name", "")).strip().lower() == str(processed.get("name", "")).strip().lower():
+                    _show_duplicate_database_warning(self, "processed-data database", str(processed.get("name", "")))
+                    continue
                 self._upsert_processed_record(raw_record)
                 raw_records.append(raw_record)
-                processed = self._build_custom_analysis_record(record, parameters)
                 self._upsert_processed_record(processed)
                 processed_records.append(processed)
                 records.append(
@@ -21147,6 +21528,18 @@ class MainWindow(QMainWindow):
             _show_info_message(self, "Custom Analysis", message)
         return payload
 
+    def _unique_processed_record_name(self, name: str, reserved_names: set[str]) -> str:
+        base = str(name or "custom data").strip() or "custom data"
+        existing = {str(item or "").strip().lower() for item in reserved_names}
+        if base.lower() not in existing:
+            return base
+        index = 2
+        while True:
+            candidate = f"{base} ({index})"
+            if candidate.lower() not in existing:
+                return candidate
+            index += 1
+
     def _open_custom_plot_dialog(self):
         if not self.processed_database:
             _show_info_message(self, "Custom Plot", "No processed data is available. Run a basic function first.")
@@ -21175,6 +21568,9 @@ class MainWindow(QMainWindow):
             saved_record["commit_detail"] = str(saved_record.get("description", "Extracted processed data"))
             if params.get("extracted_name"):
                 saved_record["name"] = str(params.get("extracted_name"))
+            if _database_key_exists(self.processed_database, str(saved_record.get("name", ""))):
+                _show_duplicate_database_warning(self, "processed-data database", str(saved_record.get("name", "")))
+                continue
             self._upsert_processed_record(saved_record)
             saved += 1
         if saved:
@@ -21183,10 +21579,10 @@ class MainWindow(QMainWindow):
             self._set_app_status("Extracted data saved", f"{saved} processed subset(s) added.")
         return saved
 
-    def _open_main_raster_for_database_path(self, path_text: str) -> None:
+    def _open_main_raster_for_database_path(self, path_text: str, *, channel_selected_callback=None):
         target = str(path_text or "")
         if not target:
-            return
+            return None
         for row, record in enumerate(self.file_database):
             if str(record.get("path", "")) != target:
                 continue
@@ -21195,9 +21591,9 @@ class MainWindow(QMainWindow):
                 self.database_table.selectRow(row)
                 self.database_table.setCurrentCell(row, 0)
             self._set_active_database_index(row)
-            self.preview_raw()
-            return
+            return self.preview_raw(channel_selected_callback=channel_selected_callback, safe_window=True)
         _show_warning_message(self, "Custom Analysis", f"Selected file is no longer in the database:\n{target}")
+        return None
 
     def _open_generic_analysis_window(self, payload: dict):
         window = GenericAnalysisWindow(payload, self)
@@ -21219,7 +21615,7 @@ class MainWindow(QMainWindow):
         matrix, sample_labels, feature_labels, description = _custom_spike_vector_matrix(selected_channels, windows, "spike_count_vector")
         safe_stamp = int(time.time() * 1000)
         display_prefix = str(parameters.get("display_name", "") or "").strip()
-        display_name = display_prefix or f"{Path(path_text).name} | selected raw segment"
+        display_name = f"{display_prefix} | raw selection" if display_prefix else f"{Path(path_text).name} | selected raw segment"
         selection = {
             "source_path": path_text,
             "windows": [{"start_s": float(start), "stop_s": float(stop), "label": str(label)} for start, stop, label in windows],
@@ -21284,7 +21680,8 @@ class MainWindow(QMainWindow):
         window_tag = f"{len(sample_labels)} window{'s' if len(sample_labels) != 1 else ''}"
         channel_tag = f"{len(feature_labels)} channel{'s' if len(feature_labels) != 1 else ''}"
         default_name = f"{Path(path_text).name} | {dataset_type} | {window_tag} | {channel_tag}"
-        display_name = str(parameters.get("display_name", "") or "").strip() or default_name
+        display_prefix = str(parameters.get("display_name", "") or "").strip()
+        display_name = f"{display_prefix} | {dataset_type}" if display_prefix else default_name
         return {
             "path": f"{path_text}::custom::{dataset_type}::{safe_stamp}",
             "source_path": path_text,
@@ -21662,10 +22059,26 @@ class MainWindow(QMainWindow):
             _show_warning_message(self, "Load failed", details)
             return
 
-        first_new_index = 0
+        first_new_index = None
+        skipped_duplicates: list[str] = []
         for record in records:
+            if _database_key_exists(self.file_database, str(record.get("path", "")), key="path"):
+                skipped_duplicates.append(Path(str(record.get("path", ""))).name)
+                continue
             first_new_index = self._upsert_database_record(record)
             self._log_database_record(record)
+        if skipped_duplicates:
+            _show_warning_message(
+                self,
+                "Duplicate name",
+                "These files already exist in the file database and were not saved:\n"
+                + "\n".join(skipped_duplicates[:12]),
+            )
+        if first_new_index is None:
+            self._refresh_file_database_table()
+            self._sync_active_file_controls()
+            self._set_app_status("Database unchanged", "All loaded files already exist in the database.")
+            return
         self.database_sort_column = None
         self._refresh_file_database_table()
         self.database_table.selectRow(first_new_index)
@@ -22353,9 +22766,9 @@ class MainWindow(QMainWindow):
         if failures:
             _show_warning_message(self, "Save File", "\n".join(failures[:12]))
 
-    def preview_raw(self):
+    def preview_raw(self, _checked=False, *, channel_selected_callback=None, safe_window: bool = False):
         if self.raw_data is None:
-            return
+            return None
         self._ensure_processed_data_for_selected_records()
         progress = self._start_progress("Preparing raster", "Preparing raster data...", 4)
         try:
@@ -22378,6 +22791,8 @@ class MainWindow(QMainWindow):
                     channel_map=self.channel_map,
                     stim_times=self.raw_data.stim_times,
                     channel_groups=channel_groups,
+                    channel_selected_callback=channel_selected_callback,
+                    safe_window=bool(safe_window),
                 )
             else:
                 self._progress_step(progress, "Rendering array preview...", 2)
@@ -22390,6 +22805,7 @@ class MainWindow(QMainWindow):
         finally:
             self._finish_progress(progress)
         self._show_child(window)
+        return window
 
     def open_settings(self):
         dialog = SettingsDialog(self.config, self)
@@ -22646,6 +23062,8 @@ class MainWindow(QMainWindow):
         self.child_windows.append(window)
         window.finished.connect(lambda _: self._forget_child(window))
         window.show()
+        if bool(getattr(window, "safe_window", False)):
+            _set_balanced_normal_geometry(window, width_fraction=0.86, height_fraction=0.82)
         window.raise_()
         window.activateWindow()
 

@@ -2277,6 +2277,32 @@ def test_default_maxwell_map_is_full_template_and_recording_is_file_specific():
 
     canvas.set_available_channels(["well1_e221"])
     assert canvas._is_recording_electrode("e221", payload) is True
+    import matplotlib.pyplot as plt
+    from src.gui.app import draw_maxwell_channel_map
+    figure, ax = plt.subplots()
+    try:
+        state = draw_maxwell_channel_map(ax, channel_map)
+        xs = sorted({round(point["x"], 6) for point in state["point_lookup"][:8]})
+        ys = sorted({round(point["y"], 6) for point in state["point_lookup"][:8]})
+        if len(xs) > 2 and len(ys) > 2:
+            x_spacings = [round(xs[i + 1] - xs[i], 6) for i in range(len(xs) - 1)]
+            y_spacings = [round(ys[i + 1] - ys[i], 6) for i in range(len(ys) - 1)]
+            assert max(x_spacings) - min(x_spacings) < 1e-6
+            assert max(y_spacings) - min(y_spacings) < 1e-6
+        gray = state["point_lookup"][0]["payload"]
+        assert isinstance(gray, dict)
+        e221_point = next(point for point in state["point_lookup"] if point["electrode"] == "e221")
+        e221_position = state["positions"]["e221"]
+        assert e221_point["x"] == pytest.approx(e221_position[0])
+        assert e221_point["y"] == pytest.approx(e221_position[1])
+
+        selected_state = draw_maxwell_channel_map(ax, channel_map, selected_electrode="e221")
+        selected_position = selected_state["positions"]["e221"]
+        selected_offsets = ax.collections[-1].get_offsets()
+        assert float(selected_offsets[0][0]) == pytest.approx(selected_position[0])
+        assert float(selected_offsets[0][1]) == pytest.approx(selected_position[1])
+    finally:
+        plt.close(figure)
 
 
 def test_stimulus_response_uses_maxwell_template_for_maxwell_style_channels():
@@ -3897,6 +3923,43 @@ def test_main_window_custom_plot_saves_extracted_processed_data(monkeypatch):
         app.processEvents()
 
 
+def test_main_window_custom_plot_rejects_duplicate_extracted_name(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.processed_database = [
+        {
+            "name": "existing subset",
+            "path": "a::rates",
+            "source_path": "a.nev",
+            "source_label": "Spontaneous",
+            "dataset_type": "firing_rate_vector",
+            "matrix": np.array([[1.0, 2.0]], dtype=float),
+            "sample_labels": ["0-1s"],
+            "feature_labels": ["chan1", "chan2"],
+            "description": "rates",
+        }
+    ]
+    warnings_seen = []
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
+    params = {"feature_filter": "chan2", "apply_filters": True, "extracted_name": "existing subset"}
+    records = [_custom_extract_processed_record(window.processed_database[0], params)]
+    try:
+        saved = window._save_custom_extracted_records(records, params)
+        assert saved == 0
+        assert len(window.processed_database) == 1
+        assert warnings_seen and warnings_seen[-1][1] == "Duplicate name"
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_main_window_custom_plot_opens_embedded_plot_dialog(monkeypatch):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -4068,6 +4131,47 @@ def test_main_window_custom_analysis_adds_processed_rate_dataset(tmp_path, monke
     app.processEvents()
 
 
+def test_main_window_custom_analysis_rejects_duplicate_processed_name(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "sample.nev"
+    path.write_bytes(b"placeholder")
+    window.file_database = [
+        {
+            "path": str(path),
+            "raw_data": UnifiedMEAData(spikes={"chan1": np.array([0.1, 0.2], dtype=float)}, sr=20000.0),
+            "data_kind": "nev",
+        }
+    ]
+    window.processed_database = [{"name": "duplicate feature", "path": "existing::feature", "matrix": np.array([[1.0]])}]
+    warnings_seen = []
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
+    payload = window._run_custom_analysis_records(
+        [str(path)],
+        {
+            "analysis_kind": "custom_basic",
+            "analysis_type": "firing_rate_vector",
+            "time_windows": "0-1",
+            "channels": "chan1",
+            "display_name": "duplicate feature",
+        },
+        open_result=False,
+    )
+
+    assert not payload["records"]
+    assert len(window.processed_database) == 1
+    assert any(message[1] == "Duplicate name" for message in warnings_seen)
+    window.close()
+    app.processEvents()
+
+
 def test_custom_data_selection_dialog_uses_main_raster_callback(tmp_path):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -4156,15 +4260,18 @@ def test_custom_data_selection_channel_map_right_click_and_box_remove(tmp_path):
             self.xdata = x
             self.ydata = y
             self.button = button
+            self.x = x
+            self.y = y
 
     try:
         e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
         e2_x, e2_y, _payload = dialog.electrode_positions["e2"]
-        dialog._map_clicked(Event(e1_x, e1_y, 3))
+        dialog._refresh_map()
+        assert dialog._nearest_map_electrode(Event(e1_x, e1_y, 3)) == "e1"
+        dialog.selected_channels = {"chan1", "chan2", "chan3"}
+        dialog._apply_map_channel_selection(["chan1"], "remove")
         assert "chan1" not in dialog.selected_channels
-        dialog._map_box_selected(Event(0.0, 0.0, 3), Event(0.6, 1.0, 3))
-        assert "chan2" not in dialog.selected_channels
-        dialog._map_box_selected(Event(0.0, 0.0, 1), Event(0.6, 1.0, 1))
+        dialog._apply_map_channel_selection(["chan1", "chan2"], "add")
         assert {"chan1", "chan2"} <= dialog.selected_channels
     finally:
         dialog.close()
@@ -4209,13 +4316,16 @@ def test_custom_data_selection_channel_map_left_click_highlights_electrode(tmp_p
             self.xdata = x
             self.ydata = y
             self.button = 1
+            self.x = x
+            self.y = y
 
     try:
         e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
         before_collections = len(dialog.map_ax.collections)
-        dialog._map_clicked(Event(e1_x, e1_y))
-        assert dialog.map_selected_electrode == "e1"
-        assert dialog.map_state.get("selected") == "e1"
+        dialog._refresh_map()
+        assert dialog._nearest_map_electrode(Event(e1_x, e1_y)) == "e1"
+        dialog.map_selected_electrode = "e1"
+        assert dialog._update_preview_map_selection_artist("e1", draw=False) == "e1"
         assert len(dialog.map_ax.collections) > before_collections
         selected_collection = dialog.map_ax.collections[-1]
         assert selected_collection.get_sizes()[0] >= 90
@@ -4423,7 +4533,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.block_phase_table.rowCount() == 0
     assert dialog.protocols == []
     assert dialog.groups == []
-    assert dialog.protocol_fields["name"].text() == "new_protocol"
+    assert dialog.protocol_fields["name"].text() == "single_pulse"
     assert dialog.protocol_fields["amplitude_mv"].text() == "150.0"
     assert dialog.protocol_fields["pulse_width_us"].text() == "300.0"
     assert dialog.protocol_fields["start_ms"].text() == "1500.0"
@@ -4453,6 +4563,8 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert not hasattr(dialog, "preview_block_name")
     assert dialog.protocol_fields["amplitude_mv"].maximumWidth() >= 220
     assert dialog.protocol_box.layout().horizontalSpacing() <= 4
+    dialog.protocol_type.setCurrentText("sequence_with_poisson_burst")
+    assert dialog.protocol_fields["name"].text() == "sequence_with_poisson_burst"
     dialog.protocol_fields["name"].setText("settings_added")
     dialog.protocol_type.setCurrentText("single_pulse")
     dialog._save_protocol()
@@ -4696,6 +4808,28 @@ def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_
     assert "seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))" in setup_text
 
 
+def test_stimulus_generation_poisson_burst_sequence_uses_random_bursts():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_bursts",
+        "sequence_with_poisson_burst",
+        start_ms=0.0,
+        pulses_per_burst=2,
+        interpulse_interval_ms=25.0,
+        burst_count=3,
+        burst_interval_ms=1000.0,
+        random_seed=7,
+    )
+
+    times = [time_ms for time_ms, _amp in stimulus_builder.pulse_starts_ms(protocol)]
+    assert len(times) == 6
+    assert times[0] == pytest.approx(0.0)
+    assert times[1] == pytest.approx(25.0)
+    assert times[2] != pytest.approx(1000.0)
+    assert times[4] >= times[2]
+
+
 def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp_path):
     from src.gui import visual_stimulus_package_builder as stimulus_builder
 
@@ -4757,6 +4891,47 @@ def test_stimulus_generation_package_writes_poisson_auto_electrode_group(tmp_pat
     assert "201" in stimulation_text
 
 
+def test_stimulus_generation_package_reuses_poisson_auto_electrode_group(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    rate_path = tmp_path / "rates.npz"
+    np.savez(
+        rate_path,
+        electrodes=np.asarray([100, 101, 200, 201], dtype=np.int32),
+        rates_hz=np.asarray([1.0, 9.0, 2.0, 8.0], dtype=float),
+    )
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_auto",
+        "poisson_random_electrodes",
+        spontaneous_data_path=str(rate_path),
+        region_count=2,
+        max_candidate_electrodes=4,
+    )
+    auto_group_name = "manual_group_poisson_auto_auto"
+    groups = [
+        stimulus_builder.ElectrodeGroup("manual_group", [7317]),
+        stimulus_builder.ElectrodeGroup(auto_group_name, [7317]),
+    ]
+    block = stimulus_builder.ExperimentBlock("poisson_block", auto_group_name, protocol.name)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        groups,
+        [protocol],
+        [block],
+    )
+
+    system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
+    stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
+
+    assert "electrode_group: manual_group_poisson_auto_auto" in system_text
+    assert "manual_group_poisson_auto_auto_poisson_auto_auto" not in system_text
+    assert stimulation_text.count("name: manual_group_poisson_auto_auto") == 1
+    assert "101" in stimulation_text
+    assert "201" in stimulation_text
+
+
 def test_stimulus_generation_ui_updates_poisson_auto_electrode_group(tmp_path):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -4792,6 +4967,50 @@ def test_stimulus_generation_ui_updates_poisson_auto_electrode_group(tmp_path):
     assert dialog.blocks[0].electrode_group == auto_group.name
     group_names = [dialog.group_table.item(row, 0).text() for row in range(dialog.group_table.rowCount())]
     assert auto_group.name in group_names
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_ui_reuses_existing_poisson_auto_group(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    app = QApplication.instance() or QApplication([])
+    rate_path = tmp_path / "rates.npz"
+    np.savez(
+        rate_path,
+        electrodes=np.asarray([100, 101, 200, 201], dtype=np.int32),
+        rates_hz=np.asarray([1.0, 9.0, 2.0, 8.0], dtype=float),
+    )
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    protocol = stimulus_builder.StimulusProtocol(
+        "poisson_ui",
+        "poisson_random_electrodes",
+        spontaneous_data_path=str(rate_path),
+        region_count=2,
+        max_candidate_electrodes=4,
+    )
+    auto_name = "manual_group_poisson_ui_auto"
+    dialog.protocols = [protocol]
+    dialog.protocol_source_paths[protocol.name] = str(rate_path)
+    dialog.poisson_auto_groups[protocol.name] = auto_name
+    dialog.groups = [
+        stimulus_builder.ElectrodeGroup("manual_group", [7317]),
+        stimulus_builder.ElectrodeGroup(auto_name, [7317]),
+    ]
+    dialog.blocks = [stimulus_builder.ExperimentBlock("poisson_block", auto_name, protocol.name)]
+
+    dialog._sync_poisson_protocol_auto_group(protocol.name)
+
+    matching_groups = [group for group in dialog.groups if group.name == auto_name]
+    assert len(matching_groups) == 1
+    assert matching_groups[0].electrodes == [101, 201]
+    assert dialog.blocks[0].electrode_group == auto_name
+    assert not any(group.name == f"{auto_name}_{protocol.name}_auto" for group in dialog.groups)
     dialog.close()
     app.processEvents()
 
@@ -4840,6 +5059,127 @@ def test_stimulus_generation_save_protocol_creates_poisson_group_without_block(t
     app.processEvents()
 
 
+def test_stimulus_generation_poisson_group_uses_normalized_source_path(tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    source_path = (tmp_path / "spontaneous.nev").resolve()
+    source_path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={
+            "chan100": np.array([0.0, 0.5], dtype=float),
+            "chan101": np.array([0.0, 0.1, 0.2, 0.3], dtype=float),
+        },
+        sr=20000.0,
+    )
+    dialog = StimulusGenerationDialog(
+        [{"path": str(source_path), "raw_data": data, "data_kind": "nev"}],
+        channel_map=None,
+    )
+    dialog._refresh_all()
+
+    dialog.protocol_fields["name"].setText("poisson_path")
+    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog.protocol_fields["region_count"].setText("1")
+    dialog.protocol_fields["max_candidate_electrodes"].setText("2")
+    dialog._set_combo_data(dialog.source_combo, str(source_path).replace("\\", "/"))
+    dialog._save_protocol()
+
+    auto_group = next(group for group in dialog.groups if group.name == "new_group_poisson_path_auto")
+    assert auto_group.electrodes == [100, 101]
+    assert dialog.protocol_source_paths["poisson_path"] == str(source_path)
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_rejects_duplicate_library_names(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    warnings_seen = []
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
+
+    dialog.protocol_fields["name"].setText("duplicate_protocol")
+    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._save_protocol()
+    assert len(dialog.protocols) == 1
+    dialog._save_protocol()
+    assert len(dialog.protocols) == 1
+    assert warnings_seen[-1][1] == "Duplicate name"
+
+    dialog.preview_group_name.setText("duplicate_site")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._save_group_from_settings()
+    assert len(dialog.groups) == 1
+    dialog._save_group_from_settings()
+    assert len(dialog.groups) == 1
+    assert warnings_seen[-1][1] == "Duplicate name"
+
+    dialog.protocol_fields["name"].setText("phase_protocol")
+    dialog.preview_group_name.setText("phase_site")
+    dialog._save_block_phase_from_settings()
+    assert len(dialog.block_phases) == 1
+    dialog.protocol_fields["name"].setText("phase_protocol")
+    dialog.preview_group_name.setText("phase_site")
+    dialog._save_block_phase_from_settings()
+    assert len(dialog.block_phases) == 1
+    assert warnings_seen[-1][1] == "Duplicate name"
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_save_block_phase_can_reference_existing_protocol_and_site(monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    warnings_seen = []
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
+
+    dialog.protocol_fields["name"].setText("existing_protocol")
+    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._save_protocol()
+    dialog.preview_group_name.setText("existing_site")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._save_group_from_settings()
+    assert len(dialog.protocols) == 1
+    assert len(dialog.groups) == 1
+
+    dialog.protocol_fields["name"].setText("existing_protocol")
+    dialog.preview_group_name.setText("existing_site")
+    dialog._save_block_phase_from_settings()
+
+    assert len(dialog.protocols) == 1
+    assert len(dialog.groups) == 1
+    assert len(dialog.block_phases) == 1
+    assert dialog.block_phases[0].protocol == "existing_protocol"
+    assert dialog.block_phases[0].electrode_group == "existing_site"
+    assert not warnings_seen
+
+    dialog.protocol_fields["name"].setText("existing_protocol")
+    dialog.preview_group_name.setText("existing_site")
+    dialog._save_block_phase_from_settings()
+    assert len(dialog.block_phases) == 1
+    assert warnings_seen and warnings_seen[-1][1] == "Duplicate name"
+    dialog.close()
+    app.processEvents()
+
+
 def test_stimulus_generation_protocol_fields_follow_selected_type():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -4875,6 +5215,7 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     assert not dialog.lambda_mode.isHidden()
     assert not dialog.protocol_fields["poisson_duration_s"].isHidden()
     assert dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert dialog.protocol_fields["pulses_per_burst"].isHidden()
     dialog.advanced_toggle.setChecked(True)
     dialog.lambda_mode.setCurrentText("scale")
     dialog._update_protocol_type_fields()
@@ -4886,6 +5227,11 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     assert dialog.protocol_fields["lambda_scale"].isHidden()
     assert not dialog.protocol_fields["lambda_mean_hz"].isHidden()
     assert not dialog.protocol_fields["lambda_std_hz"].isHidden()
+    dialog.protocol_type.setCurrentText("sequence_with_poisson_burst")
+    dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["burst_count"].isHidden()
+    assert not dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
     dialog.close()
     app.processEvents()
 
@@ -4964,12 +5310,20 @@ def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_pa
     original_draw_map = dialog._draw_preview_channel_map
     monkeypatch.setattr(dialog, "_draw_preview_channel_map", lambda *args, **kwargs: redraw_calls.append(args))
 
-    class Event:
-        inaxes = dialog.preview_map_canvas.figure.axes[0]
-        xdata = float(x)
-        ydata = float(y)
+    state = dialog.preview_map_state
+    selected_point = next((point for point in state["point_lookup"] if point["electrode"] == "e1"), None)
+    assert selected_point is not None
 
-    dialog._preview_map_clicked(Event())
+    class Event:
+        def __init__(self, x_value, y_value):
+            self.inaxes = dialog.preview_map_canvas.figure.axes[0]
+            self.xdata = float(x_value)
+            self.ydata = float(y_value)
+            self.x = float(x_value)
+            self.y = float(y_value)
+            self.button = 1
+
+    dialog._preview_map_clicked(Event(selected_point["x"], selected_point["y"]))
 
     assert redraw_calls == []
     assert dialog.preview_map_selected == "e1"
@@ -4977,14 +5331,15 @@ def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_pa
     assert "Electrode: e1" in dialog.preview_map_detail.text()
 
     class Scroll:
-        inaxes = dialog.preview_map_canvas.figure.axes[0]
-        xdata = float(x)
-        ydata = float(y)
-        step = 1
-        button = "up"
+        def __init__(self, x_value, y_value):
+            self.inaxes = dialog.preview_map_canvas.figure.axes[0]
+            self.xdata = float(x_value)
+            self.ydata = float(y_value)
+            self.step = 1
+            self.button = "up"
 
     old_xlim = dialog.preview_map_canvas.figure.axes[0].get_xlim()
-    dialog._preview_map_scrolled(Scroll())
+    dialog._preview_map_scrolled(Scroll(x, y))
     new_xlim = dialog.preview_map_canvas.figure.axes[0].get_xlim()
     assert abs(new_xlim[1] - new_xlim[0]) < abs(old_xlim[1] - old_xlim[0])
     assert redraw_calls == []
@@ -5171,6 +5526,52 @@ def test_main_window_save_file_saves_multiple_selected_records(tmp_path, monkeyp
 
     assert (output_dir / "first_spike_train.npz").exists()
     assert (output_dir / "second_spike_train.npz").exists()
+    window.close()
+    window.deleteLater()
+    app.closeAllWindows()
+    app.processEvents()
+    app.quit()
+    app.processEvents()
+
+
+def test_main_window_file_database_rejects_duplicate_loaded_path(tmp_path, monkeypatch):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        import src.gui.app as gui_app
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "duplicate.nev"
+    path.write_bytes(b"placeholder")
+    window.file_database = [
+        {"path": str(path), "raw_data": UnifiedMEAData(spikes={"a": np.array([0.1])}, sr=20000.0), "data_kind": "nev"}
+    ]
+    window._refresh_file_database_table()
+    warnings_seen = []
+    monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
+
+    class Worker:
+        def _is_cancelled(self):
+            return False
+
+    worker = Worker()
+    window.active_load_worker = worker
+    window._data_load_finished(
+        {
+            "records": [
+                {"path": str(path), "raw_data": UnifiedMEAData(spikes={"a": np.array([0.2])}, sr=20000.0), "data_kind": "nev"}
+            ],
+            "errors": [],
+        },
+        worker,
+    )
+
+    assert len(window.file_database) == 1
+    assert np.asarray(window.file_database[0]["raw_data"].spikes["a"]).tolist() == [0.1]
+    assert warnings_seen and warnings_seen[-1][1] == "Duplicate name"
     window.close()
     window.deleteLater()
     app.closeAllWindows()
