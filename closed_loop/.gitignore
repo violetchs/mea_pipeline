@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+cpp/build/
+data/
+data_*/
+config/closed_loop_rules.json

@@ -1,0 +1,11 @@
+[
+  {
+    "start_s": 0,
+    "stop_s": null,
+    "detect_spec": "auto:top:8:5",
+    "detect_channels": [],
+    "threshold": 12,
+    "stim_electrodes": [7317],
+    "sequence": "closed_loop"
+  }
+]

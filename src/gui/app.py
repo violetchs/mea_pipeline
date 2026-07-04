@@ -2,6 +2,7 @@
 
 import copy
 import colorsys
+import json
 import os
 import re
 import sys
@@ -20,7 +21,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 
 try:
-    from PySide6.QtCore import QItemSelectionModel, QLineF, QPointF, QObject, QRunnable, QRectF, Qt, QThreadPool, QTimer, Signal, Slot
+    from PySide6.QtCore import QItemSelectionModel, QLineF, QPointF, QObject, QProcess, QRunnable, QRectF, Qt, QThreadPool, QTimer, Signal, Slot
     from PySide6.QtGui import QAction, QColor, QFont, QImage, QPalette, QPainter, QPen, QPolygonF, QRadialGradient, QWheelEvent
     from PySide6.QtWidgets import (
         QApplication,
@@ -6196,7 +6197,10 @@ class CustomDataSelectionDialog(_DatabaseAnalysisDialogBase):
         paths = self._selected_paths()
         path = paths[0] if paths else str((self._active_record() or {}).get("path", ""))
         if path:
-            window = self.open_main_raster_callback(path, channel_selected_callback=self._raster_channel_selected)
+            try:
+                window = self.open_main_raster_callback(path, channel_selected_callback=self._raster_channel_selected)
+            except TypeError:
+                window = self.open_main_raster_callback(path)
             self.linked_raster_window = window
             if window is not None and self.map_selected_electrode:
                 labels = self._channels_for_electrode(self.map_selected_electrode)
@@ -8501,6 +8505,7 @@ class PlotWindow(AppDialog):
 class SpikeRasterCanvas(QWidget):
     wheel_zoom_requested = Signal(float, int)
     pan_requested = Signal(int)
+    pan_finished = Signal()
     channel_selected = Signal(str)
 
     def __init__(self, spike_series, y_axis_label: str = "Channel", parent=None):
@@ -8919,7 +8924,8 @@ class SpikeRasterCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start_x is not None:
-            if not self._drag_moved:
+            was_dragged = bool(self._drag_moved)
+            if not was_dragged:
                 pos = event.position() if hasattr(event, "position") else event.pos()
                 channel = self._channel_at_y(float(pos.y()))
                 if channel:
@@ -8928,6 +8934,8 @@ class SpikeRasterCanvas(QWidget):
             self._drag_start_y = None
             self._drag_moved = False
             self.unsetCursor()
+            if was_dragged:
+                self.pan_finished.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -9255,6 +9263,8 @@ class ElectrodeHeatmapCanvas(QWidget):
         self.active_wells = set()
         self.scale_max_count = 0
         self.fast_mode = False
+        self._heatmap_image_cache = None
+        self._heatmap_image_cache_key = None
         self._coordinate_entries_cache = None
         self._coordinate_bounds_cache = None
         self._coordinate_lookup_cache = None
@@ -9274,6 +9284,8 @@ class ElectrodeHeatmapCanvas(QWidget):
         self._coordinate_bounds_cache = None
         self._coordinate_lookup_cache = None
         self._routed_coordinate_entries_cache = None
+        self._heatmap_image_cache = None
+        self._heatmap_image_cache_key = None
 
     def _normalize_count_payload(self, counts: dict[str, int | float]):
         normalized = {}
@@ -9308,6 +9320,17 @@ class ElectrodeHeatmapCanvas(QWidget):
         self._raw_counts = dict(raw_counts)
         self.counts = dict(normalized)
         self.well_counts = {well: dict(payload) for well, payload in well_counts.items()}
+        self._heatmap_image_cache = None
+        self._heatmap_image_cache_key = None
+        if self.fast_mode:
+            self._display_raw_counts = dict(self._target_raw_counts)
+            self._display_counts = dict(self._target_counts)
+            self._display_well_counts = {well: dict(payload) for well, payload in self._target_well_counts.items()}
+            self.active_wells = {well for well, payload in self.well_counts.items() if any(value > 0 for value in payload.values())}
+            if self._transition_timer.isActive():
+                self._transition_timer.stop()
+            self.update()
+            return
         if not self._transition_timer.isActive():
             self._transition_timer.start()
         self._advance_count_transition()
@@ -9365,6 +9388,8 @@ class ElectrodeHeatmapCanvas(QWidget):
 
     def set_scale_max_count(self, max_count: int) -> None:
         self.scale_max_count = max(0, int(max_count))
+        self._heatmap_image_cache = None
+        self._heatmap_image_cache_key = None
         self.update()
 
     def set_fast_mode(self, enabled: bool) -> None:
@@ -9372,6 +9397,13 @@ class ElectrodeHeatmapCanvas(QWidget):
         if self.fast_mode == enabled:
             return
         self.fast_mode = enabled
+        self._heatmap_image_cache = None
+        self._heatmap_image_cache_key = None
+        if self.fast_mode and self._transition_timer.isActive():
+            self._transition_timer.stop()
+            self._display_raw_counts = dict(self._target_raw_counts)
+            self._display_counts = dict(self._target_counts)
+            self._display_well_counts = {well: dict(payload) for well, payload in self._target_well_counts.items()}
         self.update()
 
     def paintEvent(self, event):  # noqa: N802 - Qt override
@@ -9663,10 +9695,25 @@ class ElectrodeHeatmapCanvas(QWidget):
         max_resolution = 112 if self.fast_mode else 180
         min_resolution = 72 if self.fast_mode else 96
         resolution = int(max(min_resolution, min(max_resolution, round(rect.width()))))
-        field = self._continuous_heatmap_field(active_counts, max_count, resolution)
-        if not np.any(field > 0):
-            field = self._fallback_heatmap_field(active_counts, max_count, resolution)
-        image = self._heatmap_field_image(field)
+        count_items = tuple(sorted((str(key), int(round(float(value)))) for key, value in active_counts.items() if float(value) > 0))
+        cache_key = (
+            int(rect.width()),
+            int(rect.height()),
+            int(resolution),
+            int(max_count),
+            bool(self.fast_mode),
+            count_items,
+            id(self.channel_map),
+        )
+        if self._heatmap_image_cache_key == cache_key and self._heatmap_image_cache is not None:
+            image = self._heatmap_image_cache
+        else:
+            field = self._continuous_heatmap_field(active_counts, max_count, resolution)
+            if not np.any(field > 0):
+                field = self._fallback_heatmap_field(active_counts, max_count, resolution)
+            image = self._heatmap_field_image(field)
+            self._heatmap_image_cache = image
+            self._heatmap_image_cache_key = cache_key
         painter.drawImage(rect, image)
         painter.restore()
 
@@ -16028,6 +16075,7 @@ class SpikeRasterWindow(AppDialog):
         self.channel_map = channel_map
         self.analysis_windows = []
         self.selected_channel = _prefer_waveform_channel(self.spike_series, self.waveform_series)
+        self._burst_detection_dirty = False
         self.channel_groups = {}
         if isinstance(channel_groups, dict):
             available_labels = {str(label) for label, _times in self.raw_spike_series}
@@ -16039,6 +16087,9 @@ class SpikeRasterWindow(AppDialog):
         self._last_waveform_refresh = 0.0
         self._waveform_min_interval_s = 0.12
         self._waveform_window_limit = 2400
+        self._interactive_pan_active = False
+        self._last_pan_update = 0.0
+        self._pan_min_interval_s = 0.016
         self._playback_time_ms = None
         self._internal_slider_update = False
         self._channel_count_cache = {}
@@ -16066,6 +16117,7 @@ class SpikeRasterWindow(AppDialog):
         self.canvas.set_stim_times(self.stim_times)
         self.canvas.wheel_zoom_requested.connect(self._zoom_grid_at)
         self.canvas.pan_requested.connect(self._pan_to_absolute_ms)
+        self.canvas.pan_finished.connect(self._finish_interactive_pan)
         self.canvas.channel_selected.connect(self._select_channel)
         self.rate_canvas = PopulationRateCanvas(self.spike_series, left_margin=self.canvas.plot_left)
         self.rate_canvas.set_bursts(self.burst_intervals)
@@ -16232,6 +16284,7 @@ class SpikeRasterWindow(AppDialog):
         self.slider.setSingleStep(10)
         self.slider.setPageStep(max(10, self._window_ms() // 2))
         self.slider.valueChanged.connect(self._slider_value_changed)
+        self.slider.sliderReleased.connect(self._finish_slider_drag)
 
         self.time_label = QLabel()
         self.time_label.setObjectName("MutedText")
@@ -16316,7 +16369,7 @@ class SpikeRasterWindow(AppDialog):
         layout.addLayout(playback_controls)
         layout.addWidget(parameter_frame)
 
-        self._refresh_bursts()
+        self._initialize_bursts_for_open()
         self._refresh_heatmap_scale()
         self._update_row_scroll_range()
         self._update_slider_range()
@@ -16650,11 +16703,21 @@ class SpikeRasterWindow(AppDialog):
                 self._set_playback_time_ms(self.slider.value())
             else:
                 self._set_playback_time_ms(self._window_start_offset_ms())
+            if self.slider.isSliderDown():
+                self._update_view(lightweight=True)
+                return
             self._update_view(force_heatmap=True)
             return
         self._update_view()
 
-    def _update_view(self, *, force_heatmap: bool = False):
+    def _finish_slider_drag(self) -> None:
+        if self._short_data_window():
+            self._set_playback_time_ms(self.slider.value())
+        else:
+            self._set_playback_time_ms(self._window_start_offset_ms())
+        self._update_view(force_heatmap=True)
+
+    def _update_view(self, *, force_heatmap: bool = False, lightweight: bool = False):
         start_s = self.min_time + self._window_start_offset_ms() / 1000.0
         duration_s = self._window_ms() / 1000.0
         grid_s = self.grid_ms.value() / 1000.0
@@ -16664,6 +16727,8 @@ class SpikeRasterWindow(AppDialog):
         self.canvas.set_playhead_time(playhead_time)
         self.rate_canvas.set_playhead_time(playhead_time)
         self.time_label.setText(f"{start_s:8.3f} - {start_s + duration_s:8.3f} s")
+        if lightweight:
+            return
         self._refresh_waveforms_for_window()
         self._refresh_heatmap_for_view(start_s, duration_s, force=force_heatmap)
 
@@ -16719,28 +16784,40 @@ class SpikeRasterWindow(AppDialog):
         stop = float(self.max_time)
         scale = 0
         if stop > start:
-            edges = np.arange(start, stop + heatmap_duration_s * 1.5, heatmap_duration_s, dtype=float)
-            if edges.size < 2:
-                edges = np.array([start, start + heatmap_duration_s], dtype=float)
-            per_channel_bins: dict[str, np.ndarray] = {}
-            for base_channel, series_list in self._count_series_by_channel.items():
-                for values in series_list:
-                    if values.size == 0:
-                        continue
-                    lo = int(np.searchsorted(values, edges[0], side="left"))
-                    hi = int(np.searchsorted(values, edges[-1], side="right"))
-                    if hi <= lo:
-                        continue
-                    indices = np.searchsorted(values[lo:hi], edges)
-                    bin_counts = np.diff(indices).astype(np.int32, copy=False)
-                    existing = per_channel_bins.get(base_channel)
-                    if existing is None:
-                        per_channel_bins[base_channel] = bin_counts
-                    else:
-                        existing += bin_counts
-            for bin_counts in per_channel_bins.values():
-                if bin_counts.size:
-                    scale = max(scale, int(bin_counts.max()))
+            duration_s = stop - start
+            bin_count = int(np.ceil(duration_s / heatmap_duration_s))
+            channel_count = max(1, len(self._count_series_by_channel))
+            if bin_count * channel_count > 250000:
+                sample_count = min(240, max(24, int(np.sqrt(bin_count) * 4)))
+                sample_stops = np.linspace(start + heatmap_duration_s, stop, sample_count, dtype=float)
+                for sample_stop in sample_stops:
+                    sample_start = max(start, float(sample_stop) - heatmap_duration_s)
+                    counts = self._window_channel_counts(sample_start, float(sample_stop))
+                    if counts:
+                        scale = max(scale, int(max(counts.values(), default=0)))
+            else:
+                edges = np.arange(start, stop + heatmap_duration_s * 1.5, heatmap_duration_s, dtype=float)
+                if edges.size < 2:
+                    edges = np.array([start, start + heatmap_duration_s], dtype=float)
+                per_channel_bins: dict[str, np.ndarray] = {}
+                for base_channel, series_list in self._count_series_by_channel.items():
+                    for values in series_list:
+                        if values.size == 0:
+                            continue
+                        lo = int(np.searchsorted(values, edges[0], side="left"))
+                        hi = int(np.searchsorted(values, edges[-1], side="right"))
+                        if hi <= lo:
+                            continue
+                        indices = np.searchsorted(values[lo:hi], edges)
+                        bin_counts = np.diff(indices).astype(np.int32, copy=False)
+                        existing = per_channel_bins.get(base_channel)
+                        if existing is None:
+                            per_channel_bins[base_channel] = bin_counts
+                        else:
+                            existing += bin_counts
+                for bin_counts in per_channel_bins.values():
+                    if bin_counts.size:
+                        scale = max(scale, int(bin_counts.max()))
         self.heatmap_scale_count = int(scale)
         self._heatmap_scale_cache[cache_key] = self.heatmap_scale_count
         self.heatmap_canvas.set_scale_max_count(self.heatmap_scale_count)
@@ -16878,8 +16955,27 @@ class SpikeRasterWindow(AppDialog):
     def _window_ms(self) -> int:
         return max(1, self.window_grids.value() * self.grid_ms.value())
 
-    def _refresh_bursts(self):
-        spike_count = sum(np.asarray(times).size for _, times in self.spike_series)
+    def _spike_count_for_current_view(self) -> int:
+        return int(sum(np.asarray(times).size for _, times in self.spike_series))
+
+    def _initialize_bursts_for_open(self) -> None:
+        spike_count = self._spike_count_for_current_view()
+        if len(self.spike_series) > 160 or spike_count > 750000:
+            self.burst_intervals = []
+            self.canvas.set_bursts(self.burst_intervals)
+            self.rate_canvas.set_bursts(self.burst_intervals)
+            self._burst_detection_dirty = True
+            return
+        self._refresh_bursts(force=True)
+
+    def _ensure_bursts_ready(self) -> bool:
+        if not self._burst_detection_dirty:
+            return True
+        self._refresh_bursts(force=True)
+        return not self._burst_detection_dirty
+
+    def _refresh_bursts(self, *, force: bool = False):
+        spike_count = self._spike_count_for_current_view()
         progress = None
         if len(self.spike_series) > 80 or spike_count > 500000:
             progress = self._start_progress("Burst detection", "Detecting bursts...", 0)
@@ -16898,16 +16994,21 @@ class SpikeRasterWindow(AppDialog):
             )
             if cancel_requested():
                 self._log("Burst detection cancelled")
+                self._burst_detection_dirty = True
                 return
             self.burst_intervals = intervals
             self.canvas.set_bursts(self.burst_intervals)
             self.rate_canvas.set_bursts(self.burst_intervals)
+            self._burst_detection_dirty = False
         except InterruptedError as exc:
-            self._log(str(exc) or "Burst detection cancelled")
+            _show_warning_message(self, "Burst detection", str(exc) or "Burst detection cancelled")
+            self._burst_detection_dirty = True
         finally:
             self._finish_progress(progress)
 
     def _open_ibi_window(self):
+        if not self._ensure_bursts_ready():
+            return None
         progress = self._start_progress("IBI", "Preparing IBI histogram...", 0)
         try:
             window = IBIWindow(self.burst_intervals, self)
@@ -16924,6 +17025,8 @@ class SpikeRasterWindow(AppDialog):
         return self._show_analysis_window(window)
 
     def _open_burst_correlation_window(self):
+        if not self._ensure_bursts_ready():
+            return None
         progress = self._start_progress("Burst correlation", "Computing burst correlation...", 0)
         try:
             window = BurstCorrelationWindow(self.spike_series, self.burst_intervals, self, self.channel_map)
@@ -16932,6 +17035,8 @@ class SpikeRasterWindow(AppDialog):
         return self._show_analysis_window(window)
 
     def _open_burst_delay_window(self):
+        if not self._ensure_bursts_ready():
+            return None
         for window in list(self.analysis_windows):
             if isinstance(window, BurstDelayWindow):
                 window.show()
@@ -16949,6 +17054,8 @@ class SpikeRasterWindow(AppDialog):
         return self._show_analysis_window(window)
 
     def _open_burst_clustering_window(self):
+        if not self._ensure_bursts_ready():
+            return None
         progress = self._start_progress("Burst clustering", "Preparing burst clustering...", 0)
         try:
             window = BurstClusteringWindow(self.spike_series, self.burst_intervals, self)
@@ -16957,6 +17064,8 @@ class SpikeRasterWindow(AppDialog):
         return self._show_analysis_window(window)
 
     def _open_burst_trajectory_window(self):
+        if not self._ensure_bursts_ready():
+            return None
         progress = self._start_progress("Burst trajectory", "Preparing burst trajectory analysis...", 0)
         try:
             window = BurstTrajectoryWindow(self.spike_series, self.burst_intervals, self, self.channel_map)
@@ -16965,6 +17074,8 @@ class SpikeRasterWindow(AppDialog):
         return self._show_analysis_window(window)
 
     def _save_bursts(self):
+        if not self._ensure_bursts_ready():
+            return False
         if not self.burst_intervals:
             _show_info_message(self, "Save Bursts", "No detected bursts are available to save.")
             return False
@@ -17076,8 +17187,30 @@ class SpikeRasterWindow(AppDialog):
         self._update_view()
 
     def _pan_to_absolute_ms(self, absolute_start_ms: int) -> None:
+        now = time.monotonic()
+        if self._interactive_pan_active and (now - self._last_pan_update) < self._pan_min_interval_s:
+            return
+        self._interactive_pan_active = True
+        self._last_pan_update = now
         target_slider = int(round(absolute_start_ms - self.min_time * 1000))
-        self.slider.setValue(min(self.slider.maximum(), max(self.slider.minimum(), target_slider)))
+        value = min(self.slider.maximum(), max(self.slider.minimum(), target_slider))
+        if value == self.slider.value():
+            return
+        self._last_waveform_view = None
+        self.slider.blockSignals(True)
+        self.slider.setValue(value)
+        self.slider.blockSignals(False)
+        if self._playback_time_ms is None:
+            self._set_playback_time_ms(self._window_start_offset_ms())
+        self._update_view(lightweight=True)
+
+    def _finish_interactive_pan(self) -> None:
+        if not self._interactive_pan_active:
+            return
+        self._interactive_pan_active = False
+        if self._playback_time_ms is None:
+            self._set_playback_time_ms(self._window_start_offset_ms())
+        self._update_view(force_heatmap=True)
 
     def _select_channel(self, channel: str) -> None:
         self._scroll_channel_into_view(str(channel))
@@ -17146,6 +17279,964 @@ class SpikeRasterWindow(AppDialog):
         else:
             window_waveforms = waveforms[lo:hi]
         self.waveform_canvas.set_channel_waveforms(channel, window_waveforms, self.sampling_rate)
+
+
+class ClosedLoopStimCanvas(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.window_s = 10.0
+        self.current_time_s = 0.0
+        self.events: list[dict[str, object]] = []
+        self.setMinimumSize(260, 240)
+
+    def set_state(self, current_time_s: float, events: list[dict[str, object]], window_s: float) -> None:
+        self.current_time_s = max(0.0, float(current_time_s))
+        self.window_s = max(0.1, float(window_s))
+        self.events = list(events or [])[-200:]
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        margin = 14
+        left = margin + 36
+        right = margin
+        top = margin + 16
+        bottom = margin + 30
+        width = max(1, self.width() - left - right)
+        height = max(1, self.height() - top - bottom)
+        start_s = max(0.0, self.current_time_s - self.window_s)
+        stop_s = start_s + self.window_s
+
+        painter.setPen(QPen(QColor("#d7deea"), 1))
+        painter.drawRect(left, top, width, height)
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(QPen(QColor("#475569"), 1))
+        painter.drawText(left, 4, width, 18, Qt.AlignmentFlag.AlignCenter, "Closed-loop stimulation")
+
+        rows = [("trigger", QColor("#2563eb")), ("stim", QColor("#dc2626"))]
+        for row, (name, color) in enumerate(rows):
+            y = top + height * (row + 0.5) / len(rows)
+            painter.setPen(QPen(QColor("#94a3b8"), 1))
+            painter.drawText(4, int(y - 8), left - 10, 16, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, name)
+            painter.drawLine(left, int(y), left + width, int(y))
+            event_pen = QPen(color, 2)
+            event_pen.setCosmetic(True)
+            painter.setPen(event_pen)
+            for item in self.events:
+                if str(item.get("type", "")) != name:
+                    continue
+                try:
+                    t = float(item.get("time_s", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if not (start_s <= t <= stop_s):
+                    continue
+                x = left + (t - start_s) / self.window_s * width
+                painter.drawLine(QLineF(float(x), float(y - 22), float(x), float(y + 22)))
+
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(left, self.height() - 22, width, 16, Qt.AlignmentFlag.AlignCenter, f"{start_s:.2f} - {stop_s:.2f} s")
+        painter.end()
+
+
+class ClosedLoopControlDialog(AppDialog):
+    def __init__(self, records=None, parent=None, channel_map: ChannelMap | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("MaxWell Closed Loop")
+        self.resize(1420, 860)
+        self.records = list(records or [])
+        self.channel_map = channel_map
+        self.run_start_monotonic: float | None = None
+        self.spike_events: dict[str, list[float]] = {}
+        self.closed_loop_events: list[dict[str, object]] = []
+        self.total_spikes = 0
+        self.total_stims = 0
+        self.blanking_until_s = 0.0
+        self.follow_live = True
+        self.display_window_s = 10.0
+        self._last_external_log_s = -999.0
+        self.runner_process: QProcess | None = None
+        self.control_process: QProcess | None = None
+        self._control_queue: list[tuple[str, list[str], str]] = []
+        self._loaded_rate_scores_cache_key = None
+        self._loaded_rate_scores_cache: dict[str, float] | None = None
+        self.live_channels = self._initial_channels()
+
+        self.raster_canvas = SpikeRasterCanvas([(channel, np.asarray([], dtype=float)) for channel in self.live_channels], y_axis_label="Channel")
+        self.raster_canvas.setMinimumSize(720, 440)
+        self.raster_canvas.wheel_zoom_requested.connect(self._zoom_live_window)
+        self.raster_canvas.pan_requested.connect(self._pan_live_window)
+        self.raster_canvas.pan_finished.connect(self._resume_follow_later)
+        self.heatmap_canvas = ElectrodeHeatmapCanvas(channel_map)
+        self.heatmap_canvas.setMinimumSize(320, 260)
+        self.stim_canvas = ClosedLoopStimCanvas()
+
+        self.backend_combo = NoWheelComboBox()
+        self.backend_combo.addItem("Simulation", "simulation")
+        self.backend_combo.addItem("MaxWell C++ runner", "cpp_runner")
+        self.backend_combo.addItem("External network", "network")
+        self.backend_combo.currentIndexChanged.connect(self._backend_changed)
+        self.cfg_path = QLineEdit(self._default_cfg_path())
+        self.rules_path = QLineEdit(str(self._default_rules_path()))
+        self.runner_path = QLineEdit(str(self._default_runner_path()))
+        self.amplitude_mv = QDoubleSpinBox()
+        self.amplitude_mv.setRange(1.0, 1000.0)
+        self.amplitude_mv.setValue(150.0)
+        self.amplitude_mv.setSuffix(" mV")
+        self.blank_ms = QSpinBox()
+        self.blank_ms.setRange(0, 60000)
+        self.blank_ms.setValue(500)
+        self.blank_ms.setSuffix(" ms")
+        self.rule_table = QTableWidget(0, 6)
+        self.rule_table.setHorizontalHeaderLabels(["Start s", "Stop s", "Detect ch", "Threshold", "Stim electrodes", "Sequence"])
+        self.rule_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.rule_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.rule_table.setMinimumHeight(160)
+        self.rule_table.horizontalHeader().setStretchLastSection(True)
+        self.add_rule_button = QPushButton("Add Rule")
+        self.add_rule_button.clicked.connect(self._add_rule_row)
+        self.auto_rule_button = QPushButton("Auto Detect")
+        self.auto_rule_button.clicked.connect(self._set_selected_rule_auto_detect)
+        self.remove_rule_button = QPushButton("Remove Rule")
+        self.remove_rule_button.clicked.connect(self._remove_selected_rule)
+        self.save_rules_button = QPushButton("Save Rules")
+        self.save_rules_button.clicked.connect(self._save_rules_file)
+        self.build_runner_button = QPushButton("Build C++")
+        self.build_runner_button.clicked.connect(self._build_cpp_runner)
+        self.dry_setup_button = QPushButton("Dry-run Setup")
+        self.dry_setup_button.clicked.connect(lambda: self._run_closed_loop_setup(dry_run=True))
+        self.setup_hardware_button = QPushButton("Setup Hardware")
+        self.setup_hardware_button.clicked.connect(lambda: self._run_closed_loop_setup(dry_run=False))
+        self._add_rule_row(
+            {
+                "start_s": "0",
+                "stop_s": "",
+                "detect": "auto:top:8:5",
+                "threshold": "12",
+                "stim": "7317",
+                "sequence": "closed_loop",
+            }
+        )
+
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("PrimaryButton")
+        self.start_button.clicked.connect(self._start)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.clicked.connect(self._stop)
+        self.stop_button.setEnabled(False)
+        self.reset_view_button = QPushButton("Follow")
+        self.reset_view_button.clicked.connect(self._follow_now)
+
+        self.status_label = QLabel("Idle")
+        self.status_label.setObjectName("MutedText")
+        self.metric_label = QLabel("0 spikes | 0 stim")
+        self.metric_label.setObjectName("MutedText")
+        self.event_table = QTableWidget(0, 5)
+        self.event_table.setHorizontalHeaderLabels(["Time", "Type", "Channel", "Count", "Note"])
+        self.event_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.event_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.event_table.setMinimumHeight(220)
+        self.controller_log = QTextEdit()
+        self.controller_log.setReadOnly(True)
+        self.controller_log.setPlaceholderText("External controller / network state")
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(80)
+        self.timer.timeout.connect(self._tick)
+
+        self._build_layout()
+        self._backend_changed()
+        self._refresh_live_views()
+
+    def _build_layout(self) -> None:
+        left = QFrame()
+        left.setObjectName("Panel")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Live raster / heatmap"))
+        header.addStretch(1)
+        header.addWidget(self.reset_view_button)
+        left_layout.addLayout(header)
+        left_layout.addWidget(self.raster_canvas, 3)
+        left_layout.addWidget(self.heatmap_canvas, 2)
+
+        middle = QFrame()
+        middle.setObjectName("Panel")
+        middle.setMaximumWidth(360)
+        middle_layout = QVBoxLayout(middle)
+        middle_layout.setContentsMargins(8, 8, 8, 8)
+        controls = QHBoxLayout()
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        middle_layout.addLayout(controls)
+        middle_layout.addWidget(self.status_label)
+        middle_layout.addWidget(self.metric_label)
+        middle_layout.addWidget(self.stim_canvas, 1)
+        middle_layout.addWidget(self.event_table, 1)
+
+        right = QFrame()
+        right.setObjectName("Panel")
+        right.setMaximumWidth(430)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.addRow("Backend", self.backend_combo)
+        form.addRow("CFG", self.cfg_path)
+        form.addRow("Rules", self.rules_path)
+        form.addRow("Runner", self.runner_path)
+        form.addRow("Amplitude", self.amplitude_mv)
+        form.addRow("Blanking", self.blank_ms)
+        right_layout.addLayout(form)
+        runtime_buttons = QGridLayout()
+        runtime_buttons.addWidget(self.save_rules_button, 0, 0)
+        runtime_buttons.addWidget(self.build_runner_button, 0, 1)
+        runtime_buttons.addWidget(self.dry_setup_button, 1, 0)
+        runtime_buttons.addWidget(self.setup_hardware_button, 1, 1)
+        right_layout.addLayout(runtime_buttons)
+        right_layout.addWidget(QLabel("Closed-loop rules"))
+        rule_hint = QLabel("Detect ch: 101,102 | all | auto:top:8:5 | auto:bottom:8:5 | auto:above:2:5")
+        rule_hint.setObjectName("MutedText")
+        rule_hint.setWordWrap(True)
+        right_layout.addWidget(rule_hint)
+        right_layout.addWidget(self.rule_table, 1)
+        rule_buttons = QHBoxLayout()
+        rule_buttons.addWidget(self.add_rule_button)
+        rule_buttons.addWidget(self.auto_rule_button)
+        rule_buttons.addWidget(self.remove_rule_button)
+        right_layout.addLayout(rule_buttons)
+        right_layout.addWidget(QLabel("Controller"))
+        right_layout.addWidget(self.controller_log, 1)
+
+        layout = QHBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(left, 5)
+        layout.addWidget(middle, 2)
+        layout.addWidget(right, 2)
+        _fix_spinbox_hit_targets(self)
+
+    def _closed_loop_root(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "closed_loop"
+
+    def _default_rules_path(self) -> Path:
+        return self._closed_loop_root() / "config" / "closed_loop_rules.json"
+
+    def _default_runner_path(self) -> Path:
+        build_dir = self._closed_loop_root() / "cpp" / "build"
+        exe = build_dir / "closed_loop_runner.exe"
+        if exe.exists():
+            return exe
+        return build_dir / "closed_loop_runner"
+
+    def _save_rules_file(self) -> Path | None:
+        path = Path(self.rules_path.text().strip() or str(self._default_rules_path()))
+        if not path.is_absolute():
+            path = self._closed_loop_root().parent / path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rules = self._rules_from_table(self._elapsed_s())
+            path.write_text(json.dumps(rules, indent=2, ensure_ascii=True), encoding="utf-8")
+        except OSError as exc:
+            self.controller_log.append(f"Save rules failed: {exc}")
+            self.status_label.setText("Save rules failed")
+            return None
+        self.rules_path.setText(str(path))
+        self.controller_log.append(f"Rules saved: {path}")
+        return path
+
+    def _set_runtime_buttons_enabled(self, enabled: bool) -> None:
+        for button in [self.save_rules_button, self.build_runner_button, self.dry_setup_button, self.setup_hardware_button]:
+            button.setEnabled(enabled)
+
+    def _start_control_queue(self, commands: list[tuple[str, list[str], str]], label: str) -> None:
+        if self.control_process is not None and self.control_process.state() != QProcess.ProcessState.NotRunning:
+            self.controller_log.append("Another setup/build command is already running.")
+            return
+        self._control_queue = list(commands)
+        self._set_runtime_buttons_enabled(False)
+        self.status_label.setText(label)
+        self._run_next_control_command()
+
+    def _run_next_control_command(self) -> None:
+        if not self._control_queue:
+            self.control_process = None
+            self._set_runtime_buttons_enabled(True)
+            self.status_label.setText("Ready")
+            return
+        program, arguments, workdir = self._control_queue.pop(0)
+        process = QProcess(self)
+        process.setProgram(program)
+        process.setArguments(arguments)
+        if workdir:
+            process.setWorkingDirectory(workdir)
+        process.readyReadStandardOutput.connect(self._read_control_stdout)
+        process.readyReadStandardError.connect(self._read_control_stderr)
+        process.finished.connect(self._control_finished)
+        process.errorOccurred.connect(self._control_error)
+        self.control_process = process
+        self.controller_log.append(f"$ {program} {' '.join(arguments)}")
+        process.start()
+
+    def _read_control_stdout(self) -> None:
+        process = self.control_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        for line in text.splitlines():
+            if line.strip():
+                self.controller_log.append(line.strip())
+
+    def _read_control_stderr(self) -> None:
+        process = self.control_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode(errors="replace")
+        for line in text.splitlines():
+            if line.strip():
+                self.controller_log.append(f"stderr: {line.strip()}")
+
+    def _control_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        self.controller_log.append(f"Command finished: code={exit_code}, status={exit_status.name}")
+        if exit_code != 0:
+            self._control_queue = []
+            self.control_process = None
+            self._set_runtime_buttons_enabled(True)
+            self.status_label.setText("Command failed")
+            return
+        self._run_next_control_command()
+
+    def _control_error(self, error: QProcess.ProcessError) -> None:
+        self.controller_log.append(f"Command error: {error.name}")
+        self._control_queue = []
+        self.control_process = None
+        self._set_runtime_buttons_enabled(True)
+        self.status_label.setText("Command error")
+
+    def _build_cpp_runner(self) -> None:
+        root = self._closed_loop_root()
+        cpp_dir = root / "cpp"
+        build_dir = cpp_dir / "build"
+        self._start_control_queue(
+            [
+                ("cmake", ["-S", str(cpp_dir), "-B", str(build_dir)], str(root.parent)),
+                ("cmake", ["--build", str(build_dir)], str(root.parent)),
+            ],
+            "Building C++ runner",
+        )
+
+    def _run_closed_loop_setup(self, *, dry_run: bool) -> None:
+        rules_path = self._save_rules_file()
+        if rules_path is None:
+            return
+        root = self._closed_loop_root()
+        data_dir = root / "data"
+        arguments = [
+            "-m",
+            "closed_loop.closed_loop_setup",
+            "--config-dir",
+            str(root / "config"),
+            "--cfg",
+            self.cfg_path.text().strip(),
+            "--rules-file",
+            str(rules_path),
+            "--data-dir",
+            str(data_dir),
+            "--amplitude-mv",
+            f"{float(self.amplitude_mv.value()):.6g}",
+        ]
+        if dry_run:
+            arguments.append("--dry-run")
+        label = "Dry-run setup" if dry_run else "Setting up hardware"
+        self._start_control_queue([(sys.executable, arguments, str(root.parent))], label)
+
+    def _add_rule_row(self, rule: dict[str, object] | None = None) -> None:
+        payload = dict(rule or {})
+        row = self.rule_table.rowCount()
+        self.rule_table.insertRow(row)
+        values = [
+            str(payload.get("start_s", "0")),
+            str(payload.get("stop_s", "")),
+            str(payload.get("detect", "all")),
+            str(payload.get("threshold", "12")),
+            str(payload.get("stim", "")),
+            str(payload.get("sequence", "closed_loop")),
+        ]
+        for column, value in enumerate(values):
+            self.rule_table.setItem(row, column, QTableWidgetItem(value))
+        self.rule_table.resizeColumnsToContents()
+
+    def _remove_selected_rule(self) -> None:
+        rows = sorted({index.row() for index in self.rule_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            rows = [self.rule_table.currentRow()]
+        for row in rows:
+            if 0 <= row < self.rule_table.rowCount():
+                self.rule_table.removeRow(row)
+        if self.rule_table.rowCount() == 0:
+            self._add_rule_row()
+
+    def _set_selected_rule_auto_detect(self) -> None:
+        row = self.rule_table.currentRow()
+        if row < 0:
+            row = 0
+        if self.rule_table.rowCount() == 0:
+            self._add_rule_row()
+            row = 0
+        self.rule_table.setItem(row, 2, QTableWidgetItem("auto:top:8:5"))
+        self.rule_table.resizeColumnsToContents()
+
+    def _table_text(self, row: int, column: int) -> str:
+        item = self.rule_table.item(row, column)
+        return item.text().strip() if item is not None else ""
+
+    @staticmethod
+    def _parse_auto_detect_spec(text: str) -> dict[str, object] | None:
+        raw = str(text or "").strip()
+        if not raw.lower().startswith("auto"):
+            return None
+        parts = [part.strip() for part in raw.split(":") if part.strip()]
+        mode = parts[1].lower() if len(parts) > 1 else "top"
+        count = 8
+        window_s = 5.0
+        rate_threshold_hz = 0.0
+        if mode == "above":
+            if len(parts) > 2:
+                try:
+                    rate_threshold_hz = max(0.0, float(parts[2]))
+                except ValueError:
+                    rate_threshold_hz = 0.0
+            if len(parts) > 3:
+                try:
+                    window_s = max(0.25, float(parts[3]))
+                except ValueError:
+                    window_s = 5.0
+        else:
+            if len(parts) > 2:
+                try:
+                    count = max(1, int(float(parts[2])))
+                except ValueError:
+                    count = 8
+            if len(parts) > 3:
+                try:
+                    window_s = max(0.25, float(parts[3]))
+                except ValueError:
+                    window_s = 5.0
+        if mode in {"active", "rate", "highest", "high"}:
+            mode = "top"
+        if mode in {"quiet", "lowest", "low"}:
+            mode = "bottom"
+        if mode not in {"top", "bottom", "above"}:
+            mode = "top"
+        return {
+            "raw": raw,
+            "mode": mode,
+            "count": count,
+            "window_s": window_s,
+            "rate_threshold_hz": rate_threshold_hz,
+        }
+
+    def _loaded_channel_rate_scores(self) -> dict[str, float]:
+        cache_key = tuple(
+            (
+                id(record.get("raw_data")) if isinstance(record, dict) else id(record),
+                len(getattr(record.get("raw_data"), "spikes", {}) if isinstance(record, dict) else {}),
+            )
+            for record in self.records
+        )
+        if self._loaded_rate_scores_cache_key == cache_key and self._loaded_rate_scores_cache is not None:
+            return dict(self._loaded_rate_scores_cache)
+        scores: dict[str, float] = {}
+        durations: dict[str, float] = {}
+        for record in self.records:
+            raw = record.get("raw_data") if isinstance(record, dict) else None
+            if not isinstance(raw, UnifiedMEAData):
+                continue
+            series = _spike_series_from_unified(raw)
+            finite_chunks = [values[np.isfinite(values)] for _label, values in series if np.any(np.isfinite(values))]
+            if finite_chunks:
+                finite = np.concatenate(finite_chunks)
+                duration_s = max(float(np.nanmax(finite) - min(0.0, float(np.nanmin(finite)))), 1e-9)
+            else:
+                duration_s = 1.0
+            for label, values in series:
+                finite = np.asarray(values, dtype=float)
+                count = int(np.count_nonzero(np.isfinite(finite)))
+                key = str(label)
+                scores[key] = scores.get(key, 0.0) + float(count)
+                durations[key] = durations.get(key, 0.0) + duration_s
+        result = {label: scores[label] / max(durations.get(label, 0.0), 1e-9) for label in scores}
+        self._loaded_rate_scores_cache_key = cache_key
+        self._loaded_rate_scores_cache = dict(result)
+        return result
+
+    def _channel_rate_scores(self, now_s: float | None, window_s: float) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        if now_s is not None and self.spike_events:
+            start_s = max(0.0, float(now_s) - max(0.25, float(window_s)))
+            duration_s = max(float(now_s) - start_s, 1e-9)
+            for channel in self.live_channels:
+                scores[str(channel)] = self._count_channel_window(str(channel), start_s, float(now_s)) / duration_s
+            if any(value > 0.0 for value in scores.values()):
+                return scores
+        loaded_scores = self._loaded_channel_rate_scores()
+        if loaded_scores:
+            return loaded_scores
+        return {str(channel): 0.0 for channel in self.live_channels}
+
+    def _auto_detect_channels(self, text: str, now_s: float | None = None) -> list[str] | None:
+        spec = self._parse_auto_detect_spec(text)
+        if spec is None:
+            return None
+        scores = self._channel_rate_scores(now_s, float(spec.get("window_s", 5.0)))
+        if not scores:
+            return list(self.live_channels)
+        mode = str(spec.get("mode", "top"))
+        if mode == "above":
+            threshold = float(spec.get("rate_threshold_hz", 0.0))
+            selected = [label for label, rate in scores.items() if float(rate) >= threshold]
+            selected.sort(key=lambda label: (-float(scores.get(label, 0.0)), _channel_sort_key(label)))
+            return selected
+        reverse = mode != "bottom"
+        ordered = sorted(
+            scores,
+            key=lambda label: (
+                -float(scores.get(label, 0.0)) if reverse else float(scores.get(label, 0.0)),
+                _channel_sort_key(label),
+            ),
+        )
+        count = max(1, int(spec.get("count", 8)))
+        return ordered[:count]
+
+    def _parse_label_list(self, text: str, *, available: list[str] | None = None) -> list[str]:
+        available_values = list(available or [])
+        if not str(text).strip():
+            return []
+        tokens = [token.strip() for token in re.split(r"[,;\s]+", str(text).strip()) if token.strip()]
+        labels: list[str] = []
+        for token in tokens:
+            if token.lower() == "all":
+                for label in available_values:
+                    if label not in labels:
+                        labels.append(label)
+                continue
+            range_match = re.fullmatch(r"(\d+)-(\d+)", token)
+            if range_match:
+                start = int(range_match.group(1))
+                stop = int(range_match.group(2))
+                step = 1 if stop >= start else -1
+                for value in range(start, stop + step, step):
+                    label = str(value)
+                    if label not in labels:
+                        labels.append(label)
+                continue
+            if token not in labels:
+                labels.append(token)
+        return labels
+
+    def _resolve_detection_channels(self, text: str, now_s: float | None = None) -> list[str]:
+        auto_channels = self._auto_detect_channels(text, now_s)
+        if auto_channels is not None:
+            return auto_channels
+        return self._parse_label_list(text, available=self.live_channels)
+
+    def _rules_from_table(self, now_s: float | None = None) -> list[dict[str, object]]:
+        rules: list[dict[str, object]] = []
+        for row in range(self.rule_table.rowCount()):
+            try:
+                start_s = max(0.0, float(self._table_text(row, 0) or 0.0))
+            except ValueError:
+                start_s = 0.0
+            stop_text = self._table_text(row, 1)
+            try:
+                stop_s = float(stop_text) if stop_text else None
+            except ValueError:
+                stop_s = None
+            try:
+                threshold = max(1, int(float(self._table_text(row, 3) or 1)))
+            except ValueError:
+                threshold = 1
+            detect_text = self._table_text(row, 2)
+            detect_channels = self._resolve_detection_channels(detect_text, now_s)
+            stim_electrodes = self._parse_label_list(self._table_text(row, 4))
+            sequence = self._table_text(row, 5) or "closed_loop"
+            if not detect_channels and self.live_channels:
+                detect_channels = list(self.live_channels)
+            rules.append(
+                {
+                    "start_s": start_s,
+                    "stop_s": stop_s,
+                    "detect_spec": detect_text,
+                    "detect_auto": self._parse_auto_detect_spec(detect_text) is not None,
+                    "detect_channels": detect_channels,
+                    "threshold": threshold,
+                    "stim_electrodes": stim_electrodes,
+                    "sequence": sequence,
+                }
+            )
+        return rules
+
+    def _active_rules(self, now_s: float) -> list[dict[str, object]]:
+        rules = []
+        for rule in self._rules_from_table(now_s):
+            start_s = float(rule.get("start_s", 0.0))
+            stop_s = rule.get("stop_s")
+            if now_s < start_s:
+                continue
+            if stop_s is not None and now_s > float(stop_s):
+                continue
+            rules.append(rule)
+        return rules
+
+    def _initial_channels(self) -> list[str]:
+        for record in self.records:
+            raw = record.get("raw_data") if isinstance(record, dict) else None
+            if isinstance(raw, UnifiedMEAData):
+                labels = sorted([str(label) for label in raw.spikes.keys()], key=_channel_sort_key)
+                if labels:
+                    return labels[:32]
+        if self.channel_map is not None:
+            labels = []
+            for electrode, payload in self.channel_map.electrodes.items():
+                if isinstance(payload, dict):
+                    labels.append(str(payload.get("channel") or electrode))
+            if labels:
+                return sorted(labels, key=_channel_sort_key)[:32]
+        return [f"chan{i + 1}" for i in range(16)]
+
+    def _default_cfg_path(self) -> str:
+        for record in self.records:
+            if not isinstance(record, dict):
+                continue
+            meta = getattr(record.get("raw_data"), "meta", {}) if record.get("raw_data") is not None else {}
+            if isinstance(meta, dict) and meta.get("cfg_path"):
+                return str(meta.get("cfg_path"))
+        return os.environ.get("MAXWELL_CFG_PATH", "")
+
+    def _backend_changed(self) -> None:
+        backend = str(self.backend_combo.currentData() or "simulation")
+        self.runner_path.setEnabled(backend == "cpp_runner")
+        self.controller_log.append(f"Backend: {backend}")
+
+    def _elapsed_s(self) -> float:
+        if self.run_start_monotonic is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.run_start_monotonic)
+
+    def _start(self) -> None:
+        self.run_start_monotonic = time.monotonic()
+        self.spike_events = {channel: [] for channel in self.live_channels}
+        self.closed_loop_events = []
+        self.total_spikes = 0
+        self.total_stims = 0
+        self.blanking_until_s = 0.0
+        self.follow_live = True
+        self.event_table.setRowCount(0)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.status_label.setText("Running")
+        self.controller_log.append("Closed-loop session started")
+        for index, rule in enumerate(self._rules_from_table(0.0), start=1):
+            if rule.get("detect_auto"):
+                channels = ",".join(list(rule.get("detect_channels", []))[:12])
+                suffix = "..." if len(rule.get("detect_channels", [])) > 12 else ""
+                self.controller_log.append(f"Rule {index} auto detect -> {channels}{suffix}")
+        backend = str(self.backend_combo.currentData() or "simulation")
+        if backend == "cpp_runner":
+            self._launch_cpp_runner()
+        elif backend == "network":
+            self.controller_log.append("External network backend selected; waiting for telemetry.")
+        self.timer.start()
+
+    def _stop(self) -> None:
+        self.timer.stop()
+        self._stop_cpp_runner()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("Stopped")
+        self.controller_log.append("Closed-loop session stopped")
+
+    def _runner_arguments(self) -> list[str]:
+        rules_path = Path(self.rules_path.text().strip() or str(self._default_rules_path()))
+        return [
+            "--rules-file",
+            str(rules_path),
+            "--blank-ms",
+            str(int(self.blank_ms.value())),
+        ]
+
+    def _launch_cpp_runner(self) -> None:
+        self._stop_cpp_runner(wait_ms=100)
+        rules_path = self._save_rules_file()
+        if rules_path is None:
+            return
+        program = self.runner_path.text().strip()
+        if not program:
+            self.status_label.setText("Runner path missing")
+            self.controller_log.append("MaxWell runner path is empty.")
+            return
+        if not Path(program).exists():
+            self.status_label.setText("Runner not found")
+            self.controller_log.append(f"MaxWell runner not found: {program}")
+            return
+        process = QProcess(self)
+        process.setProgram(program)
+        process.setArguments(self._runner_arguments())
+        process.readyReadStandardOutput.connect(self._read_runner_stdout)
+        process.readyReadStandardError.connect(self._read_runner_stderr)
+        process.finished.connect(self._runner_finished)
+        process.errorOccurred.connect(self._runner_error)
+        self.runner_process = process
+        self.controller_log.append(f"Starting MaxWell runner: {program}")
+        process.start()
+
+    def _stop_cpp_runner(self, wait_ms: int = 1500) -> None:
+        process = self.runner_process
+        if process is None:
+            return
+        if process.state() != QProcess.ProcessState.NotRunning:
+            process.terminate()
+            if not process.waitForFinished(wait_ms):
+                process.kill()
+                process.waitForFinished(500)
+        self.runner_process = None
+
+    def _read_runner_stdout(self) -> None:
+        process = self.runner_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            self.controller_log.append(line)
+            self._handle_runner_line(line)
+
+    def _read_runner_stderr(self) -> None:
+        process = self.runner_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode(errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                self.controller_log.append(f"stderr: {line}")
+
+    def _runner_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        self.controller_log.append(f"MaxWell runner finished: code={exit_code}, status={exit_status.name}")
+        if self.runner_process is not None and self.runner_process.state() == QProcess.ProcessState.NotRunning:
+            self.runner_process = None
+
+    def _runner_error(self, error: QProcess.ProcessError) -> None:
+        self.status_label.setText("Runner error")
+        self.controller_log.append(f"MaxWell runner error: {error.name}")
+
+    def _handle_runner_line(self, line: str) -> None:
+        item = self._parse_runner_event(line)
+        if item is None:
+            return
+        self.closed_loop_events.append(item)
+        if item.get("type") == "stim":
+            self.total_stims += 1
+        self._append_event_row(item)
+        self._refresh_live_views()
+
+    def _parse_runner_event(self, line: str) -> dict[str, object] | None:
+        stripped = line.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("type") in {"trigger", "stim"}:
+                event_time = payload.get("time_s", self._elapsed_s())
+                return {
+                    "time_s": float(event_time),
+                    "type": str(payload.get("type")),
+                    "channel": str(payload.get("channel", payload.get("electrode", ""))),
+                    "count": int(payload.get("count", self.total_stims)),
+                    "note": str(payload.get("note", "runner")),
+                }
+        lowered = stripped.lower()
+        event_type = "stim" if "stim" in lowered or "sendsequence" in lowered else "trigger" if "trigger" in lowered else ""
+        if not event_type:
+            return None
+        time_match = re.search(r"(?:time|t|time_s)\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)", stripped, flags=re.IGNORECASE)
+        channel_match = re.search(r"(?:channel|electrode|ch|el)\s*[=:]\s*([A-Za-z0-9_.-]+)", stripped, flags=re.IGNORECASE)
+        count_match = re.search(r"(?:count|n)\s*[=:]\s*([0-9]+)", stripped, flags=re.IGNORECASE)
+        return {
+            "time_s": float(time_match.group(1)) if time_match else self._elapsed_s(),
+            "type": event_type,
+            "channel": channel_match.group(1) if channel_match else "",
+            "count": int(count_match.group(1)) if count_match else (self.total_stims + 1 if event_type == "stim" else 0),
+            "note": "runner",
+        }
+
+    def _tick(self) -> None:
+        backend = str(self.backend_combo.currentData() or "simulation")
+        if backend != "simulation":
+            self._tick_external_placeholder()
+            return
+        now_s = self._elapsed_s()
+        rng_seed = int(now_s * 1000.0)
+        rng = np.random.default_rng(rng_seed)
+        active_rules = self._active_rules(now_s)
+        detection_labels = {
+            str(channel)
+            for rule in active_rules
+            for channel in rule.get("detect_channels", [])
+            if str(channel)
+        }
+        new_counts: dict[str, int] = {}
+        for index, channel in enumerate(self.live_channels):
+            rate_hz = 0.4 + (index % 7) * 0.18
+            if channel in detection_labels:
+                rate_hz += 8.0 if int(now_s) % 4 == 1 else 1.5
+            count = int(rng.poisson(rate_hz * self.timer.interval() / 1000.0))
+            if count <= 0:
+                continue
+            jitter = rng.random(count) * (self.timer.interval() / 1000.0)
+            values = [max(0.0, now_s - self.timer.interval() / 1000.0 + float(item)) for item in jitter]
+            self.spike_events.setdefault(channel, []).extend(values)
+            new_counts[channel] = count
+            self.total_spikes += count
+        for rule in active_rules:
+            detect_channels = [str(channel) for channel in rule.get("detect_channels", []) if str(channel)]
+            recent = sum(self._count_channel_window(channel, max(0.0, now_s - 1.0), now_s) for channel in detect_channels)
+            if (
+                recent >= int(rule.get("threshold", 1))
+                and now_s >= self.blanking_until_s
+            ):
+                self._register_closed_loop_event(now_s, rule, recent)
+                break
+        self._trim_events(now_s)
+        self._refresh_live_views()
+
+    def _tick_external_placeholder(self) -> None:
+        now_s = self._elapsed_s()
+        if now_s - self._last_external_log_s >= 2.0:
+            self._last_external_log_s = now_s
+            self.controller_log.append("Waiting for external controller telemetry...")
+        self._refresh_live_views()
+
+    def _count_channel_window(self, channel: str, start_s: float, stop_s: float) -> int:
+        values = np.asarray(self.spike_events.get(channel, []), dtype=float)
+        if values.size == 0:
+            return 0
+        lo = int(np.searchsorted(values, start_s, side="left"))
+        hi = int(np.searchsorted(values, stop_s, side="right"))
+        return max(0, hi - lo)
+
+    def _register_closed_loop_event(self, time_s: float, rule: dict[str, object], count: int) -> None:
+        self.blanking_until_s = time_s + int(self.blank_ms.value()) / 1000.0
+        detect_channels = [str(channel) for channel in rule.get("detect_channels", []) if str(channel)]
+        stim_electrodes = [str(electrode) for electrode in rule.get("stim_electrodes", []) if str(electrode)]
+        sequence = str(rule.get("sequence", "closed_loop") or "closed_loop")
+        trigger = {
+            "time_s": float(time_s),
+            "type": "trigger",
+            "channel": ",".join(detect_channels),
+            "count": int(count),
+            "note": f"{rule.get('detect_spec', 'detect')}; threshold>={int(rule.get('threshold', 1))}",
+        }
+        stim_events = []
+        for electrode in stim_electrodes or [""]:
+            self.total_stims += 1
+            stim_events.append(
+                {
+                    "time_s": float(time_s),
+                    "type": "stim",
+                    "channel": electrode,
+                    "count": int(self.total_stims),
+                    "note": sequence,
+                }
+            )
+        self.closed_loop_events.extend([trigger, *stim_events])
+        self._append_event_row(trigger)
+        for stim in stim_events:
+            self._append_event_row(stim)
+
+    def _append_event_row(self, item: dict[str, object]) -> None:
+        row = self.event_table.rowCount()
+        self.event_table.insertRow(row)
+        values = [
+            f"{float(item.get('time_s', 0.0)):.3f}",
+            str(item.get("type", "")),
+            str(item.get("channel", "")),
+            str(item.get("count", "")),
+            str(item.get("note", "")),
+        ]
+        for column, value in enumerate(values):
+            self.event_table.setItem(row, column, QTableWidgetItem(value))
+        if row > 300:
+            self.event_table.removeRow(0)
+        self.event_table.scrollToBottom()
+
+    def _trim_events(self, now_s: float) -> None:
+        keep_after = max(0.0, now_s - 180.0)
+        for channel in list(self.spike_events):
+            values = self.spike_events[channel]
+            while values and values[0] < keep_after:
+                values.pop(0)
+        self.closed_loop_events = [item for item in self.closed_loop_events if float(item.get("time_s", 0.0)) >= keep_after]
+
+    def _series_arrays(self) -> list[tuple[str, np.ndarray]]:
+        return [(channel, np.asarray(self.spike_events.get(channel, []), dtype=float)) for channel in self.live_channels]
+
+    def _refresh_live_views(self) -> None:
+        current_s = self._elapsed_s()
+        window_s = float(self.display_window_s)
+        if self.follow_live:
+            start_s = max(0.0, current_s - window_s)
+        else:
+            start_s = self.raster_canvas.window_start
+        self.raster_canvas.set_spike_series(self._series_arrays())
+        self.raster_canvas.set_view(start_s, window_s, max(0.05, window_s / 10.0))
+        self.raster_canvas.set_playhead_time(current_s)
+        heatmap_start = max(0.0, current_s - 0.25)
+        counts = {channel: self._count_channel_window(channel, heatmap_start, current_s) for channel in self.live_channels}
+        self.heatmap_canvas.set_fast_mode(True)
+        self.heatmap_canvas.set_counts(counts)
+        self.stim_canvas.set_state(current_s, self.closed_loop_events, window_s)
+        self.metric_label.setText(f"{self.total_spikes} spikes | {self.total_stims} stim")
+
+    def _zoom_live_window(self, fraction: float, direction: int) -> None:
+        old_window = float(self.display_window_s)
+        factor = 0.8 if direction > 0 else 1.25
+        new_window = min(300.0, max(0.25, old_window * factor))
+        if not self.follow_live:
+            anchor_s = self.raster_canvas.window_start + max(0.0, min(1.0, float(fraction))) * old_window
+            new_start = max(0.0, anchor_s - max(0.0, min(1.0, float(fraction))) * new_window)
+            self.raster_canvas.set_view(new_start, new_window, max(0.05, new_window / 10.0))
+        self.display_window_s = new_window
+        self._refresh_live_views()
+
+    def _pan_live_window(self, absolute_start_ms: int) -> None:
+        self.follow_live = False
+        window_s = float(self.display_window_s)
+        self.raster_canvas.set_view(max(0.0, float(absolute_start_ms) / 1000.0), window_s, max(0.05, window_s / 10.0))
+
+    def _resume_follow_later(self) -> None:
+        self.follow_live = False
+
+    def _follow_now(self) -> None:
+        self.follow_live = True
+        self._refresh_live_views()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt override
+        self.timer.stop()
+        self._stop_cpp_runner()
+        if self.control_process is not None and self.control_process.state() != QProcess.ProcessState.NotRunning:
+            self.control_process.terminate()
+            if not self.control_process.waitForFinished(500):
+                self.control_process.kill()
+        super().closeEvent(event)
 
 
 class ResultsWindow(AppDialog):
@@ -19995,12 +21086,8 @@ class StimulusGenerationDialog(AppDialog):
             auto_group = stimulus_builder.ElectrodeGroup(group_name, [])
             self.groups.append(auto_group)
         auto_group.electrodes = candidate_list
-        if manual_group is not None:
-            for block in related_blocks:
-                block.electrode_group = manual_group.name
-        else:
-            for block in related_blocks:
-                block.electrode_group = group_name
+        for block in related_blocks:
+            block.electrode_group = group_name
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_table()
@@ -21028,6 +22115,7 @@ class MainWindow(QMainWindow):
         self.generic_analysis_payload = None
         self.custom_data_selection_dialog = None
         self.stimulus_generation_dialog = None
+        self.closed_loop_dialog = None
         self.active_processed_index = -1
 
         self._build_ui()
@@ -21191,6 +22279,9 @@ class MainWindow(QMainWindow):
         stimulus_generation_action = QAction("Stimulus Generation", self)
         stimulus_generation_action.triggered.connect(self.open_stimulus_generation)
         tools_menu.addAction(stimulus_generation_action)
+        closed_loop_action = QAction("Closed Loop Control", self)
+        closed_loop_action.triggered.connect(self.open_closed_loop_control)
+        tools_menu.addAction(closed_loop_action)
         multi_file_fa_action = QAction("Dynamics Analysis", self)
         multi_file_fa_action.triggered.connect(self.open_multi_file_factor_analysis)
         tools_menu.addAction(multi_file_fa_action)
@@ -21248,6 +22339,23 @@ class MainWindow(QMainWindow):
         self.stimulus_generation_dialog.show()
         self.stimulus_generation_dialog.raise_()
         self.stimulus_generation_dialog.activateWindow()
+
+    def open_closed_loop_control(self):
+        if self.closed_loop_dialog is None:
+            self.closed_loop_dialog = ClosedLoopControlDialog(
+                self.file_database,
+                self,
+                channel_map=self.channel_map,
+            )
+            self.closed_loop_dialog.setWindowModality(Qt.WindowModality.NonModal)
+            self.closed_loop_dialog.finished.connect(lambda _result: setattr(self, "closed_loop_dialog", None))
+        else:
+            self.closed_loop_dialog.records = list(self.file_database)
+            self.closed_loop_dialog.channel_map = self.channel_map
+            self.closed_loop_dialog.heatmap_canvas.set_channel_map(self.channel_map)
+        self.closed_loop_dialog.show()
+        self.closed_loop_dialog.raise_()
+        self.closed_loop_dialog.activateWindow()
 
     def open_stimulus_response_analysis(self):
         if self.active_stimulus_worker is not None:
@@ -21591,7 +22699,10 @@ class MainWindow(QMainWindow):
                 self.database_table.selectRow(row)
                 self.database_table.setCurrentCell(row, 0)
             self._set_active_database_index(row)
-            return self.preview_raw(channel_selected_callback=channel_selected_callback, safe_window=True)
+            try:
+                return self.preview_raw(channel_selected_callback=channel_selected_callback, safe_window=True)
+            except TypeError:
+                return self.preview_raw()
         _show_warning_message(self, "Custom Analysis", f"Selected file is no longer in the database:\n{target}")
         return None
 
