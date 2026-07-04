@@ -4,7 +4,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR/.."
 
 if [ -z "${CXX:-}" ]; then
-    for candidate in g++-13 g++-12; do
+    for candidate in g++-13; do
         if command -v "$candidate" >/dev/null 2>&1; then
             export CXX="$(command -v "$candidate")"
             cc_candidate="$(printf '%s\n' "$candidate" | sed 's/g++/gcc/')"
@@ -17,8 +17,8 @@ if [ -z "${CXX:-}" ]; then
     done
 fi
 if [ -z "${CXX:-}" ]; then
-    echo "ERROR: g++-12 or g++-13 is required to link MaxLab libmaxlab.a." >&2
-    echo "Install one with: sudo apt install g++-12 gcc-12" >&2
+    echo "ERROR: g++-13 or newer is required to link MaxLab libmaxlab.a." >&2
+    echo "Install it or set CXX/CC to a compatible compiler before running this script." >&2
     exit 1
 fi
 

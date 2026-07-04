@@ -17585,9 +17585,9 @@ class ClosedLoopControlDialog(AppDialog):
     def _preferred_closed_loop_compiler_args(self) -> list[str] | None:
         if os.name == "nt":
             return []
-        cxx = os.environ.get("CXX") or shutil.which("g++-13") or shutil.which("g++-12")
+        cxx = os.environ.get("CXX") or shutil.which("g++-13")
         if not cxx:
-            message = "g++-12 or g++-13 is required to link MaxLab libmaxlab.a. Install with: sudo apt install g++-12 gcc-12"
+            message = "g++-13 or newer is required to link MaxLab libmaxlab.a. Install g++-13 or set CXX/CC to a compatible compiler."
             self.controller_log.append(f"ERROR: {message}")
             self.status_label.setText("C++ compiler too old")
             QMessageBox.warning(self, "Closed-loop build", message)
