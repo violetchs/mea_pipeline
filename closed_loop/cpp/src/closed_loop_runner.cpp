@@ -72,6 +72,17 @@ struct Rule
     std::string sequence = "closed_loop";
 };
 
+struct PendingArtifact
+{
+    bool active = true;
+    unsigned long command_frame = 0;
+    unsigned long deadline_frame = 0;
+    double command_time_s = 0.0;
+    int stim_count = 0;
+    std::string sequence;
+    std::vector<int> channels;
+};
+
 struct Args
 {
     std::string rules_json;
@@ -82,6 +93,7 @@ struct Args
     double blank_ms = 500.0;
     double run_seconds = 0.0;
     double sample_rate_hz = 20000.0;
+    double artifact_window_ms = 25.0;
 };
 
 std::string trim(const std::string &value)
@@ -367,6 +379,8 @@ Args parse_args(int argc, char **argv)
             args.run_seconds = std::atof(next().c_str());
         else if (key == "--sample-rate-hz")
             args.sample_rate_hz = std::atof(next().c_str());
+        else if (key == "--artifact-window-ms")
+            args.artifact_window_ms = std::atof(next().c_str());
         else if (key == "--cfg" || key == "--response-electrode" || key == "--amplitude-mv")
             (void)next();
     }
@@ -412,13 +426,23 @@ std::vector<int> resolved_channels(const Rule &rule, const std::vector<std::dequ
     return rule.detect_channels;
 }
 
-void log_event(double time_s, const std::string &type, const std::string &channel, int count, const std::string &note)
+void log_event(double time_s, const std::string &type, const std::string &channel, int count, const std::string &note, double latency_ms = -1.0, double dispatch_ms = -1.0)
 {
     std::cout << "{\"time_s\":" << time_s
               << ",\"type\":\"" << type
               << "\",\"channel\":\"" << channel
               << "\",\"count\":" << count
-              << ",\"note\":\"" << note << "\"}" << std::endl;
+              << ",\"note\":\"" << note << "\"";
+    if (latency_ms >= 0.0)
+        std::cout << ",\"latency_ms\":" << latency_ms;
+    if (dispatch_ms >= 0.0)
+        std::cout << ",\"dispatch_ms\":" << dispatch_ms;
+    std::cout << "}" << std::endl;
+}
+
+bool contains_channel(const std::vector<int> &channels, int channel)
+{
+    return channels.empty() || std::find(channels.begin(), channels.end(), channel) != channels.end();
 }
 
 std::string join_channels(const std::vector<int> &channels, size_t max_items = 16)
@@ -458,6 +482,7 @@ int main(int argc, char **argv)
     const auto t0 = std::chrono::steady_clock::now();
     auto blank_until = t0;
     int stim_count = 0;
+    std::vector<PendingArtifact> pending_artifacts;
 
     std::cout << "closed_loop_runner started with " << rules.size() << " rule(s)" << std::endl;
     for (size_t i = 0; i < rules.size(); ++i)
@@ -498,6 +523,36 @@ int main(int argc, char **argv)
             }
         }
 
+        for (auto &pending : pending_artifacts)
+        {
+            if (!pending.active)
+                continue;
+            bool found = false;
+            for (uint64_t i = 0; i < frame.spikeCount; ++i)
+            {
+                const auto &event = frame.spikeEvents[i];
+                if (event.frameNo <= pending.command_frame || event.frameNo > pending.deadline_frame)
+                    continue;
+                if (!contains_channel(pending.channels, static_cast<int>(event.channel)))
+                    continue;
+                const double latency_ms = (static_cast<double>(event.frameNo - pending.command_frame) / args.sample_rate_hz) * 1000.0;
+                const double artifact_time_s = pending.command_time_s + latency_ms / 1000.0;
+                log_event(artifact_time_s, "artifact", std::to_string(event.channel), pending.stim_count, pending.sequence, latency_ms);
+                pending.active = false;
+                found = true;
+                break;
+            }
+            if (!found && frame_no > pending.deadline_frame)
+            {
+                const double window_ms = (static_cast<double>(pending.deadline_frame - pending.command_frame) / args.sample_rate_hz) * 1000.0;
+                log_event(pending.command_time_s + window_ms / 1000.0, "artifact_miss", pending.sequence, pending.stim_count, "no filtered artifact", -1.0);
+                pending.active = false;
+            }
+        }
+        pending_artifacts.erase(
+            std::remove_if(pending_artifacts.begin(), pending_artifacts.end(), [](const PendingArtifact &item) { return !item.active; }),
+            pending_artifacts.end());
+
         double max_window_s = 5.0;
         for (const auto &rule : rules)
         {
@@ -532,7 +587,12 @@ int main(int argc, char **argv)
             if (count < rule.threshold)
                 continue;
 
+            const auto command_start = std::chrono::steady_clock::now();
             const maxlab::Status send_status = maxlab::sendSequence(rule.sequence.c_str());
+            const auto command_done = std::chrono::steady_clock::now();
+            const double command_start_s = std::chrono::duration<double>(command_start - t0).count();
+            const double command_done_s = std::chrono::duration<double>(command_done - t0).count();
+            const double dispatch_latency_ms = std::chrono::duration<double, std::milli>(command_done - command_start).count();
             if (send_status != maxlab::Status::MAXLAB_OK)
             {
                 std::cerr << "sendSequence(" << rule.sequence << ") failed: " << status_to_string(send_status) << std::endl;
@@ -540,8 +600,16 @@ int main(int argc, char **argv)
                 return 2;
             }
             ++stim_count;
-            log_event(elapsed_s, "trigger", join_channels(channels), count, rule.detect_spec.empty() ? "threshold" : rule.detect_spec);
-            log_event(elapsed_s, "stim", rule.sequence, stim_count, "sendSequence");
+            log_event(command_start_s, "trigger", join_channels(channels), count, rule.detect_spec.empty() ? "threshold" : rule.detect_spec);
+            log_event(command_done_s, "stim", rule.sequence, stim_count, "sendSequence_ack", -1.0, dispatch_latency_ms);
+            PendingArtifact pending;
+            pending.command_frame = frame_no;
+            pending.deadline_frame = frame_no + static_cast<unsigned long>(std::max(1.0, args.artifact_window_ms / 1000.0 * args.sample_rate_hz));
+            pending.command_time_s = command_start_s;
+            pending.stim_count = stim_count;
+            pending.sequence = rule.sequence;
+            pending.channels = channels;
+            pending_artifacts.push_back(pending);
             blank_until = now + std::chrono::milliseconds(static_cast<int>(std::max(0.0, args.blank_ms)));
             break;
         }

@@ -17355,6 +17355,7 @@ class ClosedLoopControlDialog(AppDialog):
         self.closed_loop_events: list[dict[str, object]] = []
         self.total_spikes = 0
         self.total_stims = 0
+        self.last_artifact_latency_ms: float | None = None
         self.blanking_until_s = 0.0
         self.follow_live = True
         self.display_window_s = 10.0
@@ -17391,6 +17392,10 @@ class ClosedLoopControlDialog(AppDialog):
         self.blank_ms.setRange(0, 60000)
         self.blank_ms.setValue(500)
         self.blank_ms.setSuffix(" ms")
+        self.artifact_window_ms = QSpinBox()
+        self.artifact_window_ms.setRange(1, 1000)
+        self.artifact_window_ms.setValue(25)
+        self.artifact_window_ms.setSuffix(" ms")
         self.rule_table = QTableWidget(0, 6)
         self.rule_table.setHorizontalHeaderLabels(["Start s", "Stop s", "Detect ch", "Threshold", "Stim electrodes", "Sequence"])
         self.rule_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -17435,8 +17440,10 @@ class ClosedLoopControlDialog(AppDialog):
         self.status_label.setObjectName("MutedText")
         self.metric_label = QLabel("0 spikes | 0 stim")
         self.metric_label.setObjectName("MutedText")
-        self.event_table = QTableWidget(0, 5)
-        self.event_table.setHorizontalHeaderLabels(["Time", "Type", "Channel", "Count", "Note"])
+        self.latency_label = QLabel("Artifact latency: -- ms")
+        self.latency_label.setObjectName("MutedText")
+        self.event_table = QTableWidget(0, 6)
+        self.event_table.setHorizontalHeaderLabels(["Time", "Type", "Channel", "Count", "Latency ms", "Note"])
         self.event_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.event_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.event_table.setMinimumHeight(220)
@@ -17476,6 +17483,7 @@ class ClosedLoopControlDialog(AppDialog):
         middle_layout.addLayout(controls)
         middle_layout.addWidget(self.status_label)
         middle_layout.addWidget(self.metric_label)
+        middle_layout.addWidget(self.latency_label)
         middle_layout.addWidget(self.stim_canvas, 1)
         middle_layout.addWidget(self.event_table, 1)
 
@@ -17492,6 +17500,7 @@ class ClosedLoopControlDialog(AppDialog):
         form.addRow("Runner", self.runner_path)
         form.addRow("Amplitude", self.amplitude_mv)
         form.addRow("Blanking", self.blank_ms)
+        form.addRow("Artifact window", self.artifact_window_ms)
         right_layout.addLayout(form)
         runtime_buttons = QGridLayout()
         runtime_buttons.addWidget(self.save_rules_button, 0, 0)
@@ -17985,6 +17994,7 @@ class ClosedLoopControlDialog(AppDialog):
         self.closed_loop_events = []
         self.total_spikes = 0
         self.total_stims = 0
+        self.last_artifact_latency_ms = None
         self.blanking_until_s = 0.0
         self.follow_live = True
         self.event_table.setRowCount(0)
@@ -18019,6 +18029,8 @@ class ClosedLoopControlDialog(AppDialog):
             str(rules_path),
             "--blank-ms",
             str(int(self.blank_ms.value())),
+            "--artifact-window-ms",
+            str(int(self.artifact_window_ms.value())),
         ]
 
     def _launch_cpp_runner(self) -> None:
@@ -18095,6 +18107,13 @@ class ClosedLoopControlDialog(AppDialog):
         self.closed_loop_events.append(item)
         if item.get("type") == "stim":
             self.total_stims += 1
+        if item.get("type") == "artifact":
+            latency = item.get("latency_ms")
+            if latency is not None:
+                try:
+                    self.last_artifact_latency_ms = float(latency)
+                except (TypeError, ValueError):
+                    pass
         self._append_event_row(item)
         self._refresh_live_views()
 
@@ -18107,28 +18126,42 @@ class ClosedLoopControlDialog(AppDialog):
                 payload = json.loads(stripped)
             except json.JSONDecodeError:
                 payload = None
-            if isinstance(payload, dict) and payload.get("type") in {"trigger", "stim"}:
+            if isinstance(payload, dict) and payload.get("type") in {"trigger", "stim", "artifact", "artifact_miss"}:
                 event_time = payload.get("time_s", self._elapsed_s())
+                note = str(payload.get("note", "runner"))
+                if payload.get("dispatch_ms") is not None:
+                    note = f"{note}; dispatch={float(payload['dispatch_ms']):.3f} ms"
                 return {
                     "time_s": float(event_time),
                     "type": str(payload.get("type")),
                     "channel": str(payload.get("channel", payload.get("electrode", ""))),
                     "count": int(payload.get("count", self.total_stims)),
-                    "note": str(payload.get("note", "runner")),
+                    "note": note,
+                    "latency_ms": float(payload["latency_ms"]) if payload.get("latency_ms") is not None else None,
+                    "dispatch_ms": float(payload["dispatch_ms"]) if payload.get("dispatch_ms") is not None else None,
                 }
         lowered = stripped.lower()
-        event_type = "stim" if "stim" in lowered or "sendsequence" in lowered else "trigger" if "trigger" in lowered else ""
+        event_type = (
+            "artifact_miss" if "artifact_miss" in lowered
+            else "artifact" if "artifact" in lowered
+            else "stim" if "stim" in lowered or "sendsequence" in lowered
+            else "trigger" if "trigger" in lowered
+            else ""
+        )
         if not event_type:
             return None
         time_match = re.search(r"(?:time|t|time_s)\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)", stripped, flags=re.IGNORECASE)
         channel_match = re.search(r"(?:channel|electrode|ch|el)\s*[=:]\s*([A-Za-z0-9_.-]+)", stripped, flags=re.IGNORECASE)
         count_match = re.search(r"(?:count|n)\s*[=:]\s*([0-9]+)", stripped, flags=re.IGNORECASE)
+        latency_match = re.search(r"(?:latency|latency_ms)\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)", stripped, flags=re.IGNORECASE)
         return {
             "time_s": float(time_match.group(1)) if time_match else self._elapsed_s(),
             "type": event_type,
             "channel": channel_match.group(1) if channel_match else "",
             "count": int(count_match.group(1)) if count_match else (self.total_stims + 1 if event_type == "stim" else 0),
             "note": "runner",
+            "latency_ms": float(latency_match.group(1)) if latency_match else None,
+            "dispatch_ms": None,
         }
 
     def _tick(self) -> None:
@@ -18199,6 +18232,7 @@ class ClosedLoopControlDialog(AppDialog):
             "note": f"{rule.get('detect_spec', 'detect')}; threshold>={int(rule.get('threshold', 1))}",
         }
         stim_events = []
+        artifact_events = []
         for electrode in stim_electrodes or [""]:
             self.total_stims += 1
             stim_events.append(
@@ -18210,10 +18244,23 @@ class ClosedLoopControlDialog(AppDialog):
                     "note": sequence,
                 }
             )
-        self.closed_loop_events.extend([trigger, *stim_events])
+            artifact_events.append(
+                {
+                    "time_s": float(time_s),
+                    "type": "artifact",
+                    "channel": electrode,
+                    "count": int(self.total_stims),
+                    "latency_ms": 0.0,
+                    "note": "simulation",
+                }
+            )
+        self.closed_loop_events.extend([trigger, *stim_events, *artifact_events])
         self._append_event_row(trigger)
         for stim in stim_events:
             self._append_event_row(stim)
+        for artifact in artifact_events:
+            self.last_artifact_latency_ms = float(artifact.get("latency_ms", 0.0))
+            self._append_event_row(artifact)
 
     def _append_event_row(self, item: dict[str, object]) -> None:
         row = self.event_table.rowCount()
@@ -18223,6 +18270,7 @@ class ClosedLoopControlDialog(AppDialog):
             str(item.get("type", "")),
             str(item.get("channel", "")),
             str(item.get("count", "")),
+            "--" if item.get("latency_ms") is None else f"{float(item.get('latency_ms', 0.0)):.3f}",
             str(item.get("note", "")),
         ]
         for column, value in enumerate(values):
@@ -18258,6 +18306,10 @@ class ClosedLoopControlDialog(AppDialog):
         self.heatmap_canvas.set_counts(counts)
         self.stim_canvas.set_state(current_s, self.closed_loop_events, window_s)
         self.metric_label.setText(f"{self.total_spikes} spikes | {self.total_stims} stim")
+        if self.last_artifact_latency_ms is None:
+            self.latency_label.setText("Artifact latency: -- ms")
+        else:
+            self.latency_label.setText(f"Artifact latency: {self.last_artifact_latency_ms:.3f} ms")
 
     def _zoom_live_window(self, fraction: float, direction: int) -> None:
         old_window = float(self.display_window_s)
