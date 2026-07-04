@@ -16,6 +16,11 @@ if [ -z "${CXX:-}" ]; then
         fi
     done
 fi
+if [ -z "${CXX:-}" ]; then
+    echo "ERROR: g++-12 or g++-13 is required to link MaxLab libmaxlab.a." >&2
+    echo "Install one with: sudo apt install g++-12 gcc-12" >&2
+    exit 1
+fi
 
 rm -f closed_loop/cpp/build/CMakeCache.txt
 rm -rf closed_loop/cpp/build/CMakeFiles

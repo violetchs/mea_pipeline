@@ -17582,12 +17582,16 @@ class ClosedLoopControlDialog(AppDialog):
         self.controller_log.append(f"$ {program} {' '.join(arguments)}")
         process.start()
 
-    def _preferred_closed_loop_compiler_args(self) -> list[str]:
+    def _preferred_closed_loop_compiler_args(self) -> list[str] | None:
         if os.name == "nt":
             return []
         cxx = os.environ.get("CXX") or shutil.which("g++-13") or shutil.which("g++-12")
         if not cxx:
-            return []
+            message = "g++-12 or g++-13 is required to link MaxLab libmaxlab.a. Install with: sudo apt install g++-12 gcc-12"
+            self.controller_log.append(f"ERROR: {message}")
+            self.status_label.setText("C++ compiler too old")
+            QMessageBox.warning(self, "Closed-loop build", message)
+            return None
         args = [f"-DCMAKE_CXX_COMPILER={cxx}"]
         cxx_name = Path(cxx).name
         cc_name = cxx_name.replace("g++", "gcc", 1)
@@ -17653,7 +17657,10 @@ class ClosedLoopControlDialog(AppDialog):
         build_dir = cpp_dir / "build"
         self._reset_closed_loop_build_cache(build_dir, cpp_dir)
         configure_args = ["-S", str(cpp_dir), "-B", str(build_dir)]
-        configure_args.extend(self._preferred_closed_loop_compiler_args())
+        compiler_args = self._preferred_closed_loop_compiler_args()
+        if compiler_args is None:
+            return
+        configure_args.extend(compiler_args)
         self._start_control_queue(
             [
                 ("cmake", configure_args, str(root.parent)),
