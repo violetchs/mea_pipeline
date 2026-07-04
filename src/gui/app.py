@@ -17675,13 +17675,23 @@ class ClosedLoopControlDialog(AppDialog):
             return
         root = self._closed_loop_root()
         data_dir = root / "data"
+        cfg_text = self.cfg_path.text().strip()
+        if not dry_run:
+            if not cfg_text:
+                message = "CFG path is required for hardware setup."
+                self.controller_log.append(f"ERROR: {message}")
+                QMessageBox.warning(self, "Closed-loop setup", message)
+                return
+            if not Path(cfg_text).exists():
+                message = f"CFG path does not exist: {cfg_text}"
+                self.controller_log.append(f"ERROR: {message}")
+                QMessageBox.warning(self, "Closed-loop setup", message)
+                return
         arguments = [
             "-m",
             "closed_loop.closed_loop_setup",
             "--config-dir",
             str(root / "config"),
-            "--cfg",
-            self.cfg_path.text().strip(),
             "--rules-file",
             str(rules_path),
             "--data-dir",
@@ -17689,6 +17699,8 @@ class ClosedLoopControlDialog(AppDialog):
             "--amplitude-mv",
             f"{float(self.amplitude_mv.value()):.6g}",
         ]
+        if cfg_text:
+            arguments.extend(["--cfg", cfg_text])
         if dry_run:
             arguments.append("--dry-run")
         label = "Dry-run setup" if dry_run else "Setting up hardware"

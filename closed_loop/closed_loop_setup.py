@@ -13,17 +13,56 @@ from typing import Any
 _MX = None
 
 
+def _candidate_maxlab_python_paths() -> list[Path]:
+    paths: list[Path] = []
+    env_path = os.environ.get("MAXLAB_PYTHON_PATH", "")
+    for item in env_path.split(os.pathsep):
+        if item:
+            paths.append(Path(item).expanduser())
+
+    maxlab_root = Path(os.environ.get("MAXLAB_ROOT", Path.home() / "MaxLab")).expanduser()
+    paths.extend(
+        [
+            maxlab_root,
+            maxlab_root / "python",
+            maxlab_root / "lib",
+            maxlab_root / "share" / "libmaxlab",
+            maxlab_root / "share" / "libmaxlab" / "python",
+            maxlab_root / "share" / "libmaxlab" / "maxlab_lib",
+        ]
+    )
+    if maxlab_root.exists():
+        for pattern in ("maxlab.py", "maxlab/__init__.py"):
+            for candidate in maxlab_root.rglob(pattern):
+                paths.append(candidate.parent if candidate.name == "maxlab.py" else candidate.parent.parent)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        text = str(path)
+        if text and text not in seen:
+            seen.add(text)
+            unique.append(path)
+    return unique
+
+
 def _mx() -> Any:
     global _MX
     if _MX is not None:
         return _MX
-    api_path = os.environ.get("MAXLAB_PYTHON_PATH")
-    if api_path and api_path not in sys.path:
-        sys.path.insert(0, api_path)
+    searched: list[str] = []
+    for api_path in _candidate_maxlab_python_paths():
+        searched.append(str(api_path))
+        if api_path.exists() and str(api_path) not in sys.path:
+            sys.path.insert(0, str(api_path))
     try:
         import maxlab as mx  # type: ignore
     except ImportError as exc:
-        raise RuntimeError("maxlab is required. Install MaxWell API or set MAXLAB_PYTHON_PATH.") from exc
+        searched_text = "\n  ".join(searched[:32]) if searched else "(no candidate paths)"
+        raise RuntimeError(
+            "maxlab is required. Install MaxWell API or set MAXLAB_PYTHON_PATH to the directory that contains "
+            f"maxlab.py or the maxlab package. Searched:\n  {searched_text}"
+        ) from exc
     _MX = mx
     return mx
 
@@ -239,13 +278,17 @@ def main() -> int:
     if not config_dir.is_absolute():
         config_dir = base_dir / config_dir
     system_config = load_yaml(config_dir / "system.yaml")
-    cfg_path = Path(args.cfg or system_config.get("electrode_map", {}).get("cfg_path", ""))
+    cfg_text = str(args.cfg or system_config.get("electrode_map", {}).get("cfg_path", "") or "").strip()
+    cfg_path = Path(cfg_text)
     rules = load_rules(args, system_config)
 
     data_dir = Path(args.data_dir)
     if not data_dir.is_absolute():
         data_dir = base_dir / data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    if not args.dry_run and (not cfg_text or not cfg_path.exists()):
+        raise FileNotFoundError(f"cfg_path does not exist: {cfg_text or '<empty>'}")
 
     meta = prepare_hardware(
         cfg_path,
