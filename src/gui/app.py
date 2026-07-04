@@ -5,6 +5,7 @@ import colorsys
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -17581,6 +17582,36 @@ class ClosedLoopControlDialog(AppDialog):
         self.controller_log.append(f"$ {program} {' '.join(arguments)}")
         process.start()
 
+    def _preferred_closed_loop_compiler_args(self) -> list[str]:
+        if os.name == "nt":
+            return []
+        cxx = os.environ.get("CXX") or shutil.which("g++-13") or shutil.which("g++-12")
+        if not cxx:
+            return []
+        args = [f"-DCMAKE_CXX_COMPILER={cxx}"]
+        cxx_name = Path(cxx).name
+        cc_name = cxx_name.replace("g++", "gcc", 1)
+        cc = os.environ.get("CC") or shutil.which(cc_name)
+        if cc:
+            args.append(f"-DCMAKE_C_COMPILER={cc}")
+        self.controller_log.append(f"Using C++ compiler: {cxx}")
+        return args
+
+    def _reset_closed_loop_build_cache(self, build_dir: Path, cpp_dir: Path) -> None:
+        try:
+            build_resolved = build_dir.resolve()
+            cpp_resolved = cpp_dir.resolve()
+            if cpp_resolved not in build_resolved.parents:
+                return
+            cache_file = build_resolved / "CMakeCache.txt"
+            files_dir = build_resolved / "CMakeFiles"
+            if cache_file.exists():
+                cache_file.unlink()
+            if files_dir.exists():
+                shutil.rmtree(files_dir)
+        except OSError as exc:
+            self.controller_log.append(f"Could not reset CMake cache: {exc}")
+
     def _read_control_stdout(self) -> None:
         process = self.control_process
         if process is None:
@@ -17620,9 +17651,12 @@ class ClosedLoopControlDialog(AppDialog):
         root = self._closed_loop_root()
         cpp_dir = root / "cpp"
         build_dir = cpp_dir / "build"
+        self._reset_closed_loop_build_cache(build_dir, cpp_dir)
+        configure_args = ["-S", str(cpp_dir), "-B", str(build_dir)]
+        configure_args.extend(self._preferred_closed_loop_compiler_args())
         self._start_control_queue(
             [
-                ("cmake", ["-S", str(cpp_dir), "-B", str(build_dir)], str(root.parent)),
+                ("cmake", configure_args, str(root.parent)),
                 ("cmake", ["--build", str(build_dir)], str(root.parent)),
             ],
             "Building C++ runner",
