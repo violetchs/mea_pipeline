@@ -9422,13 +9422,17 @@ class ElectrodeHeatmapCanvas(QWidget):
             return
 
         if self.channel_map is None:
-            painter.setFont(QFont("Segoe UI", 9))
-            painter.setPen(QPen(QColor("#cbd5e1"), 1))
-            painter.drawText(
-                QRectF(8, 8, self.width() - 16, self.height() - 16),
-                Qt.AlignmentFlag.AlignCenter,
-                "No channel map",
-            )
+            display_counts = self._display_raw_counts or self._raw_counts or self._display_counts or self.counts
+            if display_counts:
+                self._draw_numeric_channel_heatmap(painter, QRectF(margin, margin, map_width, map_height), display_counts)
+            else:
+                painter.setFont(QFont("Segoe UI", 9))
+                painter.setPen(QPen(QColor("#cbd5e1"), 1))
+                painter.drawText(
+                    QRectF(8, 8, self.width() - 16, self.height() - 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    "No channel map",
+                )
             painter.end()
             return
 
@@ -9463,6 +9467,24 @@ class ElectrodeHeatmapCanvas(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(QRectF(bar_left, bar_top, colorbar_width, bar_height))
         painter.end()
+
+    def _draw_numeric_channel_heatmap(self, painter: QPainter, rect: QRectF, counts: dict[str, float]) -> None:
+        cols = 32
+        rows = 32
+        cell_w = rect.width() / cols
+        cell_h = rect.height() / rows
+        max_count = self.scale_max_count or max((float(value) for value in counts.values()), default=0.0)
+        painter.setPen(QPen(QColor("#1f2937"), 0.35))
+        for channel in range(rows * cols):
+            value = float(counts.get(str(channel), counts.get(normalize_channel_name(str(channel)), 0.0)))
+            fraction = 0.0 if max_count <= 0 else min(1.0, value / max_count)
+            painter.setBrush(_activity_heatmap_color(fraction))
+            row = channel // cols
+            col = channel % cols
+            painter.drawRect(QRectF(rect.left() + col * cell_w, rect.top() + row * cell_h, cell_w, cell_h))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#aeb4c0"), 1.1))
+        painter.drawRect(rect)
 
     def _coordinate_entries(self):
         if self._coordinate_entries_cache is not None:
@@ -17360,6 +17382,8 @@ class ClosedLoopControlDialog(AppDialog):
         self.follow_live = True
         self.display_window_s = 10.0
         self._last_external_log_s = -999.0
+        self._last_live_refresh_s = -999.0
+        self._live_dirty = True
         self.runner_process: QProcess | None = None
         self.control_process: QProcess | None = None
         self._control_queue: list[tuple[str, list[str], str]] = []
@@ -17959,15 +17983,15 @@ class ClosedLoopControlDialog(AppDialog):
             if isinstance(raw, UnifiedMEAData):
                 labels = sorted([str(label) for label in raw.spikes.keys()], key=_channel_sort_key)
                 if labels:
-                    return labels[:32]
+                    return labels
         if self.channel_map is not None:
             labels = []
             for electrode, payload in self.channel_map.electrodes.items():
                 if isinstance(payload, dict):
                     labels.append(str(payload.get("channel") or electrode))
             if labels:
-                return sorted(labels, key=_channel_sort_key)[:32]
-        return [f"chan{i + 1}" for i in range(16)]
+                return sorted(labels, key=_channel_sort_key)
+        return [str(index) for index in range(1024)]
 
     def _default_cfg_path(self) -> str:
         for record in self.records:
@@ -17989,6 +18013,10 @@ class ClosedLoopControlDialog(AppDialog):
         return max(0.0, time.monotonic() - self.run_start_monotonic)
 
     def _start(self) -> None:
+        backend = str(self.backend_combo.currentData() or "simulation")
+        if backend == "cpp_runner" and len(self.live_channels) < 1024:
+            self.live_channels = [str(index) for index in range(1024)]
+            self.raster_canvas.set_spike_series([(channel, np.asarray([], dtype=float)) for channel in self.live_channels])
         self.run_start_monotonic = time.monotonic()
         self.spike_events = {channel: [] for channel in self.live_channels}
         self.closed_loop_events = []
@@ -17997,6 +18025,9 @@ class ClosedLoopControlDialog(AppDialog):
         self.last_artifact_latency_ms = None
         self.blanking_until_s = 0.0
         self.follow_live = True
+        self._last_external_log_s = -999.0
+        self._last_live_refresh_s = -999.0
+        self._live_dirty = True
         self.event_table.setRowCount(0)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -18007,7 +18038,6 @@ class ClosedLoopControlDialog(AppDialog):
                 channels = ",".join(list(rule.get("detect_channels", []))[:12])
                 suffix = "..." if len(rule.get("detect_channels", [])) > 12 else ""
                 self.controller_log.append(f"Rule {index} auto detect -> {channels}{suffix}")
-        backend = str(self.backend_combo.currentData() or "simulation")
         if backend == "cpp_runner":
             self._launch_cpp_runner()
         elif backend == "network":
@@ -18031,6 +18061,10 @@ class ClosedLoopControlDialog(AppDialog):
             str(int(self.blank_ms.value())),
             "--artifact-window-ms",
             str(int(self.artifact_window_ms.value())),
+            "--telemetry-interval-ms",
+            "100",
+            "--telemetry-max-events",
+            "4096",
         ]
 
     def _launch_cpp_runner(self) -> None:
@@ -18078,6 +18112,9 @@ class ClosedLoopControlDialog(AppDialog):
             line = line.strip()
             if not line:
                 continue
+            if '"type":"spikes"' in line:
+                self._handle_runner_line(line)
+                continue
             self.controller_log.append(line)
             self._handle_runner_line(line)
 
@@ -18104,6 +18141,9 @@ class ClosedLoopControlDialog(AppDialog):
         item = self._parse_runner_event(line)
         if item is None:
             return
+        if item.get("type") == "spikes":
+            self._apply_runner_spike_batch(item)
+            return
         self.closed_loop_events.append(item)
         if item.get("type") == "stim":
             self.total_stims += 1
@@ -18115,6 +18155,7 @@ class ClosedLoopControlDialog(AppDialog):
                 except (TypeError, ValueError):
                     pass
         self._append_event_row(item)
+        self._live_dirty = True
         self._refresh_live_views()
 
     def _parse_runner_event(self, line: str) -> dict[str, object] | None:
@@ -18126,6 +18167,15 @@ class ClosedLoopControlDialog(AppDialog):
                 payload = json.loads(stripped)
             except json.JSONDecodeError:
                 payload = None
+            if isinstance(payload, dict) and payload.get("type") == "spikes":
+                channels = payload.get("channels", [])
+                times_s = payload.get("times_s", [])
+                if isinstance(channels, list) and isinstance(times_s, list):
+                    return {
+                        "type": "spikes",
+                        "channels": channels,
+                        "times_s": times_s,
+                    }
             if isinstance(payload, dict) and payload.get("type") in {"trigger", "stim", "artifact", "artifact_miss"}:
                 event_time = payload.get("time_s", self._elapsed_s())
                 note = str(payload.get("note", "runner"))
@@ -18163,6 +18213,31 @@ class ClosedLoopControlDialog(AppDialog):
             "latency_ms": float(latency_match.group(1)) if latency_match else None,
             "dispatch_ms": None,
         }
+
+    def _apply_runner_spike_batch(self, item: dict[str, object]) -> None:
+        channels = item.get("channels", [])
+        times_s = item.get("times_s", [])
+        if not isinstance(channels, list) or not isinstance(times_s, list):
+            return
+        appended = 0
+        for channel, time_s in zip(channels, times_s):
+            try:
+                channel_text = str(int(channel))
+                value = float(time_s)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(value):
+                continue
+            if channel_text not in self.spike_events:
+                self.spike_events[channel_text] = []
+                if channel_text not in self.live_channels:
+                    self.live_channels.append(channel_text)
+                    self.live_channels.sort(key=_channel_sort_key)
+            self.spike_events[channel_text].append(value)
+            appended += 1
+        if appended:
+            self.total_spikes += appended
+            self._live_dirty = True
 
     def _tick(self) -> None:
         backend = str(self.backend_combo.currentData() or "simulation")
@@ -18206,10 +18281,14 @@ class ClosedLoopControlDialog(AppDialog):
 
     def _tick_external_placeholder(self) -> None:
         now_s = self._elapsed_s()
-        if now_s - self._last_external_log_s >= 2.0:
+        if self.total_spikes == 0 and now_s - self._last_external_log_s >= 2.0:
             self._last_external_log_s = now_s
             self.controller_log.append("Waiting for external controller telemetry...")
-        self._refresh_live_views()
+        if self._live_dirty and now_s - self._last_live_refresh_s >= 0.10:
+            self._last_live_refresh_s = now_s
+            self._live_dirty = False
+            self._trim_events(now_s)
+            self._refresh_live_views()
 
     def _count_channel_window(self, channel: str, start_s: float, stop_s: float) -> int:
         values = np.asarray(self.spike_events.get(channel, []), dtype=float)

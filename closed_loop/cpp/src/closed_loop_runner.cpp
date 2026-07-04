@@ -94,6 +94,8 @@ struct Args
     double run_seconds = 0.0;
     double sample_rate_hz = 20000.0;
     double artifact_window_ms = 25.0;
+    double telemetry_interval_ms = 100.0;
+    int telemetry_max_events = 4096;
 };
 
 std::string trim(const std::string &value)
@@ -381,6 +383,10 @@ Args parse_args(int argc, char **argv)
             args.sample_rate_hz = std::atof(next().c_str());
         else if (key == "--artifact-window-ms")
             args.artifact_window_ms = std::atof(next().c_str());
+        else if (key == "--telemetry-interval-ms")
+            args.telemetry_interval_ms = std::atof(next().c_str());
+        else if (key == "--telemetry-max-events")
+            args.telemetry_max_events = std::atoi(next().c_str());
         else if (key == "--cfg" || key == "--response-electrode" || key == "--amplitude-mv")
             (void)next();
     }
@@ -440,6 +446,28 @@ void log_event(double time_s, const std::string &type, const std::string &channe
     std::cout << "}" << std::endl;
 }
 
+void log_spike_batch(double time_s, const std::vector<std::pair<int, double>> &events)
+{
+    if (events.empty())
+        return;
+    std::cout << "{\"time_s\":" << time_s
+              << ",\"type\":\"spikes\",\"channels\":[";
+    for (size_t i = 0; i < events.size(); ++i)
+    {
+        if (i)
+            std::cout << ",";
+        std::cout << events[i].first;
+    }
+    std::cout << "],\"times_s\":[";
+    for (size_t i = 0; i < events.size(); ++i)
+    {
+        if (i)
+            std::cout << ",";
+        std::cout << events[i].second;
+    }
+    std::cout << "]}" << std::endl;
+}
+
 bool contains_channel(const std::vector<int> &channels, int channel)
 {
     return channels.empty() || std::find(channels.begin(), channels.end(), channel) != channels.end();
@@ -483,6 +511,10 @@ int main(int argc, char **argv)
     auto blank_until = t0;
     int stim_count = 0;
     std::vector<PendingArtifact> pending_artifacts;
+    std::vector<std::pair<int, double>> telemetry_events;
+    auto last_telemetry_flush = t0;
+    unsigned long stream_frame0 = 0;
+    bool have_stream_frame0 = false;
 
     std::cout << "closed_loop_runner started with " << rules.size() << " rule(s)" << std::endl;
     for (size_t i = 0; i < rules.size(); ++i)
@@ -513,6 +545,11 @@ int main(int argc, char **argv)
             continue;
 
         unsigned long frame_no = static_cast<unsigned long>(frame.frameInfo.frame_number);
+        if (!have_stream_frame0)
+        {
+            stream_frame0 = frame_no;
+            have_stream_frame0 = true;
+        }
         for (uint64_t i = 0; i < frame.spikeCount; ++i)
         {
             const auto &event = frame.spikeEvents[i];
@@ -520,6 +557,13 @@ int main(int argc, char **argv)
             {
                 spikes[event.channel].push_back(event.frameNo);
                 frame_no = std::max<unsigned long>(frame_no, event.frameNo);
+                if (static_cast<int>(telemetry_events.size()) < std::max(1, args.telemetry_max_events))
+                {
+                    const double event_time_s = event.frameNo >= stream_frame0
+                                                    ? static_cast<double>(event.frameNo - stream_frame0) / args.sample_rate_hz
+                                                    : elapsed_s;
+                    telemetry_events.push_back({static_cast<int>(event.channel), event_time_s});
+                }
             }
         }
 
@@ -552,6 +596,17 @@ int main(int argc, char **argv)
         pending_artifacts.erase(
             std::remove_if(pending_artifacts.begin(), pending_artifacts.end(), [](const PendingArtifact &item) { return !item.active; }),
             pending_artifacts.end());
+
+        if (args.telemetry_interval_ms > 0.0)
+        {
+            const double since_flush_ms = std::chrono::duration<double, std::milli>(now - last_telemetry_flush).count();
+            if (since_flush_ms >= args.telemetry_interval_ms)
+            {
+                log_spike_batch(elapsed_s, telemetry_events);
+                telemetry_events.clear();
+                last_telemetry_flush = now;
+            }
+        }
 
         double max_window_s = 5.0;
         for (const auto &rule : rules)
