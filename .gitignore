@@ -47,6 +47,17 @@ htmlcov/
 
 # Data files
 data/
+.agents/
+docs/api_utils/
+docs/api_utils.zip
+generated_visual_experiment/config/
+test_tmp/
+tmp_plan_debug/
+tmp_plan_debug_constrained/
+tmp_plan_debug_relative/
+pytest-tmp/
+results/pytest-cache-files-*/
+results/pytest-tmp/
 tests/
 # Logs
 *.log

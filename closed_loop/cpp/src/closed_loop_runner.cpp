@@ -94,8 +94,8 @@ struct Args
     double run_seconds = 0.0;
     double sample_rate_hz = 20000.0;
     double artifact_window_ms = 25.0;
-    double telemetry_interval_ms = 100.0;
-    int telemetry_max_events = 4096;
+    double telemetry_interval_ms = 250.0;
+    int telemetry_max_events = 1024;
 };
 
 std::string trim(const std::string &value)

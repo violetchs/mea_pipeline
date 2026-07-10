@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -11,6 +12,13 @@ from typing import Any
 
 
 _MX = None
+_STOP_REQUESTED = False
+
+
+def _request_stop(_signum, _frame) -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+    raise KeyboardInterrupt()
 
 
 def _candidate_maxlab_python_paths() -> list[Path]:
@@ -77,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pulse-width-us", type=float, default=300.0)
     parser.add_argument("--inter-phase-interval-us", type=float, default=0.0)
     parser.add_argument("--dac", type=int, default=0)
+    parser.add_argument("--blank-ms", type=float, default=-1.0)
+    parser.add_argument("--artifact-window-ms", type=float, default=25.0)
+    parser.add_argument("--telemetry-interval-ms", type=float, default=250.0)
+    parser.add_argument("--telemetry-max-events", type=int, default=1024)
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--recording-name", default="closed_loop")
     parser.add_argument("--data-dir", default="data")
@@ -117,6 +129,22 @@ def load_rules(args: argparse.Namespace, system_config: dict[str, Any]) -> list[
     if not isinstance(rules, list):
         raise ValueError("Closed-loop rules must be a JSON list")
     return [dict(item) for item in rules]
+
+
+def _finite_schedule_stop_s(rules: list[dict[str, Any]]) -> float:
+    stops = []
+    for rule in rules:
+        value = rule.get("stop_s")
+        if value is None:
+            value = rule.get("stop")
+        try:
+            stop_s = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if stop_s <= 0:
+            return 0.0
+        stops.append(stop_s)
+    return max(stops, default=0.0)
 
 
 def _half_bits(amplitude_mv: float) -> int:
@@ -273,6 +301,8 @@ def start_saving(data_dir: Path, recording_name: str) -> Any:
 
 def main() -> int:
     args = parse_args()
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
     base_dir = Path(__file__).resolve().parents[1]
     config_dir = Path(args.config_dir)
     if not config_dir.is_absolute():
@@ -307,22 +337,45 @@ def main() -> int:
     if args.dry_run or not args.runner:
         return 0
 
-    saver = None
-    if args.record:
-        saver = start_saving(data_dir, args.recording_name)
-        print(f"Recording started: {args.recording_name}")
     runner_cmd = [
         args.runner,
         "--rules",
         json.dumps(rules, ensure_ascii=True),
         "--blank-ms",
-        str(int(system_config.get("closed_loop", {}).get("blank_ms", 500))),
+        str(int(args.blank_ms if args.blank_ms >= 0 else system_config.get("closed_loop", {}).get("blank_ms", 500))),
+        "--artifact-window-ms",
+        f"{float(args.artifact_window_ms):.6g}",
+        "--telemetry-interval-ms",
+        f"{float(args.telemetry_interval_ms):.6g}",
+        "--telemetry-max-events",
+        str(max(1, int(args.telemetry_max_events))),
     ]
-    if args.run_seconds > 0:
-        runner_cmd += ["--run-seconds", str(args.run_seconds)]
+    run_seconds = float(args.run_seconds)
+    if run_seconds <= 0:
+        schedule_stop_s = _finite_schedule_stop_s(rules)
+        if schedule_stop_s > 0:
+            run_seconds = schedule_stop_s + 1.0
+    if run_seconds > 0:
+        runner_cmd += ["--run-seconds", f"{run_seconds:.6g}"]
+        print(f"Runner will stop after {run_seconds:.6g} s")
+    proc = None
+    ret = 0
+    saver = None
     try:
+        if args.record:
+            saver = start_saving(data_dir, args.recording_name)
+            print(f"Recording started: {args.recording_name}")
         proc = subprocess.Popen(runner_cmd, cwd=str(base_dir))
         ret = proc.wait()
+    except KeyboardInterrupt:
+        ret = 130 if _STOP_REQUESTED else 1
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
     finally:
         if saver is not None:
             saver.stop_recording()

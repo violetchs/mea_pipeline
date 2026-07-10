@@ -108,6 +108,7 @@ try:
         save_channel_map,
         validate_channel_map,
     )
+    from .agent_tasks import AgentCustomCodeDialog, AgentEnvironmentCheckDialog
     from . import visual_stimulus_package_builder as stimulus_builder
     from ..mea_io import (
         MEAReader,
@@ -146,6 +147,7 @@ except ImportError:
         save_channel_map,
         validate_channel_map,
     )
+    from gui.agent_tasks import AgentCustomCodeDialog, AgentEnvironmentCheckDialog
     from gui import visual_stimulus_package_builder as stimulus_builder
     from mea_io import (
         MEAReader,
@@ -626,6 +628,29 @@ def _spike_series_from_unified(data: UnifiedMEAData):
         (channel, np.asarray(data.spikes[channel], dtype=float))
         for channel in sorted(data.channels(), key=_channel_sort_key)
     ]
+
+
+def _unified_time_range_preview(data: UnifiedMEAData, max_channels: int = 256) -> tuple[float, float, bool]:
+    channels = list(data.spikes.keys())
+    sampled = len(channels) > max_channels
+    if sampled:
+        channels = channels[: max(1, int(max_channels))]
+    tmin = np.inf
+    tmax = -np.inf
+    for channel in channels:
+        timestamps = np.asarray(data.spikes.get(channel, []), dtype=float)
+        if timestamps.size:
+            tmin = min(tmin, float(timestamps[0]), float(timestamps.min() if timestamps.size <= 2 else timestamps[0]))
+            tmax = max(tmax, float(timestamps[-1]), float(timestamps.max() if timestamps.size <= 2 else timestamps[-1]))
+    stim_times = np.asarray(getattr(data, "stim_times", []), dtype=float)
+    if stim_times.size:
+        stim_times = stim_times[np.isfinite(stim_times)]
+        if stim_times.size:
+            tmin = min(tmin, float(stim_times[0]), float(stim_times.min() if stim_times.size <= 2 else stim_times[0]))
+            tmax = max(tmax, float(stim_times[-1]), float(stim_times.max() if stim_times.size <= 2 else stim_times[-1]))
+    if not np.isfinite(tmin):
+        return 0.0, 0.0, sampled
+    return float(tmin), float(tmax), sampled
 
 
 def _unit_display_label(unit: int) -> str:
@@ -3991,6 +4016,9 @@ def _create_progress_dialog(parent: QWidget, title: str, message: str, maximum: 
     timer.start()
     dialog._progress_timer = timer
     dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    dialog.repaint()
     QApplication.processEvents()
     return dialog
 
@@ -4022,6 +4050,9 @@ def _set_progress_dialog(dialog: QProgressDialog | None, message: str | None = N
             else:
                 dialog._progress_soft_ceiling = min(real_maximum - 1, value + max(1, real_maximum // 30))
             dialog.setValue(value)
+    dialog.show()
+    dialog.raise_()
+    dialog.repaint()
     QApplication.processEvents()
 
 
@@ -4031,7 +4062,17 @@ def _close_progress_dialog(dialog: QProgressDialog | None) -> None:
     timer = getattr(dialog, "_progress_timer", None)
     if timer is not None:
         timer.stop()
+    try:
+        dialog.canceled.disconnect()
+    except (TypeError, RuntimeError):
+        pass
+    dialog.setAutoClose(True)
+    dialog.setAutoReset(True)
+    dialog.reset()
+    dialog.hide()
     dialog.close()
+    dialog.deleteLater()
+    QApplication.processEvents()
     QApplication.processEvents()
 
 
@@ -4204,6 +4245,34 @@ def _loaded_data_stats(data) -> tuple[int, int, int]:
     array = np.asarray(data) if data is not None else np.asarray([])
     channels = int(array.shape[0]) if array.ndim >= 1 else 0
     return channels, int(array.size), 0
+
+
+def _loaded_data_stats_lightweight(data) -> tuple[int, str, int]:
+    if isinstance(data, UnifiedMEAData):
+        channels = len(data.spikes)
+        waveforms = len(data.waveforms)
+        spike_total = None
+        if isinstance(data.meta, dict):
+            for key in ("spike_count", "total_spikes", "event_count"):
+                value = data.meta.get(key)
+                try:
+                    if value is not None:
+                        spike_total = int(value)
+                        break
+                except (TypeError, ValueError):
+                    continue
+        return channels, str(spike_total) if spike_total is not None else "deferred", waveforms
+    if data is None:
+        return 0, "0", 0
+    shape = getattr(data, "shape", None)
+    if shape is not None:
+        try:
+            channels = int(shape[0]) if len(shape) >= 1 else 0
+            size = int(np.prod(shape)) if shape else 0
+            return channels, str(size), 0
+        except Exception:
+            pass
+    return 0, "deferred", 0
 
 
 def _loaded_data_activity_label(path: str | Path, data=None) -> str:
@@ -8876,6 +8945,28 @@ class SpikeRasterCanvas(QWidget):
                 painter.drawLines([QLineF(float(xi), y0, float(xi), y1) for xi in xi_values])
             break
 
+        if self.stim_times.size:
+            stim_lo = int(np.searchsorted(self.stim_times, start, side="left"))
+            stim_hi = int(np.searchsorted(self.stim_times, stop, side="right"))
+            visible_stim = self.stim_times[stim_lo:stim_hi]
+            if visible_stim.size:
+                stim_pen = QPen(QColor("#ea580c"), 2)
+                stim_pen.setCosmetic(True)
+                painter.setPen(stim_pen)
+                painter.setBrush(QColor("#ea580c"))
+                for stim_time in visible_stim[:2000]:
+                    x = left + (float(stim_time) - start) / self.window_duration * plot_width
+                    x = min(float(left + plot_width - 1), max(float(left + 1), float(x)))
+                    painter.drawLine(QLineF(float(x), top, float(x), top + plot_height))
+                    triangle = QPolygonF(
+                        [
+                            QPointF(float(x), top + 1),
+                            QPointF(float(x) - 5.0, top + 11.0),
+                            QPointF(float(x) + 5.0, top + 11.0),
+                        ]
+                    )
+                    painter.drawPolygon(triangle)
+
         if self.playhead_time is not None and start <= self.playhead_time <= stop:
             x = left + (float(self.playhead_time) - start) / self.window_duration * plot_width
             playhead_pen = QPen(QColor("#0f172a"), 2)
@@ -9077,7 +9168,14 @@ class SpikeWaveformCanvas(QWidget):
 
 
 class PopulationRateCanvas(QWidget):
-    def __init__(self, spike_series, left_margin: int = 76, bin_ms: float = 20.0, parent=None):
+    def __init__(
+        self,
+        spike_series,
+        left_margin: int = 76,
+        bin_ms: float = 20.0,
+        parent=None,
+        defer_build: bool = False,
+    ):
         super().__init__(parent)
         self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
         self.left_margin = left_margin
@@ -9093,10 +9191,13 @@ class PopulationRateCanvas(QWidget):
         self._burst_stops = np.array([], dtype=float)
         self.stim_times = np.array([], dtype=float)
         self.playhead_time = None
-        self._build_rate_cache()
+        self._rate_cache_ready = False
+        if not defer_build:
+            self._build_rate_cache()
         self.setMinimumHeight(120)
 
     def _build_rate_cache(self) -> None:
+        self._rate_cache_ready = True
         all_times = [times for _, times in self.spike_series if times.size]
         if not all_times:
             self._all_centers = np.array([], dtype=float)
@@ -9116,6 +9217,13 @@ class PopulationRateCanvas(QWidget):
         counts, edges = np.histogram(values, bins=edges)
         self._all_centers = (edges[:-1] + edges[1:]) / 2.0
         self._all_rates = counts.astype(float) / self.bin_s / max(1, len(self.spike_series))
+
+    def ensure_rate_cache(self) -> None:
+        if self._rate_cache_ready:
+            return
+        self._build_rate_cache()
+        self.centers, self.rates = self._average_rate_trace(self.window_start, self.window_start + self.window_duration)
+        self.update()
 
     def set_spike_series(self, spike_series) -> None:
         self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
@@ -9151,6 +9259,11 @@ class PopulationRateCanvas(QWidget):
     def set_view(self, start_s: float, duration_s: float) -> None:
         self.window_start = max(0.0, float(start_s))
         self.window_duration = max(0.001, float(duration_s))
+        if not self._rate_cache_ready:
+            self.centers = np.array([], dtype=float)
+            self.rates = np.array([], dtype=float)
+            self.update()
+            return
         self.centers, self.rates = self._average_rate_trace(self.window_start, self.window_start + self.window_duration)
         self.update()
 
@@ -16077,6 +16190,7 @@ class SpikeRasterWindow(AppDialog):
         channel_groups: dict[str, list[str]] | None = None,
         channel_selected_callback=None,
         safe_window: bool = False,
+        lazy_waveform_loader=None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -16085,6 +16199,9 @@ class SpikeRasterWindow(AppDialog):
         self.safe_window = bool(safe_window)
         self.raw_spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
         self.raw_waveform_series = {label: np.asarray(values) for label, values in (waveform_series or {}).items()}
+        self._lazy_waveform_loader = lazy_waveform_loader
+        self._lazy_waveform_load_started = False
+        self._open_deferred_initialization_done = False
         self._filtered_spike_series_all = list(self.raw_spike_series)
         self._filtered_waveform_series_all = dict(self.raw_waveform_series)
         self.spike_series = list(self.raw_spike_series)
@@ -16142,7 +16259,7 @@ class SpikeRasterWindow(AppDialog):
         self.canvas.pan_requested.connect(self._pan_to_absolute_ms)
         self.canvas.pan_finished.connect(self._finish_interactive_pan)
         self.canvas.channel_selected.connect(self._select_channel)
-        self.rate_canvas = PopulationRateCanvas(self.spike_series, left_margin=self.canvas.plot_left)
+        self.rate_canvas = PopulationRateCanvas(self.spike_series, left_margin=self.canvas.plot_left, defer_build=True)
         self.rate_canvas.set_bursts(self.burst_intervals)
         self.rate_canvas.set_stim_times(self.stim_times)
         self.waveform_canvas = SpikeWaveformCanvas()
@@ -16392,24 +16509,78 @@ class SpikeRasterWindow(AppDialog):
         layout.addLayout(playback_controls)
         layout.addWidget(parameter_frame)
 
-        self._initialize_bursts_for_open()
-        self._refresh_heatmap_scale()
         self._update_row_scroll_range()
-        self._update_slider_range()
+        self._update_slider_range(refresh=False)
         self._update_raster_settings_summary()
+        self._update_view(lightweight=True)
         if self.selected_channel:
-            self._select_channel(self.selected_channel)
+            self.canvas.set_selected_channel(self.selected_channel)
         _fix_spinbox_hit_targets(self)
         if self.safe_window:
             _set_balanced_normal_geometry(self, width_fraction=0.86, height_fraction=0.82)
         else:
             self.showMaximized()
+        QTimer.singleShot(60, self._finish_open_initialization)
 
     def _start_progress(self, title: str, message: str, maximum: int = 0) -> QProgressDialog:
         return _create_progress_dialog(self, title, message, maximum)
 
     def _finish_progress(self, dialog: QProgressDialog | None) -> None:
         _close_progress_dialog(dialog)
+
+    def _finish_open_initialization(self) -> None:
+        if self._open_deferred_initialization_done:
+            return
+        self._open_deferred_initialization_done = True
+        self.rate_canvas.ensure_rate_cache()
+        QTimer.singleShot(0, self._finish_open_burst_initialization)
+
+    def _finish_open_burst_initialization(self) -> None:
+        self._initialize_bursts_for_open()
+        QTimer.singleShot(0, self._finish_open_heatmap_initialization)
+
+    def _finish_open_heatmap_initialization(self) -> None:
+        self._refresh_heatmap_scale()
+        self._update_view(force_heatmap=True)
+        if self.selected_channel:
+            self._select_channel(self.selected_channel)
+        if self._lazy_waveform_loader is not None:
+            QTimer.singleShot(0, self._load_lazy_waveforms)
+
+    def _load_lazy_waveforms(self) -> None:
+        if self._lazy_waveform_load_started or self._lazy_waveform_loader is None:
+            return
+        self._lazy_waveform_load_started = True
+        try:
+            loaded = self._lazy_waveform_loader() or {}
+        except Exception as exc:
+            self._lazy_waveform_loader = None
+            self.waveform_canvas.set_channel_waveforms(
+                self.selected_channel or "",
+                None,
+                self.sampling_rate,
+            )
+            self.waveform_canvas.figure.suptitle(f"Waveforms unavailable: {exc}")
+            self.waveform_canvas.draw_idle()
+            return
+
+        self._lazy_waveform_loader = None
+        self.raw_waveform_series = {str(label): np.asarray(values) for label, values in loaded.items()}
+        self._filtered_waveform_series_all = dict(self.raw_waveform_series)
+        allowed_labels = self._display_labels_for_current_group()
+        if allowed_labels is None:
+            self.waveform_series = dict(self._filtered_waveform_series_all)
+        else:
+            self.waveform_series = {
+                str(label): np.asarray(values)
+                for label, values in self._filtered_waveform_series_all.items()
+                if str(label) in allowed_labels
+            }
+        if not self.selected_channel or self.selected_channel not in self.spike_lookup:
+            self.selected_channel = _prefer_waveform_channel(self.spike_series, self.waveform_series)
+            self.canvas.set_selected_channel(self.selected_channel)
+        self._last_waveform_view = None
+        self._refresh_waveforms_for_window(force=True)
 
     def _raster_action_selected(self, index: int) -> None:
         action = str(self.raster_action_combo.itemData(int(index)) or "")
@@ -16433,9 +16604,10 @@ class SpikeRasterWindow(AppDialog):
 
     def _update_raster_settings_summary(self) -> None:
         window_ms = self._window_ms()
-        stim_text = "off"
+        stim_text = "markers 0, tail off"
         if self.stim_times.size:
-            stim_text = "on" if self.hide_stim_tail.isChecked() else "off"
+            stim_text = f"markers {int(self.stim_times.size)}, tail "
+            stim_text += "on" if self.hide_stim_tail.isChecked() else "off"
             stim_text += f" ({self.stim_tail_ms.value():g} ms)"
         group_text = ""
         if self.well_combo is not None:
@@ -16445,7 +16617,7 @@ class SpikeRasterWindow(AppDialog):
             "Core view: "
             f"{window_ms:g} ms window, {self.grid_ms.value()} ms/grid, {self.visible_rows.value()} visible rows. "
             "Display: "
-            f"heatmap {self.heatmap_ms.value()} ms, stim-tail filter {stim_text}.{group_text} "
+            f"heatmap {self.heatmap_ms.value()} ms, stim {stim_text}.{group_text} "
             "Burst detection: "
             f"{self.burst_bin_ms.value()} ms bin, z >= {self.burst_threshold_z.value():.1f}, "
             f"min spikes {self.burst_min_spikes.value()}."
@@ -16643,7 +16815,7 @@ class SpikeRasterWindow(AppDialog):
             return
         self._playback_time_ms = int(min(max(0, round(float(value_ms))), self._total_duration_ms()))
 
-    def _update_slider_range(self):
+    def _update_slider_range(self, _value=None, *, refresh: bool = True):
         window_ms = self._window_ms()
         self.slider.setMaximum(self._slider_maximum_ms())
         self.slider.setPageStep(max(1, window_ms // 2))
@@ -16651,6 +16823,8 @@ class SpikeRasterWindow(AppDialog):
             self._set_playback_time_ms(self._playback_time_ms)
         if self.slider.maximum() == 0 and not self._short_data_window():
             self._stop_playback()
+        if not refresh:
+            return
         self._refresh_heatmap_scale()
         self._update_view()
 
@@ -16982,13 +17156,6 @@ class SpikeRasterWindow(AppDialog):
         return int(sum(np.asarray(times).size for _, times in self.spike_series))
 
     def _initialize_bursts_for_open(self) -> None:
-        spike_count = self._spike_count_for_current_view()
-        if len(self.spike_series) > 160 or spike_count > 750000:
-            self.burst_intervals = []
-            self.canvas.set_bursts(self.burst_intervals)
-            self.rate_canvas.set_bursts(self.burst_intervals)
-            self._burst_detection_dirty = True
-            return
         self._refresh_bursts(force=True)
 
     def _ensure_bursts_ready(self) -> bool:
@@ -17384,15 +17551,23 @@ class ClosedLoopControlDialog(AppDialog):
         self._last_external_log_s = -999.0
         self._last_live_refresh_s = -999.0
         self._live_dirty = True
+        self._last_live_trim_s = -999.0
         self.runner_process: QProcess | None = None
         self.control_process: QProcess | None = None
         self._control_queue: list[tuple[str, list[str], str]] = []
         self._loaded_rate_scores_cache_key = None
         self._loaded_rate_scores_cache: dict[str, float] | None = None
         self.live_channels = self._initial_channels()
+        self.spike_events = {channel: [] for channel in self.live_channels}
+        self._spike_series_arrays: dict[str, np.ndarray] = {}
+        self._spike_series_cache: list[tuple[str, np.ndarray]] = []
+        self._spike_series_index: dict[str, int] = {}
+        self._recent_spike_events: list[tuple[float, str]] = []
+        self._rebuild_live_series_cache()
 
-        self.raster_canvas = SpikeRasterCanvas([(channel, np.asarray([], dtype=float)) for channel in self.live_channels], y_axis_label="Channel")
+        self.raster_canvas = SpikeRasterCanvas(self._spike_series_cache, y_axis_label="Channel")
         self.raster_canvas.setMinimumSize(720, 440)
+        self.raster_canvas.set_visible_rows(0, min(96, max(1, len(self.live_channels))))
         self.raster_canvas.wheel_zoom_requested.connect(self._zoom_live_window)
         self.raster_canvas.pan_requested.connect(self._pan_live_window)
         self.raster_canvas.pan_finished.connect(self._resume_follow_later)
@@ -17406,6 +17581,8 @@ class ClosedLoopControlDialog(AppDialog):
         self.backend_combo.addItem("External network", "network")
         self.backend_combo.currentIndexChanged.connect(self._backend_changed)
         self.cfg_path = QLineEdit(self._default_cfg_path())
+        self.cfg_browse_button = QPushButton("Browse")
+        self.cfg_browse_button.clicked.connect(self._browse_cfg_path)
         self.rules_path = QLineEdit(str(self._default_rules_path()))
         self.runner_path = QLineEdit(str(self._default_runner_path()))
         self.amplitude_mv = QDoubleSpinBox()
@@ -17518,8 +17695,14 @@ class ClosedLoopControlDialog(AppDialog):
         right_layout.setContentsMargins(8, 8, 8, 8)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        cfg_row = QWidget()
+        cfg_layout = QHBoxLayout(cfg_row)
+        cfg_layout.setContentsMargins(0, 0, 0, 0)
+        cfg_layout.setSpacing(6)
+        cfg_layout.addWidget(self.cfg_path, 1)
+        cfg_layout.addWidget(self.cfg_browse_button)
         form.addRow("Backend", self.backend_combo)
-        form.addRow("CFG", self.cfg_path)
+        form.addRow("CFG", cfg_row)
         form.addRow("Rules", self.rules_path)
         form.addRow("Runner", self.runner_path)
         form.addRow("Amplitude", self.amplitude_mv)
@@ -17565,6 +17748,28 @@ class ClosedLoopControlDialog(AppDialog):
         if exe.exists():
             return exe
         return build_dir / "closed_loop_runner"
+
+    def _browse_cfg_path(self) -> None:
+        current = self.cfg_path.text().strip()
+        initial_dir = ""
+        if current:
+            path = Path(current).expanduser()
+            initial_dir = str(path.parent if path.suffix else path)
+        if not initial_dir:
+            env_path = os.environ.get("MAXWELL_CFG_PATH", "").strip()
+            if env_path:
+                path = Path(env_path).expanduser()
+                initial_dir = str(path.parent if path.suffix else path)
+        if not initial_dir:
+            initial_dir = str(Path.home())
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Select MaxWell CFG",
+            initial_dir,
+            "MaxWell config (*.cfg);;All files (*)",
+        )
+        if selected:
+            self.cfg_path.setText(selected)
 
     def _save_rules_file(self) -> Path | None:
         path = Path(self.rules_path.text().strip() or str(self._default_rules_path()))
@@ -17988,9 +18193,11 @@ class ClosedLoopControlDialog(AppDialog):
             labels = []
             for electrode, payload in self.channel_map.electrodes.items():
                 if isinstance(payload, dict):
-                    labels.append(str(payload.get("channel") or electrode))
+                    channel = str(payload.get("channel") or "").strip()
+                    if channel:
+                        labels.append(channel)
             if labels:
-                return sorted(labels, key=_channel_sort_key)
+                return sorted(set(labels), key=_channel_sort_key)
         return [str(index) for index in range(1024)]
 
     def _default_cfg_path(self) -> str:
@@ -18012,13 +18219,63 @@ class ClosedLoopControlDialog(AppDialog):
             return 0.0
         return max(0.0, time.monotonic() - self.run_start_monotonic)
 
+    def _rebuild_live_series_cache(self) -> None:
+        self._spike_series_arrays = {
+            channel: np.asarray(self.spike_events.get(channel, []), dtype=float)
+            for channel in self.live_channels
+        }
+        self._spike_series_cache = [(channel, self._spike_series_arrays[channel]) for channel in self.live_channels]
+        self._spike_series_index = {channel: index for index, channel in enumerate(self.live_channels)}
+
+    def _update_live_series_cache(self, channels) -> None:
+        changed = False
+        for channel in channels:
+            channel = str(channel)
+            if channel not in self._spike_series_index:
+                self.live_channels.append(channel)
+                self.live_channels.sort(key=_channel_sort_key)
+                self._rebuild_live_series_cache()
+                changed = True
+            index = self._spike_series_index.get(channel)
+            if index is None:
+                continue
+            array = np.asarray(self.spike_events.get(channel, []), dtype=float)
+            self._spike_series_arrays[channel] = array
+            self._spike_series_cache[index] = (channel, array)
+            changed = True
+        if changed:
+            self.raster_canvas.spike_series = list(self._spike_series_cache)
+            self.raster_canvas._raster_cache = None
+            self.raster_canvas._raster_cache_key = None
+
+    def _focus_live_rows_on_channels(self, channels) -> None:
+        indices = [self._spike_series_index.get(str(channel)) for channel in channels]
+        indices = [index for index in indices if index is not None]
+        if not indices:
+            return
+        offset = int(self.raster_canvas.row_offset)
+        count = max(1, int(self.raster_canvas.visible_row_count))
+        if any(offset <= index < offset + count for index in indices):
+            return
+        target = max(0, min(indices) - 8)
+        self.raster_canvas.set_visible_rows(target, min(96, max(1, len(self.live_channels))))
+
     def _start(self) -> None:
         backend = str(self.backend_combo.currentData() or "simulation")
-        if backend == "cpp_runner" and len(self.live_channels) < 1024:
-            self.live_channels = [str(index) for index in range(1024)]
-            self.raster_canvas.set_spike_series([(channel, np.asarray([], dtype=float)) for channel in self.live_channels])
+        cpp_channels = [str(index) for index in range(1024)]
+        if backend == "cpp_runner" and self.live_channels != cpp_channels:
+            self.live_channels = cpp_channels
+            self.spike_events = {channel: [] for channel in self.live_channels}
+            self._recent_spike_events = []
+            self._rebuild_live_series_cache()
+            self.raster_canvas.set_spike_series(self._spike_series_cache)
+            self.raster_canvas.set_visible_rows(0, min(96, max(1, len(self.live_channels))))
         self.run_start_monotonic = time.monotonic()
         self.spike_events = {channel: [] for channel in self.live_channels}
+        self._recent_spike_events = []
+        self._rebuild_live_series_cache()
+        self.raster_canvas.set_spike_series(self._spike_series_cache)
+        self.raster_canvas.set_visible_rows(int(self.raster_canvas.row_offset), min(96, max(1, len(self.live_channels))))
         self.closed_loop_events = []
         self.total_spikes = 0
         self.total_stims = 0
@@ -18027,6 +18284,7 @@ class ClosedLoopControlDialog(AppDialog):
         self.follow_live = True
         self._last_external_log_s = -999.0
         self._last_live_refresh_s = -999.0
+        self._last_live_trim_s = -999.0
         self._live_dirty = True
         self.event_table.setRowCount(0)
         self.start_button.setEnabled(False)
@@ -18052,25 +18310,19 @@ class ClosedLoopControlDialog(AppDialog):
         self.status_label.setText("Stopped")
         self.controller_log.append("Closed-loop session stopped")
 
-    def _runner_arguments(self) -> list[str]:
-        rules_path = Path(self.rules_path.text().strip() or str(self._default_rules_path()))
-        return [
-            "--rules-file",
-            str(rules_path),
-            "--blank-ms",
-            str(int(self.blank_ms.value())),
-            "--artifact-window-ms",
-            str(int(self.artifact_window_ms.value())),
-            "--telemetry-interval-ms",
-            "100",
-            "--telemetry-max-events",
-            "4096",
-        ]
-
     def _launch_cpp_runner(self) -> None:
         self._stop_cpp_runner(wait_ms=100)
         rules_path = self._save_rules_file()
         if rules_path is None:
+            return
+        cfg_text = self.cfg_path.text().strip()
+        if not cfg_text:
+            self.status_label.setText("CFG path missing")
+            self.controller_log.append("CFG path is required for recording closed-loop runs.")
+            return
+        if not Path(cfg_text).exists():
+            self.status_label.setText("CFG not found")
+            self.controller_log.append(f"CFG path does not exist: {cfg_text}")
             return
         program = self.runner_path.text().strip()
         if not program:
@@ -18081,15 +18333,47 @@ class ClosedLoopControlDialog(AppDialog):
             self.status_label.setText("Runner not found")
             self.controller_log.append(f"MaxWell runner not found: {program}")
             return
+        root = self._closed_loop_root()
+        recording_name = f"closed_loop_{time.strftime('%Y%m%d_%H%M%S')}"
+        arguments = [
+            "-m",
+            "closed_loop.closed_loop_setup",
+            "--config-dir",
+            str(root / "config"),
+            "--cfg",
+            cfg_text,
+            "--rules-file",
+            str(rules_path),
+            "--data-dir",
+            str(root / "data"),
+            "--amplitude-mv",
+            f"{float(self.amplitude_mv.value()):.6g}",
+            "--blank-ms",
+            str(int(self.blank_ms.value())),
+            "--artifact-window-ms",
+            str(int(self.artifact_window_ms.value())),
+            "--telemetry-interval-ms",
+            "250",
+            "--telemetry-max-events",
+            "1024",
+            "--record",
+            "--recording-name",
+            recording_name,
+            "--runner",
+            program,
+        ]
         process = QProcess(self)
-        process.setProgram(program)
-        process.setArguments(self._runner_arguments())
+        process.setProgram(sys.executable)
+        process.setArguments(arguments)
+        process.setWorkingDirectory(str(root.parent))
         process.readyReadStandardOutput.connect(self._read_runner_stdout)
         process.readyReadStandardError.connect(self._read_runner_stderr)
         process.finished.connect(self._runner_finished)
         process.errorOccurred.connect(self._runner_error)
         self.runner_process = process
-        self.controller_log.append(f"Starting MaxWell runner: {program}")
+        self.controller_log.append(f"Recording to: {root / 'data'}")
+        self.controller_log.append(f"Recording name: {recording_name}")
+        self.controller_log.append(f"Starting recorded MaxWell runner: {program}")
         process.start()
 
     def _stop_cpp_runner(self, wait_ms: int = 1500) -> None:
@@ -18220,6 +18504,7 @@ class ClosedLoopControlDialog(AppDialog):
         if not isinstance(channels, list) or not isinstance(times_s, list):
             return
         appended = 0
+        changed_channels: set[str] = set()
         for channel, time_s in zip(channels, times_s):
             try:
                 channel_text = str(int(channel))
@@ -18234,9 +18519,13 @@ class ClosedLoopControlDialog(AppDialog):
                     self.live_channels.append(channel_text)
                     self.live_channels.sort(key=_channel_sort_key)
             self.spike_events[channel_text].append(value)
+            self._recent_spike_events.append((value, channel_text))
+            changed_channels.add(channel_text)
             appended += 1
         if appended:
             self.total_spikes += appended
+            self._update_live_series_cache(changed_channels)
+            self._focus_live_rows_on_channels(changed_channels)
             self._live_dirty = True
 
     def _tick(self) -> None:
@@ -18265,8 +18554,11 @@ class ClosedLoopControlDialog(AppDialog):
             jitter = rng.random(count) * (self.timer.interval() / 1000.0)
             values = [max(0.0, now_s - self.timer.interval() / 1000.0 + float(item)) for item in jitter]
             self.spike_events.setdefault(channel, []).extend(values)
+            self._recent_spike_events.extend((value, channel) for value in values)
             new_counts[channel] = count
             self.total_spikes += count
+        if new_counts:
+            self._update_live_series_cache(new_counts.keys())
         for rule in active_rules:
             detect_channels = [str(channel) for channel in rule.get("detect_channels", []) if str(channel)]
             recent = sum(self._count_channel_window(channel, max(0.0, now_s - 1.0), now_s) for channel in detect_channels)
@@ -18291,7 +18583,9 @@ class ClosedLoopControlDialog(AppDialog):
             self._refresh_live_views()
 
     def _count_channel_window(self, channel: str, start_s: float, stop_s: float) -> int:
-        values = np.asarray(self.spike_events.get(channel, []), dtype=float)
+        values = self._spike_series_arrays.get(str(channel))
+        if values is None:
+            values = np.asarray(self.spike_events.get(channel, []), dtype=float)
         if values.size == 0:
             return 0
         lo = int(np.searchsorted(values, start_s, side="left"))
@@ -18359,15 +18653,38 @@ class ClosedLoopControlDialog(AppDialog):
         self.event_table.scrollToBottom()
 
     def _trim_events(self, now_s: float) -> None:
+        if now_s - self._last_live_trim_s < 2.0:
+            return
+        self._last_live_trim_s = now_s
         keep_after = max(0.0, now_s - 180.0)
+        changed_channels = []
         for channel in list(self.spike_events):
             values = self.spike_events[channel]
+            original_len = len(values)
             while values and values[0] < keep_after:
                 values.pop(0)
+            if len(values) != original_len:
+                changed_channels.append(channel)
+        recent_keep_after = max(0.0, now_s - 5.0)
+        if self._recent_spike_events:
+            self._recent_spike_events = [
+                (time_s, channel)
+                for time_s, channel in self._recent_spike_events
+                if time_s >= recent_keep_after
+            ]
+        if changed_channels:
+            self._update_live_series_cache(changed_channels)
         self.closed_loop_events = [item for item in self.closed_loop_events if float(item.get("time_s", 0.0)) >= keep_after]
 
     def _series_arrays(self) -> list[tuple[str, np.ndarray]]:
-        return [(channel, np.asarray(self.spike_events.get(channel, []), dtype=float)) for channel in self.live_channels]
+        return self._spike_series_cache
+
+    def _recent_heatmap_counts(self, start_s: float) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for time_s, channel in self._recent_spike_events:
+            if time_s >= start_s:
+                counts[channel] = counts.get(channel, 0) + 1
+        return counts
 
     def _refresh_live_views(self) -> None:
         current_s = self._elapsed_s()
@@ -18376,11 +18693,11 @@ class ClosedLoopControlDialog(AppDialog):
             start_s = max(0.0, current_s - window_s)
         else:
             start_s = self.raster_canvas.window_start
-        self.raster_canvas.set_spike_series(self._series_arrays())
+        self.raster_canvas.spike_series = self._series_arrays()
         self.raster_canvas.set_view(start_s, window_s, max(0.05, window_s / 10.0))
         self.raster_canvas.set_playhead_time(current_s)
         heatmap_start = max(0.0, current_s - 0.25)
-        counts = {channel: self._count_channel_window(channel, heatmap_start, current_s) for channel in self.live_channels}
+        counts = self._recent_heatmap_counts(heatmap_start)
         self.heatmap_canvas.set_fast_mode(True)
         self.heatmap_canvas.set_counts(counts)
         self.stim_canvas.set_state(current_s, self.closed_loop_events, window_s)
@@ -22280,6 +22597,8 @@ class MainWindow(QMainWindow):
         self.raw_data = None
         self.result = None
         self.channel_map = _default_maxwell_channel_map() or default_channel_map()
+        self._source_channel_map_cache: dict[tuple[str, str, int], ChannelMap] = {}
+        self._source_channel_map_ready_key: tuple[str, str, int] | None = None
         self.child_windows = []
         self.file_database: list[dict] = []
         self.processed_database: list[dict] = []
@@ -22300,6 +22619,8 @@ class MainWindow(QMainWindow):
         self.custom_data_selection_dialog = None
         self.stimulus_generation_dialog = None
         self.closed_loop_dialog = None
+        self.agent_custom_code_dialog = None
+        self.active_database_index = -1
         self.active_processed_index = -1
 
         self._build_ui()
@@ -22472,6 +22793,9 @@ class MainWindow(QMainWindow):
         generic_action = QAction("Custom Analysis", self)
         generic_action.triggered.connect(self.open_generic_analysis)
         tools_menu.addAction(generic_action)
+        agent_custom_code_action = QAction("Agent Custom Code", self)
+        agent_custom_code_action.triggered.connect(self.open_agent_custom_code)
+        tools_menu.addAction(agent_custom_code_action)
 
     def _start_progress(self, title: str, message: str, maximum: int = 0) -> QProgressDialog:
         return _create_progress_dialog(self, title, message, maximum)
@@ -22511,6 +22835,7 @@ class MainWindow(QMainWindow):
         self.generic_analysis_button.setEnabled(has_database and not any_busy)
 
     def open_stimulus_generation(self):
+        self._ensure_source_channel_map_ready("Preparing stimulus generation")
         if self.stimulus_generation_dialog is None:
             self.stimulus_generation_dialog = StimulusGenerationDialog(
                 self.file_database,
@@ -22525,6 +22850,7 @@ class MainWindow(QMainWindow):
         self.stimulus_generation_dialog.activateWindow()
 
     def open_closed_loop_control(self):
+        self._ensure_source_channel_map_ready("Preparing closed loop")
         if self.closed_loop_dialog is None:
             self.closed_loop_dialog = ClosedLoopControlDialog(
                 self.file_database,
@@ -22540,6 +22866,33 @@ class MainWindow(QMainWindow):
         self.closed_loop_dialog.show()
         self.closed_loop_dialog.raise_()
         self.closed_loop_dialog.activateWindow()
+
+    def open_agent_custom_code(self):
+        check_dialog = AgentEnvironmentCheckDialog(self)
+        check_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        if check_dialog.exec() != QDialog.Accepted:
+            return
+        if self.agent_custom_code_dialog is None:
+            dialog = AgentCustomCodeDialog(
+                raw_provider=lambda: list(self.file_database),
+                selected_raw_provider=self._agent_selected_raw_records,
+                processed_provider=lambda: list(self.processed_database),
+                selected_processed_provider=self._agent_selected_processed_records,
+                save_processed_callback=self._save_agent_processed_records,
+                parent=self,
+            )
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.finished.connect(lambda _result: self._forget_agent_custom_code_dialog(dialog))
+            self.agent_custom_code_dialog = dialog
+        elif hasattr(self.agent_custom_code_dialog, "refresh_context"):
+            self.agent_custom_code_dialog.refresh_context()
+        self.agent_custom_code_dialog.show()
+        self.agent_custom_code_dialog.raise_()
+        self.agent_custom_code_dialog.activateWindow()
+
+    def _forget_agent_custom_code_dialog(self, dialog) -> None:
+        if self.agent_custom_code_dialog is dialog:
+            self.agent_custom_code_dialog = None
 
     def open_stimulus_response_analysis(self):
         if self.active_stimulus_worker is not None:
@@ -23327,8 +23680,13 @@ class MainWindow(QMainWindow):
             return
         if self.active_load_worker is worker:
             self.active_load_worker = None
-        self._finish_progress(self.pipeline_progress)
-        self.pipeline_progress = None
+        progress = self.pipeline_progress
+
+        def finish_load_progress() -> None:
+            if self.pipeline_progress is progress:
+                self._finish_progress(progress)
+                self.pipeline_progress = None
+
         self._update_analysis_action_states()
         raw_records = payload.get("records")
         if raw_records is None and payload.get("path"):
@@ -23341,27 +23699,77 @@ class MainWindow(QMainWindow):
             ]
         records = []
         raw_records = list(raw_records or [])
-        for raw_record in raw_records:
+        prompt_before_normalize = False
+        if len(raw_records) == 1:
+            maybe_data = raw_records[0].get("raw_data") if isinstance(raw_records[0], dict) else None
+            if isinstance(maybe_data, UnifiedMEAData) and isinstance(maybe_data.meta, dict):
+                prompt_before_normalize = len([str(well) for well in maybe_data.meta.get("wells", []) if str(well)]) > 1
+        if prompt_before_normalize:
+            finish_load_progress()
+            progress = None
+        else:
+            self._progress_step(progress, "Normalizing loaded file records...", 96)
+        for index, raw_record in enumerate(raw_records):
+            if not prompt_before_normalize:
+                self._progress_step(
+                    progress,
+                    f"Normalizing loaded file records ({index + 1}/{len(raw_records)})...",
+                    96,
+                )
             record = self._normalize_database_record(raw_record, allow_well_prompt=len(raw_records) == 1)
             if record is not None:
                 records.append(record)
         errors = list(payload.get("errors", []))
         if not records:
-            self._refresh_file_database_table()
+            self._progress_step(progress, "Refreshing file database table...", 98)
+            self._refresh_file_database_table(lightweight=True)
             self._sync_active_file_controls()
             details = "\n".join(errors[:12]) if errors else "No readable files were loaded."
             self._set_app_status("Data load produced no usable files", details.splitlines()[0] if details else "")
+            finish_load_progress()
             _show_warning_message(self, "Load failed", details)
             return
 
         first_new_index = None
+        new_indices: list[int] = []
         skipped_duplicates: list[str] = []
-        for record in records:
+        for index, record in enumerate(records):
+            self._progress_step(
+                progress,
+                f"Updating file database ({index + 1}/{len(records)})...",
+                97,
+            )
             if _database_key_exists(self.file_database, str(record.get("path", "")), key="path"):
                 skipped_duplicates.append(Path(str(record.get("path", ""))).name)
                 continue
             first_new_index = self._upsert_database_record(record)
+            new_indices.append(first_new_index)
             self._log_database_record(record)
+        if first_new_index is None:
+            self._sync_active_file_controls()
+            self._set_app_status("Database unchanged", "All loaded files already exist in the database.")
+            finish_load_progress()
+            if skipped_duplicates:
+                _show_warning_message(
+                    self,
+                    "Duplicate name",
+                    "These files already exist in the file database and were not saved:\n"
+                    + "\n".join(skipped_duplicates[:12]),
+            )
+            return
+        self.database_sort_column = None
+        if errors:
+            self._log(f"Skipped {len(errors)} files: {'; '.join(errors[:4])}")
+        self._log(f"Database loaded: {len(self.file_database)} files")
+        self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded. Rendering database rows...")
+        finish_load_progress()
+        QTimer.singleShot(
+            0,
+            lambda rows=list(new_indices), index=int(first_new_index): self._render_loaded_database_rows_after_progress(
+                rows,
+                index,
+            ),
+        )
         if skipped_duplicates:
             _show_warning_message(
                 self,
@@ -23369,19 +23777,6 @@ class MainWindow(QMainWindow):
                 "These files already exist in the file database and were not saved:\n"
                 + "\n".join(skipped_duplicates[:12]),
             )
-        if first_new_index is None:
-            self._refresh_file_database_table()
-            self._sync_active_file_controls()
-            self._set_app_status("Database unchanged", "All loaded files already exist in the database.")
-            return
-        self.database_sort_column = None
-        self._refresh_file_database_table()
-        self.database_table.selectRow(first_new_index)
-        self._set_active_database_index(first_new_index)
-        if errors:
-            self._log(f"Skipped {len(errors)} files: {'; '.join(errors[:4])}")
-        self._log(f"Database loaded: {len(self.file_database)} files")
-        self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded into the workspace.")
 
     def _data_load_failed(self, details: str, worker):
         if self.active_load_worker is worker:
@@ -23436,6 +23831,54 @@ class MainWindow(QMainWindow):
     def _database_record_stats(self, record: dict) -> tuple[int, int, int]:
         return _loaded_data_stats(record.get("raw_data"))
 
+    def _refresh_file_database_row(self, row: int, *, lightweight: bool = False) -> None:
+        if not (0 <= int(row) < len(self.file_database)):
+            return
+        record = self.file_database[int(row)]
+        path = Path(str(record.get("path", "")))
+        if lightweight:
+            channels, spikes, waveforms = _loaded_data_stats_lightweight(record.get("raw_data"))
+            activity = "deferred"
+        else:
+            channels, spikes, waveforms = self._database_record_stats(record)
+            activity = _loaded_data_activity_label(path, record.get("raw_data"))
+        values = [
+            path.name,
+            _loaded_data_kind_label(record.get("raw_data"), str(record.get("data_kind", ""))),
+            activity,
+            str(channels),
+            str(spikes),
+            str(waveforms),
+            str(path.parent),
+        ]
+        previous_blocked = self.database_table.signalsBlocked()
+        self.database_table.blockSignals(True)
+        try:
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self.database_table.setItem(int(row), column, item)
+        finally:
+            self.database_table.blockSignals(previous_blocked)
+
+    def _refresh_file_database_rows(self, rows: list[int], *, lightweight: bool = False) -> None:
+        valid_rows = sorted({int(row) for row in rows if 0 <= int(row) < len(self.file_database)})
+        if not valid_rows:
+            return
+        self._ensure_database_order()
+        previous_blocked = self.database_table.signalsBlocked()
+        self.database_table.blockSignals(True)
+        self.database_table.setUpdatesEnabled(False)
+        try:
+            if self.database_table.rowCount() != len(self.file_database):
+                self.database_table.setRowCount(len(self.file_database))
+            for row in valid_rows:
+                self._refresh_file_database_row(row, lightweight=lightweight)
+        finally:
+            self.database_table.setUpdatesEnabled(True)
+            self.database_table.blockSignals(previous_blocked)
+        self._sync_active_file_controls()
+
     def _ensure_database_order(self) -> None:
         for index, record in enumerate(self.file_database):
             if "_database_order" not in record:
@@ -23446,34 +23889,25 @@ class MainWindow(QMainWindow):
             if "_processed_order" not in record:
                 record["_processed_order"] = index
 
-    def _refresh_file_database_table(self) -> None:
+    def _refresh_file_database_table(self, *, lightweight: bool = False) -> None:
         self._ensure_database_order()
         selected_rows = self._selected_database_rows() if hasattr(self, "database_table") else []
         selected_paths = {str(self.file_database[row].get("path", "")) for row in selected_rows}
         self.database_table.blockSignals(True)
+        self.database_table.setUpdatesEnabled(False)
         self.database_table.setRowCount(len(self.file_database))
-        for row, record in enumerate(self.file_database):
-            path = Path(str(record.get("path", "")))
-            channels, spikes, waveforms = self._database_record_stats(record)
-            values = [
-                path.name,
-                _loaded_data_kind_label(record.get("raw_data"), str(record.get("data_kind", ""))),
-                _loaded_data_activity_label(path, record.get("raw_data")),
-                str(channels),
-                str(spikes),
-                str(waveforms),
-                str(path.parent),
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setData(Qt.ItemDataRole.UserRole, str(path))
-                self.database_table.setItem(row, column, item)
-        self.database_table.resizeColumnsToContents()
-        self.database_table.clearSelection()
-        for row, record in enumerate(self.file_database):
-            if str(record.get("path", "")) in selected_paths:
-                self.database_table.selectRow(row)
-        self.database_table.blockSignals(False)
+        try:
+            for row, record in enumerate(self.file_database):
+                self._refresh_file_database_row(row, lightweight=lightweight)
+            if not lightweight:
+                self.database_table.resizeColumnsToContents()
+            self.database_table.clearSelection()
+            for row, record in enumerate(self.file_database):
+                if str(record.get("path", "")) in selected_paths:
+                    self.database_table.selectRow(row)
+        finally:
+            self.database_table.setUpdatesEnabled(True)
+            self.database_table.blockSignals(False)
         self._sync_active_file_controls()
 
     def _upsert_processed_record(self, record: dict) -> int:
@@ -23576,6 +24010,60 @@ class MainWindow(QMainWindow):
             return [self.processed_database[row] for row in rows]
         return list(self.processed_database)
 
+    def _agent_selected_raw_records(self) -> list[dict]:
+        rows = self._selected_database_rows() if hasattr(self, "database_table") else []
+        if rows:
+            return [self.file_database[row] for row in rows]
+        if 0 <= int(getattr(self, "active_database_index", -1)) < len(self.file_database):
+            return [self.file_database[int(self.active_database_index)]]
+        if self.raw_data is not None and self.input_path:
+            return [{"path": self.input_path, "raw_data": self.raw_data, "data_kind": self.data_kind}]
+        return []
+
+    def _agent_selected_processed_records(self) -> list[dict]:
+        rows = self._selected_processed_rows() if hasattr(self, "processed_table") else []
+        if rows:
+            return [self.processed_database[row] for row in rows]
+        if 0 <= int(self.active_processed_index) < len(self.processed_database):
+            return [self.processed_database[int(self.active_processed_index)]]
+        return []
+
+    def _save_agent_processed_records(self, records: list[dict]) -> int:
+        saved = 0
+        batch_names: set[str] = set()
+        for record in list(records or []):
+            saved_record = dict(record)
+            name = str(saved_record.get("name", "") or "").strip()
+            if not name:
+                name = f"agent result {int(time.time() * 1000)}"
+                saved_record["name"] = name
+            key = name.lower()
+            if key in batch_names or _database_key_exists(self.processed_database, name):
+                _show_duplicate_database_warning(self, "processed-data database", name)
+                continue
+            matrix = np.asarray(saved_record.get("matrix", []), dtype=float)
+            if matrix.ndim == 1:
+                matrix = matrix.reshape(-1, 1)
+            if matrix.ndim != 2:
+                _show_warning_message(self, "Agent Custom Code", f'"{name}" output matrix must be 1D or 2D.')
+                continue
+            saved_record["matrix"] = matrix
+            saved_record.setdefault("path", f"agent::{int(time.time() * 1000)}::{saved}")
+            saved_record.setdefault("dataset_group", "agent_generated")
+            saved_record.setdefault("dataset_origin", "agent_custom_code")
+            saved_record.setdefault("source_label", "Agent module")
+            saved_record.setdefault("source_path", "")
+            saved_record.setdefault("sample_labels", [str(index + 1) for index in range(matrix.shape[0])])
+            saved_record.setdefault("feature_labels", [f"feature {index + 1}" for index in range(matrix.shape[1])])
+            self._upsert_processed_record(saved_record)
+            batch_names.add(key)
+            saved += 1
+        if saved:
+            self._refresh_processed_database_table()
+            self._update_analysis_action_states()
+            self._set_app_status("Agent results saved", f"{saved} processed dataset(s) added.")
+        return saved
+
     def _processed_selection_changed(self) -> None:
         rows = self._selected_processed_rows()
         if not rows:
@@ -23668,8 +24156,60 @@ class MainWindow(QMainWindow):
         current = self.database_table.currentRow()
         self._set_active_database_index(current if current in rows else rows[0])
 
-    def _set_active_database_index(self, index: int) -> None:
+    def _activate_loaded_database_record_after_progress(self, index: int) -> None:
         if not (0 <= int(index) < len(self.file_database)):
+            return
+        self.database_table.blockSignals(True)
+        try:
+            self.database_table.clearSelection()
+            self.database_table.selectRow(int(index))
+            self.database_table.setCurrentCell(int(index), 0)
+        finally:
+            self.database_table.blockSignals(False)
+        self._set_active_database_index(int(index), lightweight=True)
+
+    def _render_loaded_database_rows_after_progress(
+        self,
+        rows: list[int],
+        first_index: int,
+        *,
+        batch_size: int = 12,
+    ) -> None:
+        pending = [int(row) for row in rows if 0 <= int(row) < len(self.file_database)]
+        if not pending:
+            self._activate_loaded_database_record_after_progress(first_index)
+            return
+        if self.database_table.rowCount() < len(self.file_database):
+            self.database_table.setRowCount(len(self.file_database))
+
+        batch = pending[: max(1, int(batch_size))]
+        remaining = pending[max(1, int(batch_size)) :]
+        self.database_table.blockSignals(True)
+        self.database_table.setUpdatesEnabled(False)
+        try:
+            for row in batch:
+                self._refresh_file_database_row(row, lightweight=True)
+        finally:
+            self.database_table.setUpdatesEnabled(True)
+            self.database_table.blockSignals(False)
+
+        if remaining:
+            self._set_app_status("Database ready", f"Rendering database rows... {len(rows) - len(remaining)}/{len(rows)}")
+            QTimer.singleShot(
+                0,
+                lambda remaining=remaining, first_index=int(first_index): self._render_loaded_database_rows_after_progress(
+                    remaining,
+                    first_index,
+                    batch_size=batch_size,
+                ),
+            )
+            return
+        self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded into the workspace.")
+        self._activate_loaded_database_record_after_progress(first_index)
+
+    def _set_active_database_index(self, index: int, *, defer_heavy: bool = False, lightweight: bool = False) -> None:
+        if not (0 <= int(index) < len(self.file_database)):
+            self.active_database_index = -1
             self.raw_data = None
             self.data_kind = ""
             self.input_path = ""
@@ -23677,16 +24217,66 @@ class MainWindow(QMainWindow):
             self._update_data_preview()
             self._sync_active_file_controls()
             return
+        self.active_database_index = int(index)
         record = self.file_database[int(index)]
         self.input_path = str(record.get("path", ""))
         self.raw_data = record.get("raw_data")
         self.data_kind = str(record.get("data_kind", ""))
         self.result = None
         self.file_label.setText(f"{int(index) + 1}/{len(self.file_database)}: {Path(self.input_path).name}")
-        self._apply_source_channel_map()
+        self._source_channel_map_ready_key = None
+        if lightweight:
+            self._sync_active_file_controls()
+            self._update_data_preview_lightweight()
+            self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded into the workspace.")
+            return
+        if defer_heavy:
+            self._sync_active_file_controls()
+            self.data_preview.setPlainText(
+                "Loaded file selected.\n\n"
+                "Data preview is updating. Channel map construction is deferred until a map-dependent view is opened."
+            )
+            self._set_app_status("Database ready", "Updating selected file preview and channel map.")
+            QTimer.singleShot(0, lambda index=int(index): self._finish_deferred_active_database_refresh(index))
+            return
         self._sync_active_file_controls()
         self._update_data_preview()
-        self._validate_default_channel_map()
+
+    def _finish_deferred_active_database_refresh(self, index: int) -> None:
+        if int(index) != int(getattr(self, "active_database_index", -1)):
+            return
+        self._update_data_preview_lightweight()
+        self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded into the workspace.")
+
+    def _update_data_preview_lightweight(self) -> None:
+        if self.raw_data is None:
+            self._update_data_preview()
+            return
+        lines = []
+        if self.input_path:
+            lines.append(f"File: {self.input_path}")
+        lines.append(f"Kind: {_loaded_data_kind_label(self.raw_data, self.data_kind)}")
+        if isinstance(self.raw_data, UnifiedMEAData):
+            channels = list(self.raw_data.spikes.keys())
+            spike_total = sum(int(np.asarray(values).size) for values in self.raw_data.spikes.values())
+            lines.extend(
+                [
+                    f"Sampling rate: {self.raw_data.sr:g} Hz" if self.raw_data.sr else "Sampling rate: n/a",
+                    f"Channels: {len(channels)}",
+                    f"Total spikes: {spike_total}",
+                    f"Waveform channels: {len(self.raw_data.waveforms)}",
+                    f"Stim/event packets: {int(np.asarray(self.raw_data.stim_times).size)}",
+                    "",
+                    "Preview is lightweight after loading. Open Raster or Channel Map to build map-dependent views.",
+                ]
+            )
+            source = self.raw_data.meta.get("source") if isinstance(self.raw_data.meta, dict) else ""
+            if source:
+                lines.insert(2, f"Source: {source}")
+        else:
+            array = np.asarray(self.raw_data)
+            lines.extend([f"Shape: {array.shape}", f"Dtype: {array.dtype}", f"Dimensions: {array.ndim}"])
+        self.data_preview.setPlainText("\n".join(lines))
 
     def _sync_active_file_controls(self) -> None:
         has_data = self.raw_data is not None
@@ -23758,19 +24348,51 @@ class MainWindow(QMainWindow):
         if not isinstance(self.raw_data.meta, dict):
             return
         source = self.raw_data.meta.get("source")
+        cache_key = (str(source or ""), str(self.input_path or ""), id(self.raw_data))
+        if self._source_channel_map_ready_key == cache_key:
+            return
+        cached = self._source_channel_map_cache.get(cache_key)
+        if cached is not None:
+            self.channel_map = cached
+            self._source_channel_map_ready_key = cache_key
+            return
         if source == "axion_spk":
             self.channel_map = _default_axion_channel_map(self.raw_data)
+            self._source_channel_map_cache[cache_key] = self.channel_map
+            self._source_channel_map_ready_key = cache_key
             return
         if source == "maxwell_h5":
             maxwell_map = _maxwell_channel_map_from_unified(self.raw_data)
             if maxwell_map is not None:
                 self.channel_map = maxwell_map
+                self._source_channel_map_cache[cache_key] = self.channel_map
+                self._source_channel_map_ready_key = cache_key
+                if len(self._source_channel_map_cache) > 12:
+                    oldest_key = next(iter(self._source_channel_map_cache))
+                    self._source_channel_map_cache.pop(oldest_key, None)
             return
         if source != "axion_spk":
             fallback = default_channel_map()
             if fallback is not None:
                 self.channel_map = fallback
+                self._source_channel_map_ready_key = cache_key
             return
+
+    def _ensure_source_channel_map_ready(self, reason: str = "Preparing channel map") -> None:
+        if not isinstance(self.raw_data, UnifiedMEAData) or not isinstance(self.raw_data.meta, dict):
+            return
+        source = self.raw_data.meta.get("source")
+        cache_key = (str(source or ""), str(self.input_path or ""), id(self.raw_data))
+        if self._source_channel_map_ready_key == cache_key:
+            return
+        progress = self._start_progress(reason, "Building source channel map...", 2)
+        try:
+            self._progress_step(progress, "Building source channel map...", 1)
+            self._apply_source_channel_map()
+            self._progress_step(progress, "Validating channel map...", 2)
+            self._validate_default_channel_map()
+        finally:
+            self._finish_progress(progress)
 
     def _update_data_preview(self):
         self.data_preview.setPlainText(self._data_preview_text())
@@ -23830,14 +24452,14 @@ class MainWindow(QMainWindow):
 
         if isinstance(self.raw_data, UnifiedMEAData):
             data = self.raw_data
-            channels = sorted(data.channels(), key=_channel_sort_key)
+            channels = list(data.channels())
             spike_counts = {channel: int(np.asarray(data.spikes.get(channel, [])).size) for channel in channels}
             total_spikes = sum(spike_counts.values())
-            _, max_time = data.time_range()
-            waveform_channels = sorted(data.waveforms.keys(), key=_channel_sort_key)
+            _min_time, max_time, sampled_time_range = _unified_time_range_preview(data)
+            waveform_channels = list(data.waveforms.keys())
             sorted_units = 0
             if isinstance(data.sorting, dict):
-                for channel in channels:
+                for channel in channels[:512]:
                     labels = _sorting_labels_for_raster(data, channel, spike_counts.get(channel, 0))
                     if labels is not None:
                         sorted_units += len([label for label in np.unique(labels) if int(label) != -1])
@@ -23845,11 +24467,11 @@ class MainWindow(QMainWindow):
             lines.extend(
                 [
                     f"Sampling rate: {data.sr:g} Hz" if data.sr else "Sampling rate: n/a",
-                    f"Duration: {max_time:.3f} s" if max_time else "Duration: n/a",
+                    f"Duration preview: {max_time:.3f} s{' (sampled)' if sampled_time_range else ''}" if max_time else "Duration: n/a",
                     f"Channels: {len(channels)}",
                     f"Total spikes: {total_spikes}",
                     f"Waveform channels: {len(waveform_channels)}",
-                    f"Sorted units: {sorted_units}",
+                    f"Sorted units preview: {sorted_units}{' (first 512 channels)' if len(channels) > 512 else ''}",
                 ]
             )
             if isinstance(data.meta, dict) and data.meta:
@@ -24064,22 +24686,25 @@ class MainWindow(QMainWindow):
     def preview_raw(self, _checked=False, *, channel_selected_callback=None, safe_window: bool = False):
         if self.raw_data is None:
             return None
-        self._ensure_processed_data_for_selected_records()
-        progress = self._start_progress("Preparing raster", "Preparing raster data...", 4)
+        progress = self._start_progress("Preparing raster", "Preparing selected-file cache...", 5)
         try:
+            self._progress_step(progress, "Preparing selected-file cache...", 1)
+            self._ensure_processed_data_for_selected_records()
             if self.data_kind == "nev":
-                self._progress_step(progress, "Building raster rows...", 1)
+                self._progress_step(progress, "Preparing channel map...", 2)
+                self._ensure_source_channel_map_ready("Preparing raster channel map")
+                self._progress_step(progress, "Building raster rows...", 2)
                 raster_series, has_units = _raster_series_from_unified(self.raw_data, include_noise=False)
-                self._progress_step(progress, "Attaching waveform data...", 2)
-                waveform_series = _raster_waveforms_from_unified(self.raw_data, include_noise=False)
-                self._progress_step(progress, "Creating raster window...", 3)
+                raw_data = self.raw_data
+                waveform_loader = lambda raw_data=raw_data: _raster_waveforms_from_unified(raw_data, include_noise=False)
+                self._progress_step(progress, "Creating raster window...", 4)
                 channel_groups = None
                 if isinstance(self.raw_data.meta, dict) and self.raw_data.meta.get("source") == "axion_spk":
                     channel_groups = _axion_raster_well_groups(raster_series)
                 window = SpikeRasterWindow(
                     "Raw Data Raster" if not has_units else "Raw Data Unit Raster",
                     raster_series,
-                    waveform_series,
+                    None,
                     self.raw_data.sr,
                     self,
                     y_axis_label="Unit" if has_units else "Channel",
@@ -24088,12 +24713,13 @@ class MainWindow(QMainWindow):
                     channel_groups=channel_groups,
                     channel_selected_callback=channel_selected_callback,
                     safe_window=bool(safe_window),
+                    lazy_waveform_loader=waveform_loader,
                 )
             else:
-                self._progress_step(progress, "Rendering array preview...", 2)
+                self._progress_step(progress, "Rendering array preview...", 3)
                 figure = Visualizer().plot_timeseries(self.raw_data)
                 window = PlotWindow("Raw Data Raster", figure, self)
-            self._progress_step(progress, "Opening raster window...", 4)
+            self._progress_step(progress, "Opening raster window...", 5)
         except Exception as exc:
             _show_error_message(self, "Preview failed", str(exc))
             return
@@ -24109,6 +24735,7 @@ class MainWindow(QMainWindow):
             self._log("Settings updated")
 
     def open_channel_map(self):
+        self._ensure_source_channel_map_ready("Preparing channel map")
         available_channels = _available_channels_for_data(self.raw_data, self.data_kind)
         dialog = ChannelMapDialog(self.channel_map, available_channels, self)
         if dialog.exec() == QDialog.Accepted:
@@ -24269,8 +24896,8 @@ class MainWindow(QMainWindow):
                 window = NevResultsWindow(self.raw_data, self)
                 self._progress_step(progress, "Building raster rows...", 1)
                 raster_series, has_units = _raster_series_from_unified(self.raw_data)
-                self._progress_step(progress, "Attaching waveform data...", 2)
-                waveform_series = _raster_waveforms_from_unified(self.raw_data)
+                raw_data = self.raw_data
+                waveform_loader = lambda raw_data=raw_data: _raster_waveforms_from_unified(raw_data)
                 self._progress_step(progress, "Creating raster window...", 3)
                 source = self.raw_data.meta.get("source", "") if isinstance(self.raw_data.meta, dict) else ""
                 prefix = "Axion SPK" if source == "axion_spk" else "NEV"
@@ -24278,13 +24905,14 @@ class MainWindow(QMainWindow):
                 raster = SpikeRasterWindow(
                     f"{prefix} Spike Raster" if not has_units else f"{prefix} Unit Raster",
                     raster_series,
-                    waveform_series,
+                    None,
                     self.raw_data.sr,
                     self,
                     y_axis_label="Unit" if has_units else "Channel",
                     channel_map=self.channel_map,
                     stim_times=self.raw_data.stim_times,
                     channel_groups=channel_groups,
+                    lazy_waveform_loader=waveform_loader,
                 )
                 self._progress_step(progress, "Opening result windows...", 5)
             except Exception as exc:
