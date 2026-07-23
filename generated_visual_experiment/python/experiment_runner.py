@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -34,11 +35,38 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
         raise ValueError("No experiment.blocks configured")
     recording_prefix = system_config.get("experiment", {}).get("recording_name_prefix") or system_config.get("experiment", {}).get("name", "recording")
     cfg_path = Path(system_config.get("electrode_map", {}).get("cfg_path", ""))
+    logging.info("Experiment start: run_dir=%s dry_run=%s blocks=%d cfg=%s", run_dir, dry_run, len(blocks), cfg_path)
+    audit.mark_event(
+        "experiment_config_loaded",
+        "",
+        "",
+        "",
+        extra={"run_dir": str(run_dir), "dry_run": dry_run, "block_count": len(blocks), "cfg_path": str(cfg_path)},
+    )
 
     if dry_run:
         logging.info("Dry run enabled: hardware calls skipped")
+        audit.mark_event("hardware_skipped_dry_run", "", "", "")
     else:
-        initialize_maxlab()
+        try:
+            audit.mark_event("cfg_preflight_start", "", "", "", extra={"cfg_path": str(cfg_path)})
+            preflight = _validate_cfg_stimulation_sites(cfg_path, blocks, groups, protocols)
+            logging.info(
+                "CFG preflight OK: cfg electrodes=%d requested stimulation electrodes=%d",
+                preflight["cfg_electrode_count"],
+                preflight["requested_electrode_count"],
+            )
+            audit.mark_event("cfg_preflight_ok", "", "", "", extra=preflight)
+            audit.mark_event("hardware_initialize_start", "", "", "")
+            initialize_maxlab()
+            audit.mark_event("hardware_initialize_done", "", "", "")
+            logging.info("MaxLab initialized")
+        except Exception as exc:
+            logging.exception("Experiment startup failed")
+            audit.mark_event("experiment_startup_failed", "", "", "", extra={"error": str(exc)})
+            audit.mark_event("experiment_end", "", "", "")
+            audit.save()
+            raise
 
     try:
         for block in blocks:
@@ -49,11 +77,45 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                 f"name: {block_name}\nelectrode_group: {block['electrode_group']}\nprotocol: {block['protocol']}\n",
                 encoding="utf-8",
             )
-            protocol = protocols[block["protocol"]]
-            electrode_group = groups[block["electrode_group"]]
-            electrode_group = _effective_electrode_group(protocol, electrode_group)
-            if not dry_run and protocol.get("type") != "poisson_random_electrodes":
-                configure_experiment_array(cfg_path, electrode_group, system_config)
+            protocol = protocols.get(block.get("protocol", ""), {})
+            electrode_group = groups.get(block.get("electrode_group", ""), {"name": "", "electrodes": []})
+            is_record_only = _block_has_record_only_stim(block)
+            logging.info(
+                "Block start: %s protocol=%s group=%s record_only=%s",
+                block_name,
+                block.get("protocol", ""),
+                block.get("electrode_group", ""),
+                is_record_only,
+            )
+            audit.mark_event(
+                "block_start",
+                block_name,
+                "",
+                "",
+                extra={
+                    "protocol": block.get("protocol", ""),
+                    "electrode_group": block.get("electrode_group", ""),
+                    "record_only": is_record_only,
+                },
+            )
+            if protocol and electrode_group:
+                electrode_group = _effective_electrode_group(protocol, electrode_group)
+                if not dry_run and protocol.get("type") != "poisson_random_electrodes" and not is_record_only:
+                    audit.mark_event(
+                        "array_configure_start",
+                        block_name,
+                        "",
+                        "",
+                        extra={
+                            "protocol": protocol.get("name", ""),
+                            "protocol_type": protocol.get("type", ""),
+                            "electrode_group": electrode_group.get("name", ""),
+                            "electrode_count": len(electrode_group.get("electrodes", [])),
+                        },
+                    )
+                    configure_experiment_array(cfg_path, electrode_group, system_config)
+                    audit.mark_event("array_configure_done", block_name, "", "")
+                    logging.info("Array configured: block=%s electrodes=%d", block_name, len(electrode_group.get("electrodes", [])))
 
             for phase in block.get("phases", []):
                 phase_id = phase["id"]
@@ -62,9 +124,10 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                 duration_s = int(phase.get("duration_s", 300))
                 segment_name = f"{recording_prefix}_{block_name}_{phase_id}"
                 segment_start = time.time()
+                logging.info("Phase start: block=%s phase=%s duration_s=%d segment=%s", block_name, phase_id, duration_s, segment_name)
                 audit.mark_event("record_start", block_name, phase_id, segment_name, epoch_sec=segment_start)
 
-                if phase_id == "02_stim":
+                if phase_id == "02_stim" and not _phase_is_record_only(phase):
                     _run_stim_phase(
                         cfg_path=cfg_path,
                         system_config=system_config,
@@ -80,15 +143,89 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                         dry_run=dry_run,
                     )
                 elif not dry_run:
+                    audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": phase.get("mode", "")})
                     saving = create_experiment_saving(phase_dir, segment_name)
                     time.sleep(duration_s)
                     saving.stop_recording()
                     saving.stop_file()
+                    audit.mark_event("recording_file_stop", block_name, phase_id, segment_name)
+                    logging.info("Recording-only phase saved: block=%s phase=%s", block_name, phase_id)
+                if phase_id == "02_stim" and _phase_is_record_only(phase):
+                    logging.info("Record-only stim phase: block=%s phase=%s pulse_count=0", block_name, phase_id)
+                    segment_log = SegmentStimLog(block_name, phase_id, segment_name, segment_start)
+                    segment_log.record_end_epoch = time.time()
+                    segment_log.save_txt(phase_dir / "stim_times.txt")
+                    segment_log.save_json(phase_dir / "segment_time_meta.json")
+                    audit.mark_event("stim_log_written", block_name, phase_id, segment_name, extra={"pulse_count": 0})
 
                 audit.mark_event("record_end", block_name, phase_id, segment_name)
+                logging.info("Phase end: block=%s phase=%s", block_name, phase_id)
+            audit.mark_event("block_end", block_name, "", "")
+            logging.info("Block end: %s", block_name)
     finally:
         audit.mark_event("experiment_end", "", "", "")
         audit.save()
+        logging.info("Experiment end: %s", run_dir)
+
+
+def _phase_is_record_only(phase: dict[str, Any]) -> bool:
+    return str(phase.get("mode", "")).strip().lower() in {"record_only", "recording_only", "no_stim", "none"}
+
+
+def _block_has_record_only_stim(block: dict[str, Any]) -> bool:
+    for phase in block.get("phases", []) or []:
+        if str(phase.get("id", "")) == "02_stim":
+            return _phase_is_record_only(phase)
+    return False
+
+
+def _validate_cfg_stimulation_sites(
+    cfg_path: Path,
+    blocks: list[dict[str, Any]],
+    groups: dict[str, dict[str, Any]],
+    protocols: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    cfg_electrodes = _cfg_recording_electrodes(cfg_path)
+    requested: list[int] = []
+    missing_references: list[str] = []
+    for block in blocks:
+        if _block_has_record_only_stim(block):
+            continue
+        block_name = str(block.get("name", ""))
+        protocol_name = str(block.get("protocol", ""))
+        group_name = str(block.get("electrode_group", ""))
+        protocol = protocols.get(protocol_name)
+        electrode_group = groups.get(group_name)
+        if protocol is None:
+            missing_references.append(f"{block_name}: protocol {protocol_name!r}")
+            continue
+        if electrode_group is None:
+            missing_references.append(f"{block_name}: electrode_group {group_name!r}")
+            continue
+        effective_group = _effective_electrode_group(protocol, electrode_group)
+        requested.extend(int(item) for item in effective_group.get("electrodes", []))
+    if missing_references:
+        raise RuntimeError("Invalid block references before experiment run: " + "; ".join(missing_references))
+    missing = sorted({electrode for electrode in requested if electrode not in cfg_electrodes})
+    if missing:
+        raise RuntimeError(
+            "Stimulation electrodes are not present in the cfg recording map: "
+            + ",".join(str(electrode) for electrode in missing)
+        )
+    return {
+        "cfg_electrode_count": len(cfg_electrodes),
+        "requested_electrode_count": len(set(requested)),
+    }
+
+
+def _cfg_recording_electrodes(cfg_path: Path) -> set[int]:
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
+    text = cfg_path.read_text(encoding="utf-8", errors="replace")
+    electrodes = {int(match) for match in re.findall(r"\b\d+\((\d+)\)", text)}
+    if not electrodes:
+        raise RuntimeError(f"No recording electrodes could be parsed from cfg_path: {cfg_path}")
+    return electrodes
 
 
 def _run_stim_phase(
@@ -105,16 +242,55 @@ def _run_stim_phase(
     segment_start: float,
     dry_run: bool,
 ) -> None:
+    protocol_type = str(protocol.get("type", ""))
+    protocol_name = str(protocol.get("name", ""))
+    source_group_name = str(electrode_group.get("name", ""))
+    source_electrode_count = len(electrode_group.get("electrodes", []))
+    logging.info(
+        "Stim phase prepare: block=%s protocol=%s type=%s group=%s electrodes=%d duration_s=%d",
+        block_name,
+        protocol_name,
+        protocol_type,
+        source_group_name,
+        source_electrode_count,
+        duration_s,
+    )
+    audit.mark_event(
+        "stim_phase_prepare",
+        block_name,
+        phase_id,
+        segment_name,
+        extra={
+            "protocol": protocol_name,
+            "protocol_type": protocol_type,
+            "electrode_group": source_group_name,
+            "electrode_count": source_electrode_count,
+            "duration_s": duration_s,
+        },
+    )
     if protocol.get("type") == "poisson_random_electrodes":
         filtered_group = dict(electrode_group)
         replacements: dict[int, int] = {}
         unresolved_electrodes: list[int] = []
         if not dry_run:
+            audit.mark_event("poisson_electrode_probe_start", block_name, phase_id, segment_name)
             filtered_group, replacements, unresolved_electrodes = _replace_unconnectable_poisson_electrodes(
                 cfg_path,
                 electrode_group,
                 system_config,
                 protocol,
+            )
+            audit.mark_event(
+                "poisson_electrode_probe_done",
+                block_name,
+                phase_id,
+                segment_name,
+                extra={
+                    "source_electrode_count": source_electrode_count,
+                    "effective_electrode_count": len(filtered_group.get("electrodes", [])),
+                    "replacement_count": len(replacements),
+                    "unresolved_count": len(unresolved_electrodes),
+                },
             )
             if replacements:
                 replacement_text = ",".join(f"{source}->{target}" for source, target in replacements.items())
@@ -146,6 +322,28 @@ def _run_stim_phase(
     else:
         plan_rows = []
         stim_times = get_stim_times_for_protocol(protocol, duration_s)
+    planned_electrodes = _planned_electrodes(plan_rows, electrode_group)
+    audit.mark_event(
+        "stim_plan_ready",
+        block_name,
+        phase_id,
+        segment_name,
+        extra={
+            "stim_count": len(stim_times),
+            "planned_electrode_count": len(planned_electrodes),
+            "first_stim_time_sec": min(stim_times) if stim_times else "",
+            "last_stim_time_sec": max(stim_times) if stim_times else "",
+        },
+    )
+    logging.info(
+        "Stim plan ready: block=%s protocol=%s pulses=%d electrodes=%d first=%s last=%s",
+        block_name,
+        protocol_name,
+        len(stim_times),
+        len(planned_electrodes),
+        min(stim_times) if stim_times else "",
+        max(stim_times) if stim_times else "",
+    )
     sequence_start_epoch = segment_start
     sequence_start_offset = 0.0
     if dry_run:
@@ -153,15 +351,39 @@ def _run_stim_phase(
         sequence_start_offset = _recording_settle_s(system_config, protocol)
         sequence_start_epoch = segment_start + sequence_start_offset
         logging.info("Dry run: %s %s pulses=%d", block_name, protocol.get("name"), len(stim_times))
+        audit.mark_event("stim_dry_run_complete", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
     else:
         if protocol.get("type") == "poisson_random_electrodes":
+            audit.mark_event(
+                "array_configure_start",
+                block_name,
+                phase_id,
+                segment_name,
+                extra={
+                    "protocol": protocol_name,
+                    "protocol_type": protocol_type,
+                    "electrode_count": len(filtered_group.get("electrodes", [])),
+                    "initial_connect": False,
+                },
+            )
             _array, stim_unit_by_electrode = configure_poisson_experiment_array(
                 cfg_path,
                 filtered_group,
                 system_config,
             )
+            audit.mark_event(
+                "array_configure_done",
+                block_name,
+                phase_id,
+                segment_name,
+                extra={"stim_unit_count": len(set(stim_unit_by_electrode.values()))},
+            )
+            logging.info("Poisson array configured: block=%s stim_units=%d", block_name, len(set(stim_unit_by_electrode.values())))
+        audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": "stimulation"})
         saving = create_experiment_saving(phase_dir, segment_name)
         record_start_epoch = time.time()
+        audit.mark_event("recording_file_started", block_name, phase_id, segment_name, epoch_sec=record_start_epoch)
+        logging.info("Recording started: block=%s phase=%s segment=%s", block_name, phase_id, segment_name)
         segment_log = SegmentStimLog(block_name, phase_id, segment_name, record_start_epoch)
         recording_settle_s = _recording_settle_s(system_config, protocol)
         if recording_settle_s > 0:
@@ -173,20 +395,11 @@ def _run_stim_phase(
                 extra={"recording_settle_s": recording_settle_s},
             )
             time.sleep(recording_settle_s)
+            audit.mark_event("recording_settle_done", block_name, phase_id, segment_name, extra={"recording_settle_s": recording_settle_s})
         if protocol.get("type") == "poisson_random_electrodes":
-            sequence_start_epoch = time.time()
-            sequence_start_offset = max(0.0, sequence_start_epoch - record_start_epoch)
-            audit.mark_event(
-                "stim_sequence_send",
-                block_name,
-                phase_id,
-                segment_name,
-                epoch_sec=sequence_start_epoch,
-                extra={"stim_count": len(stim_times)},
-            )
-            build_poisson_random_sequence(protocol, plan_rows, stim_unit_by_electrode).send()
-        else:
-            sequence = build_stim_sequence(protocol, electrode_group.get("name", ""))
+            audit.mark_event("stim_sequence_build_start", block_name, phase_id, segment_name, extra={"protocol_type": protocol_type})
+            sequence = build_poisson_random_sequence(protocol, plan_rows, stim_unit_by_electrode)
+            audit.mark_event("stim_sequence_build_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
             sequence_start_epoch = time.time()
             sequence_start_offset = max(0.0, sequence_start_epoch - record_start_epoch)
             audit.mark_event(
@@ -198,12 +411,41 @@ def _run_stim_phase(
                 extra={"stim_count": len(stim_times)},
             )
             sequence.send()
+            audit.mark_event("stim_sequence_send_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
+            logging.info("Stim sequence sent: block=%s protocol=%s pulses=%d", block_name, protocol_name, len(stim_times))
+        else:
+            audit.mark_event("stim_sequence_build_start", block_name, phase_id, segment_name, extra={"protocol_type": protocol_type})
+            sequence = build_stim_sequence(protocol, electrode_group.get("name", ""))
+            audit.mark_event("stim_sequence_build_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
+            sequence_start_epoch = time.time()
+            sequence_start_offset = max(0.0, sequence_start_epoch - record_start_epoch)
+            audit.mark_event(
+                "stim_sequence_send",
+                block_name,
+                phase_id,
+                segment_name,
+                epoch_sec=sequence_start_epoch,
+                extra={"stim_count": len(stim_times)},
+            )
+            sequence.send()
+            audit.mark_event("stim_sequence_send_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
+            logging.info("Stim sequence sent: block=%s protocol=%s pulses=%d", block_name, protocol_name, len(stim_times))
         elapsed_s = time.time() - record_start_epoch
         target_recording_s = duration_s + recording_settle_s
         if elapsed_s < target_recording_s:
+            audit.mark_event(
+                "recording_hold_start",
+                block_name,
+                phase_id,
+                segment_name,
+                extra={"remaining_s": round(target_recording_s - elapsed_s, 6), "target_recording_s": target_recording_s},
+            )
             time.sleep(target_recording_s - elapsed_s)
+            audit.mark_event("recording_hold_done", block_name, phase_id, segment_name, extra={"target_recording_s": target_recording_s})
         saving.stop_recording()
         saving.stop_file()
+        audit.mark_event("recording_file_stop", block_name, phase_id, segment_name)
+        logging.info("Recording stopped: block=%s phase=%s", block_name, phase_id)
 
     for index, stim_time in enumerate(stim_times, start=1):
         plan_row = plan_rows[index - 1] if plan_rows else {}
@@ -229,6 +471,34 @@ def _run_stim_phase(
     segment_log.record_end_epoch = time.time()
     segment_log.save_txt(phase_dir / "stim_times.txt")
     segment_log.save_json(phase_dir / "segment_time_meta.json")
+    audit.mark_event(
+        "stim_log_written",
+        block_name,
+        phase_id,
+        segment_name,
+        extra={
+            "pulse_count": len(stim_times),
+            "stim_times_path": str(phase_dir / "stim_times.txt"),
+            "segment_meta_path": str(phase_dir / "segment_time_meta.json"),
+        },
+    )
+    logging.info("Stim logs written: block=%s phase=%s pulses=%d", block_name, phase_id, len(stim_times))
+
+
+def _planned_electrodes(plan_rows: list[dict[str, Any]], electrode_group: dict[str, Any]) -> set[int]:
+    if not plan_rows:
+        return {int(item) for item in electrode_group.get("electrodes", [])}
+    electrodes: set[int] = set()
+    for row in plan_rows:
+        if "electrodes" in row:
+            values = row.get("electrodes")
+            if isinstance(values, str):
+                electrodes.update(int(float(token)) for token in values.replace(";", ",").split(",") if token.strip())
+            elif isinstance(values, (list, tuple)):
+                electrodes.update(int(value) for value in values)
+        elif "electrode" in row:
+            electrodes.add(int(row["electrode"]))
+    return electrodes
 
 
 def _recording_settle_s(system_config: dict[str, Any], protocol: dict[str, Any]) -> float:

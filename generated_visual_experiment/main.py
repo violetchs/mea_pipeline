@@ -78,17 +78,20 @@ def main() -> int:
     run_dir = data_root / time.strftime("%Y%m%d_%H%M%S_data")
     run_dir.mkdir(parents=True, exist_ok=False)
     configure_logging(run_dir)
+    logging.info("Run directory created: %s", run_dir)
 
     try:
         cfg_path = Path(system_config.get("electrode_map", {}).get("cfg_path", ""))
-        if cfg_path.exists():
-            shutil.copy(cfg_path, run_dir / time.strftime("%Hh%Mm%Ss.cfg"))
-        elif not args.dry_run:
-            logging.warning("cfg_path does not exist: %s", cfg_path)
+        if not cfg_path.is_file():
+            raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
+        cfg_copy_path = run_dir / time.strftime("%Hh%Mm%Ss.cfg")
+        shutil.copy(cfg_path, cfg_copy_path)
+        logging.info("CFG copied: %s -> %s", cfg_path, cfg_copy_path)
         snapshot = run_dir / "config_snapshot"
         snapshot.mkdir(exist_ok=True)
         shutil.copy(system_path, snapshot / "system.yaml")
         shutil.copy(stimulation_path, snapshot / "stimulation.yaml")
+        logging.info("Config snapshot saved: %s", snapshot)
         run_experiment(system_config, stimulation_config, run_dir, dry_run=args.dry_run)
         print(run_dir.resolve())
         return 0

@@ -2,6 +2,7 @@
 
 import copy
 import colorsys
+import datetime as dt
 import json
 import os
 import re
@@ -48,6 +49,7 @@ try:
         QSpacerItem,
         QSizePolicy,
         QSlider,
+        QSplitter,
         QSpinBox,
         QDoubleSpinBox,
         QStackedWidget,
@@ -970,33 +972,6 @@ def _density_burst_intervals(spikes: np.ndarray, min_duration_s: float, min_spik
             merged.append((start_s, stop_s))
     return merged
 
-
-def _burst_sequence_payload(spike_series, burst_intervals):
-    labels = np.asarray([label for label, _ in spike_series], dtype=object)
-    intervals = np.asarray(
-        [(float(start), float(stop)) for start, stop in burst_intervals if float(stop) > float(start)],
-        dtype=float,
-    ).reshape(-1, 2)
-    relative_spike_times = np.empty((intervals.shape[0], labels.size), dtype=object)
-
-    for burst_index, (start_s, stop_s) in enumerate(intervals):
-        for row_index, (_, times) in enumerate(spike_series):
-            spike_times = np.asarray(times, dtype=float)
-            lo = int(np.searchsorted(spike_times, start_s, side="left"))
-            hi = int(np.searchsorted(spike_times, stop_s, side="right"))
-            relative_spike_times[burst_index, row_index] = (spike_times[lo:hi] - start_s).astype(np.float64)
-
-    return {
-        "format": "mea_pipeline_burst_sequences_v1",
-        "time_unit": "seconds",
-        "labels": labels,
-        "burst_intervals_s": intervals,
-        "relative_spike_times_s": relative_spike_times,
-        "burst_count": int(intervals.shape[0]),
-        "row_count": int(labels.size),
-    }
-
-
 def _stim_tail_keep_mask(times: np.ndarray, stim_times: np.ndarray, window_s: float) -> np.ndarray:
     values = np.asarray(times, dtype=float)
     events = np.asarray(stim_times, dtype=float)
@@ -1029,539 +1004,6 @@ def _filter_spike_series_stim_tail(spike_series, stim_times, window_ms: float):
         removed += int(values.size - np.count_nonzero(keep))
         filtered.append((label, values[keep]))
     return filtered, masks, removed
-
-
-def _burst_delay_channel_series(spike_series, max_channels: int | None = None):
-    channel_chunks: dict[str, list[np.ndarray]] = {}
-    for label, times in spike_series:
-        text = str(label)
-        if " noise" in text.lower():
-            continue
-        channel = _base_channel_from_raster_label(text)
-        values = np.asarray(times, dtype=float)
-        values = values[np.isfinite(values)]
-        if values.size:
-            channel_chunks.setdefault(channel, []).append(values)
-
-    channel_series = []
-    for channel, chunks in channel_chunks.items():
-        merged = np.unique(np.concatenate(chunks)) if len(chunks) > 1 else np.unique(chunks[0])
-        if merged.size:
-            channel_series.append((channel, merged))
-    channel_series.sort(key=lambda item: (-item[1].size, _channel_sort_key(item[0])))
-    if max_channels is not None and int(max_channels) > 0:
-        channel_series = channel_series[: max(2, int(max_channels))]
-    return [channel for channel, _ in channel_series], [times for _, times in channel_series]
-
-
-def _burst_delay_limited_intervals(burst_intervals, burst_window_ms: float = 0.0):
-    window_s = max(0.0, float(burst_window_ms)) / 1000.0
-    intervals = []
-    for start, stop in burst_intervals:
-        start_s = float(start)
-        stop_s = float(stop)
-        if window_s > 0:
-            stop_s = min(stop_s, start_s + window_s)
-        if stop_s > start_s:
-            intervals.append((start_s, stop_s))
-    return intervals
-
-
-def _burst_delay_first_spike_matrix(spike_series, burst_intervals, max_channels: int | None = None, burst_window_ms: float = 0.0):
-    channels, channel_trains = _burst_delay_channel_series(spike_series, max_channels)
-    channel_series = list(zip(channels, channel_trains))
-
-    intervals = _burst_delay_limited_intervals(burst_intervals, burst_window_ms)
-    first_times = np.full((len(intervals), len(channel_series)), np.nan, dtype=np.float64)
-    for burst_index, (start_s, stop_s) in enumerate(intervals):
-        for channel_index, (_, times) in enumerate(channel_series):
-            lo = int(np.searchsorted(times, start_s, side="left"))
-            if lo < times.size and times[lo] <= stop_s:
-                first_times[burst_index, channel_index] = float(times[lo] - start_s)
-    return [channel for channel, _ in channel_series], intervals, first_times
-
-
-def _source_interval_delay_matches(
-    source_times: np.ndarray,
-    target_times: np.ndarray,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float = 0.0,
-    intervals: list[tuple[float, float]] | None = None,
-):
-    source_times = np.asarray(source_times, dtype=float)
-    target_times = np.asarray(target_times, dtype=float)
-    source_times = np.sort(source_times[np.isfinite(source_times)])
-    target_times = np.sort(target_times[np.isfinite(target_times)])
-    if source_times.size == 0 or target_times.size == 0 or (intervals is None and source_times.size < 2):
-        return np.zeros((0, 3), dtype=float)
-
-    source_starts, source_nexts, row_ids = _source_interval_candidates(source_times, intervals)
-    return _source_interval_delay_matches_from_candidates(
-        source_starts,
-        source_nexts,
-        row_ids,
-        target_times,
-        max_abs_delay_ms,
-        min_abs_delay_ms,
-    )
-
-
-def _source_interval_candidates(
-    source_times: np.ndarray,
-    intervals: list[tuple[float, float]] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    source_times = np.asarray(source_times, dtype=float)
-    source_times = np.sort(source_times[np.isfinite(source_times)])
-    if source_times.size < 2:
-        if intervals is None or source_times.size == 0:
-            empty = np.array([], dtype=float)
-            return empty, empty, empty.astype(int)
-
-    if intervals is None:
-        return source_times[:-1], source_times[1:], np.zeros(source_times.size - 1, dtype=int)
-
-    start_chunks = []
-    next_chunks = []
-    row_chunks = []
-    for row_index, (start_s, stop_s) in enumerate(intervals):
-        start_s = float(start_s)
-        stop_s = float(stop_s)
-        if stop_s <= start_s:
-            continue
-        lo = int(np.searchsorted(source_times, start_s, side="left"))
-        hi = int(np.searchsorted(source_times, stop_s, side="right"))
-        local_source = source_times[lo:hi]
-        if local_source.size == 0:
-            continue
-        next_sources = np.empty(local_source.size, dtype=float)
-        if local_source.size > 1:
-            next_sources[:-1] = local_source[1:]
-        next_sources[-1] = stop_s
-        start_chunks.append(local_source)
-        next_chunks.append(next_sources)
-        row_chunks.append(np.full(local_source.size, int(row_index), dtype=int))
-
-    if not start_chunks:
-        empty = np.array([], dtype=float)
-        return empty, empty, empty.astype(int)
-    return np.concatenate(start_chunks), np.concatenate(next_chunks), np.concatenate(row_chunks)
-
-
-def _source_interval_delay_matches_from_candidates(
-    source_starts: np.ndarray,
-    source_nexts: np.ndarray,
-    row_ids: np.ndarray,
-    target_times: np.ndarray,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float = 0.0,
-) -> np.ndarray:
-    source_starts = np.asarray(source_starts, dtype=float)
-    source_nexts = np.asarray(source_nexts, dtype=float)
-    row_ids = np.asarray(row_ids, dtype=int)
-    target_times = np.asarray(target_times, dtype=float)
-    target_times = np.sort(target_times[np.isfinite(target_times)])
-    if source_starts.size == 0 or target_times.size == 0:
-        return np.zeros((0, 3), dtype=float)
-
-    max_delay_s = max(0.0, float(max_abs_delay_ms)) / 1000.0
-    min_delay_s = max(0.0, float(min_abs_delay_ms)) / 1000.0
-    target_positions = np.searchsorted(target_times, source_starts, side="right")
-    valid = target_positions < target_times.size
-    if not np.any(valid):
-        return np.zeros((0, 3), dtype=float)
-
-    source_candidates = source_starts[valid]
-    next_sources = source_nexts[valid]
-    row_candidates = row_ids[valid]
-    target_candidates = target_times[target_positions[valid]]
-    delays_s = target_candidates - source_candidates
-    valid_delays = (target_candidates < next_sources) & (delays_s >= min_delay_s)
-    if max_delay_s > 0:
-        valid_delays &= delays_s <= max_delay_s
-    if not np.any(valid_delays):
-        return np.zeros((0, 3), dtype=float)
-    return np.column_stack(
-        [
-            source_candidates[valid_delays],
-            target_candidates[valid_delays],
-            row_candidates[valid_delays].astype(float, copy=False),
-        ]
-    ).astype(float, copy=False)
-
-
-def _source_interval_delay_values(
-    source_times: np.ndarray,
-    target_times: np.ndarray,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float = 0.0,
-    intervals: list[tuple[float, float]] | None = None,
-) -> np.ndarray:
-    matches = _source_interval_delay_matches(source_times, target_times, max_abs_delay_ms, min_abs_delay_ms, intervals)
-    if matches.size == 0:
-        return np.array([], dtype=float)
-    return ((matches[:, 1] - matches[:, 0]) * 1000.0).astype(float, copy=False)
-
-
-def _burst_delay_pair_values(
-    first_times: np.ndarray,
-    reference_index: int,
-    target_index: int,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float = 0.0,
-):
-    if first_times.ndim != 2 or first_times.shape[0] == 0:
-        return np.array([], dtype=float)
-    delays_ms = (first_times[:, target_index] - first_times[:, reference_index]) * 1000.0
-    delays_ms = delays_ms[np.isfinite(delays_ms)]
-    min_delay = max(0.0, float(min_abs_delay_ms))
-    if min_delay > 0:
-        delays_ms = delays_ms[np.abs(delays_ms) >= min_delay]
-    if max_abs_delay_ms > 0:
-        delays_ms = delays_ms[np.abs(delays_ms) <= float(max_abs_delay_ms)]
-    return delays_ms.astype(float, copy=False)
-
-
-BURST_DELAY_TABLE_ROW_LIMIT = 1000
-BURST_DELAY_COMBO_CHANNEL_LIMIT = 1200
-BURST_DELAY_DEFAULT_CHANNEL_LIMIT = 256
-BURST_DELAY_MAX_ACTIVE_PER_BURST = 384
-
-
-def _burst_delay_all_pair_values(
-    first_times: np.ndarray,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float = 0.0,
-    max_values: int = 250000,
-):
-    if first_times.ndim != 2 or first_times.shape[1] < 2:
-        return np.array([], dtype=float)
-    max_lag_s = max(1.0, float(max_abs_delay_ms)) / 1000.0
-    min_lag_s = max(0.0, float(min_abs_delay_ms)) / 1000.0
-    max_values = max(1, int(max_values))
-    chunks = []
-    collected = 0
-    participation = np.count_nonzero(np.isfinite(first_times), axis=0)
-    for burst_times in np.asarray(first_times, dtype=float):
-        active = np.flatnonzero(np.isfinite(burst_times))
-        if active.size < 2:
-            continue
-        if active.size > BURST_DELAY_MAX_ACTIVE_PER_BURST:
-            order = np.argsort(participation[active], kind="mergesort")[::-1]
-            active = active[order[:BURST_DELAY_MAX_ACTIVE_PER_BURST]]
-        order = np.argsort(burst_times[active], kind="mergesort")
-        sorted_times = burst_times[active][order]
-        right_edge = 1
-        for left_pos, left_time in enumerate(sorted_times[:-1]):
-            if collected >= max_values:
-                break
-            right_edge = max(right_edge, left_pos + 1)
-            while right_edge < sorted_times.size and sorted_times[right_edge] - left_time <= max_lag_s:
-                right_edge += 1
-            if right_edge <= left_pos + 1:
-                continue
-            delays_ms = (sorted_times[left_pos + 1 : right_edge] - left_time) * 1000.0
-            if min_lag_s > 0:
-                delays_ms = delays_ms[delays_ms >= min_lag_s * 1000.0]
-                if delays_ms.size == 0:
-                    continue
-            remaining = max_values - collected
-            if delays_ms.size > remaining:
-                delays_ms = delays_ms[_display_indices(delays_ms.size, remaining)]
-            chunks.append(delays_ms.astype(float, copy=False))
-            collected += int(delays_ms.size)
-        if collected >= max_values:
-            break
-    if not chunks:
-        return np.array([], dtype=float)
-    values = np.concatenate(chunks)
-    if values.size > max_values:
-        values = values[_display_indices(values.size, max_values)]
-    return values.astype(float, copy=False)
-
-
-def _burst_delay_aligned_pairs(
-    channels,
-    first_times: np.ndarray,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float,
-    bin_ms: float,
-    min_peak_count: int,
-    min_peak_fraction: float,
-    min_peak_to_background: float,
-    cancel_check=None,
-    progress_callback=None,
-):
-    if first_times.ndim != 2 or first_times.shape[1] < 2 or not channels:
-        return []
-    max_lag = max(1.0, float(max_abs_delay_ms))
-    min_lag = max(0.0, float(min_abs_delay_ms))
-    bin_width = max(0.1, float(bin_ms))
-    channel_count = min(len(channels), first_times.shape[1])
-    if channel_count < 2:
-        return []
-
-    participation = np.count_nonzero(np.isfinite(first_times[:, :channel_count]), axis=0)
-    eligible = np.flatnonzero(participation >= max(1, int(min_peak_count)))
-    if eligible.size < 2:
-        return []
-
-    if eligible.size < channel_count:
-        local_times = first_times[:, eligible]
-        local_to_original = eligible.astype(int, copy=False)
-        local_participation = participation[eligible]
-    else:
-        local_times = first_times[:, :channel_count]
-        local_to_original = np.arange(channel_count, dtype=int)
-        local_participation = participation[:channel_count]
-
-    max_lag_s = max_lag / 1000.0
-    bin_count = max(1, int(np.floor((2.0 * max_lag) / bin_width)) + 1)
-    pair_total: dict[tuple[int, int], int] = {}
-    pair_bins: dict[tuple[int, int], dict[int, int]] = {}
-    pair_bin_sums: dict[tuple[tuple[int, int], int], float] = {}
-    pair_bin_sumsq: dict[tuple[tuple[int, int], int], float] = {}
-    truncated_bursts = 0
-
-    for burst_index, burst_times in enumerate(np.asarray(local_times, dtype=float)):
-        if burst_index % 4 == 0:
-            if cancel_check is not None and cancel_check():
-                raise InterruptedError("Burst delay analysis cancelled")
-            if progress_callback is not None:
-                progress = 35 + int(55 * burst_index / max(1, local_times.shape[0]))
-                progress_callback(min(94, progress), "Scanning burst-local delay candidates...")
-        active_local = np.flatnonzero(np.isfinite(burst_times))
-        if active_local.size < 2:
-            continue
-        if active_local.size > BURST_DELAY_MAX_ACTIVE_PER_BURST:
-            order = np.argsort(local_participation[active_local], kind="mergesort")[::-1]
-            active_local = active_local[order[:BURST_DELAY_MAX_ACTIVE_PER_BURST]]
-            truncated_bursts += 1
-        order = np.argsort(burst_times[active_local], kind="mergesort")
-        active_local = active_local[order]
-        sorted_times = burst_times[active_local]
-        right_edge = 1
-        for left_pos, left_time in enumerate(sorted_times[:-1]):
-            right_edge = max(right_edge, left_pos + 1)
-            while right_edge < sorted_times.size and sorted_times[right_edge] - left_time <= max_lag_s:
-                right_edge += 1
-            if right_edge <= left_pos + 1:
-                continue
-            earlier_original = int(local_to_original[active_local[left_pos]])
-            later_originals = local_to_original[active_local[left_pos + 1 : right_edge]]
-            delays_ms = (sorted_times[left_pos + 1 : right_edge] - left_time) * 1000.0
-            for later_original, delay_ms in zip(later_originals, delays_ms):
-                later_original = int(later_original)
-                if earlier_original == later_original:
-                    continue
-                low = min(earlier_original, later_original)
-                high = max(earlier_original, later_original)
-                signed_delay = float(delay_ms if earlier_original == low else -delay_ms)
-                if not np.isfinite(signed_delay) or abs(signed_delay) < min_lag or abs(signed_delay) > max_lag:
-                    continue
-                bin_index = int(np.floor((signed_delay + max_lag) / bin_width + 0.5))
-                bin_index = max(0, min(bin_count - 1, bin_index))
-                pair_key = (low, high)
-                pair_total[pair_key] = pair_total.get(pair_key, 0) + 1
-                counts = pair_bins.setdefault(pair_key, {})
-                counts[bin_index] = counts.get(bin_index, 0) + 1
-                stats_key = (pair_key, bin_index)
-                pair_bin_sums[stats_key] = pair_bin_sums.get(stats_key, 0.0) + signed_delay
-                pair_bin_sumsq[stats_key] = pair_bin_sumsq.get(stats_key, 0.0) + signed_delay * signed_delay
-
-    if cancel_check is not None and cancel_check():
-        raise InterruptedError("Burst delay analysis cancelled")
-
-    results = []
-    for pair_key, counts_by_bin in pair_bins.items():
-        if not counts_by_bin:
-            continue
-        peak_index, peak_count = max(counts_by_bin.items(), key=lambda item: (item[1], -abs(item[0])))
-        peak_count = int(peak_count)
-        if peak_count < int(min_peak_count):
-            continue
-        total_count = int(pair_total.get(pair_key, peak_count))
-        non_peak_counts = [count for index, count in counts_by_bin.items() if index != peak_index]
-        zero_bins = max(0, bin_count - 1 - len(non_peak_counts))
-        if zero_bins:
-            non_peak_counts.extend([0] * min(zero_bins, 32))
-        background = float(np.median(non_peak_counts)) if non_peak_counts else 0.0
-        background = max(background, 0.5)
-        peak_fraction = float(peak_count) / float(max(1, total_count))
-        peak_to_background = float(peak_count) / background
-        if peak_fraction < float(min_peak_fraction):
-            continue
-        if peak_to_background < float(min_peak_to_background):
-            continue
-        delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
-        delay_window_count = int(sum(counts_by_bin.get(index, 0) for index in delay_window_indices))
-        delay_window_sum = float(
-            sum(pair_bin_sums.get((pair_key, index), 0.0) for index in delay_window_indices)
-        )
-        signed_delay = delay_window_sum / float(max(1, delay_window_count))
-        if signed_delay == 0.0:
-            signed_delay = -max_lag + float(peak_index) * bin_width
-        if signed_delay <= 0:
-            output_reference, output_target = pair_key[1], pair_key[0]
-            output_delay_ms = -signed_delay
-        else:
-            output_reference, output_target = pair_key[0], pair_key[1]
-            output_delay_ms = signed_delay
-        if output_delay_ms <= 0:
-            continue
-        sumsq = float(sum(pair_bin_sumsq.get((pair_key, index), 0.0) for index in delay_window_indices))
-        variance = max(0.0, sumsq / float(max(1, delay_window_count)) - signed_delay * signed_delay)
-        results.append(
-            {
-                "reference_index": int(output_reference),
-                "target_index": int(output_target),
-                "reference": str(channels[output_reference]),
-                "target": str(channels[output_target]),
-                "delay_ms": float(output_delay_ms),
-                "peak_center_ms": abs(float(-max_lag + float(peak_index) * bin_width)),
-                "peak_count": peak_count,
-                "delay_window_count": delay_window_count,
-                "total_count": total_count,
-                "peak_fraction": peak_fraction,
-                "peak_to_background": peak_to_background,
-                "background_count": background,
-                "std_ms": float(np.sqrt(variance)),
-                "truncated_bursts": int(truncated_bursts),
-            }
-        )
-    return sorted(
-        results,
-        key=lambda item: (
-            -float(item["peak_count"]),
-            -float(item["peak_fraction"]),
-            -float(item["peak_to_background"]),
-            abs(float(item["delay_ms"])),
-            item["reference"],
-            item["target"],
-        ),
-    )
-
-
-def _spike_train_delay_aligned_pairs(
-    channels,
-    channel_trains,
-    intervals: list[tuple[float, float]] | None,
-    max_abs_delay_ms: float,
-    min_abs_delay_ms: float,
-    bin_ms: float,
-    min_peak_count: int,
-    min_peak_fraction: float,
-    min_peak_to_background: float,
-    cancel_check=None,
-    progress_callback=None,
-    mode: str = "burst_all",
-):
-    if len(channels) < 2 or len(channel_trains) < 2:
-        return []
-    max_lag = max(1.0, float(max_abs_delay_ms))
-    min_lag = max(0.0, float(min_abs_delay_ms))
-    bin_width = max(0.1, float(bin_ms))
-    bin_count = max(1, int(np.floor(max_lag / bin_width)) + 1)
-    train_count = min(len(channels), len(channel_trains))
-    results = []
-    train_lengths = np.asarray([np.asarray(channel_trains[index]).size for index in range(train_count)], dtype=int)
-    eligible_indices = np.flatnonzero(train_lengths >= max(2, int(min_peak_count)))
-    if eligible_indices.size < 2:
-        return []
-    total_pairs = max(1, int(eligible_indices.size) * max(0, int(eligible_indices.size) - 1))
-    scanned = 0
-    source_candidates_by_index = {
-        int(index): _source_interval_candidates(
-            channel_trains[int(index)],
-            intervals,
-        )
-        for index in eligible_indices
-    }
-
-    for reference_index in eligible_indices:
-        reference_index = int(reference_index)
-        source_starts, source_nexts, row_ids = source_candidates_by_index[reference_index]
-        if source_starts.size == 0:
-            scanned += max(0, int(eligible_indices.size) - 1)
-            continue
-        for target_index in eligible_indices:
-            target_index = int(target_index)
-            if reference_index == target_index:
-                continue
-            scanned += 1
-            if scanned % 64 == 0:
-                if cancel_check is not None and cancel_check():
-                    raise InterruptedError("Burst delay analysis cancelled")
-                if progress_callback is not None:
-                    progress = 35 + int(55 * scanned / total_pairs)
-                    progress_callback(min(94, progress), "Scanning source-target spike train delays...")
-            matches = _source_interval_delay_matches_from_candidates(
-                source_starts,
-                source_nexts,
-                row_ids,
-                channel_trains[target_index],
-                max_lag,
-                min_lag,
-            )
-            if matches.size == 0:
-                continue
-            values = ((matches[:, 1] - matches[:, 0]) * 1000.0).astype(float, copy=False)
-            if values.size == 0:
-                continue
-            bin_indices = np.floor(values / bin_width + 0.5).astype(int)
-            bin_indices = np.clip(bin_indices, 0, bin_count - 1)
-            counts = np.bincount(bin_indices, minlength=bin_count)
-            peak_index = int(np.argmax(counts))
-            peak_count = int(counts[peak_index])
-            if peak_count < int(min_peak_count):
-                continue
-            total_count = int(values.size)
-            non_peak_counts = [int(count) for index, count in enumerate(counts) if index != peak_index]
-            background = float(np.median(non_peak_counts)) if non_peak_counts else 0.0
-            background = max(background, 0.5)
-            peak_fraction = float(peak_count) / float(max(1, total_count))
-            peak_to_background = float(peak_count) / background
-            if peak_fraction < float(min_peak_fraction):
-                continue
-            if peak_to_background < float(min_peak_to_background):
-                continue
-            delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
-            window_mask = np.isin(bin_indices, list(delay_window_indices))
-            window_values = values[window_mask]
-            delay_ms = float(np.mean(window_values)) if window_values.size else float(peak_index * bin_width)
-            if delay_ms <= 0:
-                continue
-            results.append(
-                {
-                    "reference_index": int(reference_index),
-                    "target_index": int(target_index),
-                    "reference": str(channels[reference_index]),
-                    "target": str(channels[target_index]),
-                    "delay_ms": delay_ms,
-                    "peak_center_ms": float(peak_index * bin_width),
-                    "peak_count": peak_count,
-                    "delay_window_count": int(window_values.size),
-                    "total_count": total_count,
-                    "peak_fraction": peak_fraction,
-                    "peak_to_background": peak_to_background,
-                    "background_count": background,
-                    "std_ms": float(np.std(window_values)) if window_values.size else 0.0,
-                    "truncated_bursts": 0,
-                    "mode": mode,
-                }
-            )
-
-    return sorted(
-        results,
-        key=lambda item: (
-            -float(item["peak_count"]),
-            -float(item["peak_fraction"]),
-            -float(item["peak_to_background"]),
-            abs(float(item["delay_ms"])),
-            item["reference"],
-            item["target"],
-        ),
-    )
-
 
 def _channel_map_positions(channel_map: ChannelMap | None):
     if channel_map is None:
@@ -1910,86 +1352,6 @@ def _non_overlapping_spike_windows(spike_series, window_ms: float) -> list[tuple
         return [(start_s, start_s + window_s)]
     count = max(1, int(np.ceil((stop_s - start_s) / window_s)))
     return [(start_s + index * window_s, start_s + (index + 1) * window_s) for index in range(count)]
-
-
-def _burst_correlation_analysis(
-    spike_series,
-    burst_intervals,
-    time_bin_ms: float = 5.0,
-    window_ms: float = 0.0,
-    normalization: str = "per_burst",
-    method: str = "template",
-    channel_map: ChannelMap | None = None,
-    cluster_count: int = 3,
-    embedding_method: str = "pca",
-    dtw_warp_bins: int = 2,
-    latency_window_ms: float = 0.0,
-    graph_window_ms: float = 10.0,
-    block_threshold: float = 0.45,
-):
-    labels, intervals, activity = _burst_activity_matrix(spike_series, burst_intervals, time_bin_ms, window_ms)
-    burst_count = activity.shape[0]
-    method = str(method or "template").lower()
-    if burst_count < 2:
-        return {
-            "labels": labels,
-            "intervals": intervals,
-            "activity": activity,
-            "features": activity.reshape((burst_count, -1)) if activity.ndim == 3 else activity,
-            "correlation": np.zeros((burst_count, burst_count), dtype=float),
-            "order": np.arange(burst_count, dtype=int),
-            "groups": np.ones(burst_count, dtype=int),
-            "time_bin_ms": float(time_bin_ms),
-            "window_ms": float(window_ms),
-            "method": method,
-            "block_threshold": float(block_threshold),
-        }
-
-    if method == "global_stats":
-        features = _burst_global_stat_features(spike_series, intervals, time_bin_ms)
-    elif method == "latency":
-        features = _burst_latency_features(spike_series, intervals, latency_window_ms)
-    elif method == "spatial":
-        spatial = _burst_spatial_activity_matrix(spike_series, intervals, channel_map, time_bin_ms, window_ms)
-        features = np.log1p(spatial.reshape((burst_count, -1)))
-    elif method == "dtw":
-        features = np.log1p(activity)
-    elif method == "graph":
-        features = _burst_propagation_graph_features(spike_series, intervals, graph_window_ms)
-    else:
-        features = np.log1p(activity.reshape((burst_count, -1)))
-
-    if method == "dtw":
-        correlation, order, groups = _dtw_correlation_order_groups(features, int(dtw_warp_bins), float(block_threshold))
-        flat_features = features.reshape((burst_count, -1))
-    else:
-        flat_features = features.reshape((burst_count, -1)) if features.ndim > 2 else np.asarray(features, dtype=float)
-        flat_features = _normalize_burst_features(flat_features, normalization)
-        correlation = _feature_correlation(flat_features)
-        if method == "template":
-            groups = _kmeans_groups(flat_features, cluster_count)
-            order = np.lexsort((np.arange(burst_count), groups))
-        elif method == "embedding":
-            embedding = _burst_embedding(flat_features, embedding_method)
-            groups = _kmeans_groups(embedding, cluster_count)
-            order = np.lexsort((np.arange(burst_count), groups))
-        else:
-            order, groups = _correlation_order_groups(correlation, float(block_threshold))
-
-    return {
-        "labels": labels,
-        "intervals": intervals,
-        "activity": activity,
-        "features": flat_features,
-        "correlation": correlation,
-        "order": order,
-        "groups": groups,
-        "time_bin_ms": float(time_bin_ms),
-        "window_ms": float(window_ms),
-        "method": method,
-        "block_threshold": float(block_threshold),
-    }
-
 
 def _normalize_burst_features(features: np.ndarray, normalization: str) -> np.ndarray:
     mode = str(normalization or "per_burst").lower()
@@ -10120,2038 +9482,6 @@ class ElectrodeHeatmapCanvas(QWidget):
             rgb[mask] = left[1:] + (right[1:] - left[1:]) * fraction[:, None]
         return np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
 
-    def render_counts_rgb(self, counts: dict[str, int], resolution: int = 320, scale_max_count: int = 0) -> np.ndarray:
-        normalized, well_counts = self._normalize_count_payload(counts)
-        active_counts = dict(counts)
-        if not active_counts:
-            active_counts = well_counts[sorted(well_counts)[0]] if well_counts else normalized
-        max_count = max(0, int(scale_max_count)) or max(active_counts.values(), default=0)
-        resolution = max(32, int(resolution))
-        if self.channel_map is None or max_count <= 0:
-            return np.zeros((resolution, resolution, 3), dtype=np.uint8)
-        field = self._continuous_heatmap_field(active_counts, max_count, resolution)
-        if not np.any(field > 0):
-            field = self._fallback_heatmap_field(active_counts, max_count, resolution)
-        return self._heatmap_field_rgb(field)
-
-
-class IBIWindow(AppDialog):
-    def __init__(self, burst_intervals, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Inter-burst Interval")
-        self.resize(760, 520)
-        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
-        self.bin_ms = QSpinBox()
-        self.bin_ms.setRange(10, 60000)
-        self.bin_ms.setSingleStep(10)
-        self.bin_ms.setValue(300)
-        self.bin_ms.setSuffix(" ms")
-        self.bin_ms.valueChanged.connect(self._draw)
-        self.canvas = FigureCanvas(Figure(figsize=(7, 4), tight_layout=True))
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("IBI bin"))
-        controls.addWidget(self.bin_ms)
-        controls.addStretch()
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
-        layout.addWidget(self.canvas, 1)
-        self._draw()
-        _fix_spinbox_hit_targets(self)
-
-    def _draw(self):
-        figure = self.canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        if len(self.burst_intervals) < 2:
-            ax.text(0.5, 0.5, "Need at least two detected bursts", ha="center", va="center")
-        else:
-            burst_starts = np.asarray([start for start, _ in self.burst_intervals], dtype=float)
-            ibis_ms = np.diff(burst_starts) * 1000.0
-            bin_ms = max(1.0, float(self.bin_ms.value()))
-            max_ibi = max(bin_ms, float(np.nanmax(ibis_ms)))
-            bins = np.arange(0.0, max_ibi + bin_ms * 1.5, bin_ms)
-            ax.hist(ibis_ms, bins=bins, color="#ef4444", alpha=0.78, edgecolor="#991b1b")
-            ax.set_title("Overall inter-burst intervals")
-            ax.set_xlabel("IBI (ms)")
-            ax.set_ylabel("Count")
-        self.canvas.draw_idle()
-
-
-class ISIWindow(AppDialog):
-    def __init__(self, spike_series, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Inter-spike Interval")
-        self.resize(760, 520)
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
-        self.spike_lookup = {label: times for label, times in self.spike_series}
-        self.unit_combo = NoWheelComboBox()
-        self.unit_combo.addItems([label for label, _ in self.spike_series])
-        self.unit_combo.currentIndexChanged.connect(self._draw)
-        self.bin_ms = QSpinBox()
-        self.bin_ms.setRange(1, 1000)
-        self.bin_ms.setSingleStep(1)
-        self.bin_ms.setValue(50)
-        self.bin_ms.setSuffix(" ms")
-        self.bin_ms.valueChanged.connect(self._draw)
-        self.canvas = FigureCanvas(Figure(figsize=(7, 4), tight_layout=True))
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Unit"))
-        controls.addWidget(self.unit_combo, 1)
-        controls.addWidget(QLabel("ISI bin"))
-        controls.addWidget(self.bin_ms)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
-        layout.addWidget(self.canvas, 1)
-        self._draw()
-        _fix_spinbox_hit_targets(self)
-
-    def _draw(self):
-        figure = self.canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        unit = self.unit_combo.currentText()
-        times = np.asarray(self.spike_lookup.get(unit, []), dtype=float)
-        if times.size < 2:
-            ax.text(0.5, 0.5, "Need at least two spikes for ISI", ha="center", va="center")
-        else:
-            isi_ms = np.diff(np.sort(times)) * 1000.0
-            isi_ms = isi_ms[(isi_ms >= 0.0) & (isi_ms <= 1000.0)]
-            if isi_ms.size == 0:
-                ax.text(0.5, 0.5, "No ISI values within 0-1000 ms", ha="center", va="center")
-            else:
-                bin_ms = max(1.0, float(self.bin_ms.value()))
-                bins = np.arange(0.0, 1000.0 + bin_ms, bin_ms)
-                ax.hist(isi_ms, bins=bins, color="#2563eb", alpha=0.78, edgecolor="#1e3a8a")
-            ax.set_title(f"{unit} inter-spike intervals")
-            ax.set_xlabel("ISI (ms)")
-            ax.set_ylabel("Count")
-            ax.set_xlim(0.0, 1000.0)
-        self.canvas.draw_idle()
-
-
-class BurstDelayWorker(QRunnable):
-    def __init__(
-        self,
-        spike_series,
-        burst_intervals,
-        *,
-        max_channels: int,
-        max_lag_ms: float,
-        min_lag_ms: float,
-        delay_mode: str,
-        burst_window_ms: float,
-        bin_ms: float,
-        min_peak_count: int,
-        min_peak_fraction: float,
-        min_peak_ratio: float,
-    ):
-        super().__init__()
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
-        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
-        self.max_channels = int(max_channels)
-        self.max_lag_ms = float(max_lag_ms)
-        self.min_lag_ms = float(min_lag_ms)
-        self.delay_mode = str(delay_mode)
-        self.burst_window_ms = float(burst_window_ms)
-        self.bin_ms = float(bin_ms)
-        self.min_peak_count = int(min_peak_count)
-        self.min_peak_fraction = float(min_peak_fraction)
-        self.min_peak_ratio = float(min_peak_ratio)
-        self.signals = WorkerSignals()
-        self._cancel_requested = False
-
-    def cancel(self) -> None:
-        self._cancel_requested = True
-
-    def _is_cancelled(self) -> bool:
-        return bool(self._cancel_requested)
-
-    def _progress(self, value: int, message: str) -> None:
-        self.signals.progress.emit(int(value), str(message))
-
-    @Slot()
-    def run(self):
-        try:
-            if self._is_cancelled():
-                raise InterruptedError("Burst delay analysis cancelled")
-            self._progress(8, "Preparing channel spike trains...")
-            channels, channel_trains = _burst_delay_channel_series(
-                self.spike_series,
-                max_channels=self.max_channels,
-            )
-            intervals = _burst_delay_limited_intervals(self.burst_intervals, self.burst_window_ms)
-            first_times = np.zeros((0, len(channels)), dtype=float)
-            aligned_pairs = []
-
-            if self.delay_mode == "burst_first":
-                self._progress(12, "Preparing burst first-spike matrix...")
-                channels, intervals, first_times = _burst_delay_first_spike_matrix(
-                    self.spike_series,
-                    self.burst_intervals,
-                    max_channels=self.max_channels,
-                    burst_window_ms=self.burst_window_ms,
-                )
-                _channels, channel_trains = _burst_delay_channel_series(
-                    self.spike_series,
-                    max_channels=self.max_channels,
-                )
-                if self._is_cancelled():
-                    raise InterruptedError("Burst delay analysis cancelled")
-                self._progress(32, "Scanning burst first-spike delay pairs...")
-                aligned_pairs = _burst_delay_aligned_pairs(
-                    channels,
-                    first_times,
-                    max_abs_delay_ms=self.max_lag_ms,
-                    min_abs_delay_ms=self.min_lag_ms,
-                    bin_ms=self.bin_ms,
-                    min_peak_count=self.min_peak_count,
-                    min_peak_fraction=self.min_peak_fraction,
-                    min_peak_to_background=self.min_peak_ratio,
-                    cancel_check=self._is_cancelled,
-                    progress_callback=self._progress,
-                )
-            else:
-                analysis_intervals = intervals if self.delay_mode == "burst_all" else None
-                if self._is_cancelled():
-                    raise InterruptedError("Burst delay analysis cancelled")
-                self._progress(32, "Scanning source-target spike train delays...")
-                aligned_pairs = _spike_train_delay_aligned_pairs(
-                    channels,
-                    channel_trains,
-                    analysis_intervals,
-                    max_abs_delay_ms=self.max_lag_ms,
-                    min_abs_delay_ms=self.min_lag_ms,
-                    bin_ms=self.bin_ms,
-                    min_peak_count=self.min_peak_count,
-                    min_peak_fraction=self.min_peak_fraction,
-                    min_peak_to_background=self.min_peak_ratio,
-                    cancel_check=self._is_cancelled,
-                    progress_callback=self._progress,
-                    mode=self.delay_mode,
-                )
-            self._progress(98, "Preparing visualizations...")
-            self.signals.finished.emit(
-                {
-                    "channels": channels,
-                    "intervals": intervals,
-                    "first_times": first_times,
-                    "channel_trains": channel_trains,
-                    "delay_mode": self.delay_mode,
-                    "aligned_pairs": aligned_pairs,
-                }
-            )
-        except InterruptedError as exc:
-            self.signals.canceled.emit(str(exc) or "Burst delay analysis cancelled")
-        except Exception:
-            self.signals.failed.emit(traceback.format_exc())
-
-
-class BurstDelayWindow(AppDialog):
-    def __init__(
-        self,
-        spike_series,
-        burst_intervals,
-        parent=None,
-        channel_map: ChannelMap | None = None,
-        waveform_series=None,
-        sampling_rate=None,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("Burst Channel Delay")
-        self.resize(1180, 720)
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
-        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
-        self.waveform_series = {str(label): np.asarray(values) for label, values in (waveform_series or {}).items()}
-        self.sampling_rate = sampling_rate
-        self.channel_map = channel_map
-        self.position_lookup, self.electrode_positions = _channel_map_positions(channel_map)
-        self._map_recorded_xy, self._map_background_xy = self._channel_map_point_arrays()
-        self.channels = []
-        self.intervals = []
-        self.first_times = np.zeros((0, 0), dtype=float)
-        self.channel_trains = []
-        self.delay_mode = "burst_first"
-        self.aligned_pairs = []
-        self.thread_pool = QThreadPool.globalInstance()
-        self.active_delay_worker = None
-        self.delay_progress = None
-        self._analysis_pending = False
-        self._map_ax = None
-        self._map_channel_indices = np.array([], dtype=int)
-        self._map_channel_xy = np.zeros((0, 2), dtype=float)
-        self._map_channel_labels = []
-        self._pair_combo_updating = False
-        self._pair_anchor = None
-        self._manual_reference_index = -1
-        self._manual_target_index = -1
-        self._manual_pair_active = False
-        self._highlight_channel_index = -1
-
-        self.max_channels = QSpinBox()
-        available_channels = len(
-            {
-                _base_channel_from_raster_label(str(label))
-                for label, times in self.spike_series
-                if np.asarray(times, dtype=float).size and " noise" not in str(label).lower()
-            }
-        )
-        self.max_channels.setRange(2, max(2, available_channels))
-        self.max_channels.setValue(max(2, available_channels))
-        self.max_channels.valueChanged.connect(self._mark_analysis_stale)
-
-        self.max_lag_ms = QSpinBox()
-        self.max_lag_ms.setRange(1, 10000)
-        self.max_lag_ms.setSingleStep(5)
-        self.max_lag_ms.setValue(100)
-        self.max_lag_ms.setSuffix(" ms")
-        self.max_lag_ms.valueChanged.connect(self._mark_analysis_stale)
-
-        self.min_lag_ms = QDoubleSpinBox()
-        self.min_lag_ms.setRange(0.0, 10000.0)
-        self.min_lag_ms.setDecimals(1)
-        self.min_lag_ms.setSingleStep(0.5)
-        self.min_lag_ms.setValue(1.0)
-        self.min_lag_ms.setSuffix(" ms")
-        self.min_lag_ms.valueChanged.connect(self._mark_analysis_stale)
-
-        self.burst_window_ms = QDoubleSpinBox()
-        self.burst_window_ms.setRange(0.0, 100000.0)
-        self.burst_window_ms.setDecimals(1)
-        self.burst_window_ms.setSingleStep(5.0)
-        self.burst_window_ms.setValue(0.0)
-        self.burst_window_ms.setSuffix(" ms")
-        self.burst_window_ms.valueChanged.connect(self._mark_analysis_stale)
-
-        self.bin_ms = QDoubleSpinBox()
-        self.bin_ms.setRange(0.1, 1000.0)
-        self.bin_ms.setDecimals(1)
-        self.bin_ms.setSingleStep(1.0)
-        self.bin_ms.setValue(2.0)
-        self.bin_ms.setSuffix(" ms")
-        self.bin_ms.valueChanged.connect(self._mark_analysis_stale)
-
-        self.min_peak_count = QSpinBox()
-        self.min_peak_count.setRange(1, 100000)
-        self.min_peak_count.setValue(25)
-        self.min_peak_count.valueChanged.connect(self._mark_analysis_stale)
-
-        self.min_peak_fraction = QDoubleSpinBox()
-        self.min_peak_fraction.setRange(0.01, 1.0)
-        self.min_peak_fraction.setDecimals(2)
-        self.min_peak_fraction.setSingleStep(0.05)
-        self.min_peak_fraction.setValue(0.50)
-        self.min_peak_fraction.valueChanged.connect(self._mark_analysis_stale)
-
-        self.min_peak_ratio = QDoubleSpinBox()
-        self.min_peak_ratio.setRange(1.0, 1000.0)
-        self.min_peak_ratio.setDecimals(1)
-        self.min_peak_ratio.setSingleStep(1.0)
-        self.min_peak_ratio.setValue(10.0)
-        self.min_peak_ratio.valueChanged.connect(self._mark_analysis_stale)
-
-        self.max_map_pairs = QSpinBox()
-        self.max_map_pairs.setRange(1, 200)
-        self.max_map_pairs.setValue(30)
-        self.max_map_pairs.valueChanged.connect(lambda *_: self._draw_channel_map())
-
-        self.delay_mode_combo = NoWheelComboBox()
-        self.delay_mode_combo.addItem("Burst first spike", "burst_first")
-        self.delay_mode_combo.addItem("Burst all spikes", "burst_all")
-        self.delay_mode_combo.addItem("All spikes", "all_spikes")
-        self.delay_mode_combo.currentIndexChanged.connect(self._mark_analysis_stale)
-        self.delay_mode_combo.setToolTip("Delay definition. First spike is the strictest; all spikes is the most permissive.")
-
-        self.mode_combo = NoWheelComboBox()
-        self.mode_combo.addItem("Selected pair", "pair")
-        self.mode_combo.currentIndexChanged.connect(self._draw_histogram)
-
-        self.map_pick_combo = NoWheelComboBox()
-        self.map_pick_combo.addItem("Source", "source")
-        self.map_pick_combo.addItem("Target", "target")
-
-        self.manual_pair_check = QCheckBox("Manual pair")
-        self.manual_pair_check.toggled.connect(self._manual_pair_toggled)
-
-        self.significance_button = QPushButton("Significance")
-        self.significance_button.clicked.connect(self._open_significance_dialog)
-        self.advanced_button = QPushButton("Analysis settings...")
-        self.advanced_button.clicked.connect(self._open_delay_settings_dialog)
-        self.analyze_button = QPushButton("Analyze")
-        self.analyze_button.clicked.connect(self._draw)
-
-        self.reference_combo = NoWheelComboBox()
-        self.reference_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("source"))
-        self.target_combo = NoWheelComboBox()
-        self.target_combo.currentIndexChanged.connect(lambda *_: self._pair_selection_changed("target"))
-        self.raster_align_combo = NoWheelComboBox()
-        self.raster_align_combo.addItem("Burst onset", "onset")
-        self.raster_align_combo.addItem("Source anchored", "source")
-        self.raster_align_combo.currentIndexChanged.connect(self._draw_delay_raster)
-        self.raster_align_combo.setToolTip("Burst onset keeps a common time origin; Source anchored aligns source spikes to a visible offset.")
-
-        self.summary = QLabel()
-        self.summary.setObjectName("MutedText")
-        self.parameter_hint = QLabel()
-        self.parameter_hint.setObjectName("MutedText")
-        self.parameter_hint.setWordWrap(True)
-        self.hist_canvas = FigureCanvas(Figure(figsize=(6, 3), tight_layout=True))
-        self.delay_raster_canvas = FigureCanvas(Figure(figsize=(6, 3), tight_layout=True))
-        self.waveform_canvas = FigureCanvas(Figure(figsize=(6, 2.4), tight_layout=True))
-        self.map_canvas = FigureCanvas(Figure(figsize=(6, 5), tight_layout=False))
-        self.map_canvas.mpl_connect("button_press_event", self._map_clicked)
-        self.aligned_table = QTableWidget(0, 8)
-        self.aligned_table.setHorizontalHeaderLabels(
-            ["Source", "Target", "Delay ms", "Peak", "Total", "Peak frac", "Peak/bg", "Peak SD"]
-        )
-        self.aligned_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.aligned_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.aligned_table.itemSelectionChanged.connect(self._aligned_pair_selected)
-
-        controls_frame = QFrame()
-        controls_frame.setObjectName("Panel")
-        controls_layout = QVBoxLayout(controls_frame)
-        controls_layout.setContentsMargins(12, 10, 12, 10)
-        controls_layout.setSpacing(8)
-
-        controls_grid = QGridLayout()
-        controls_grid.setHorizontalSpacing(10)
-        controls_grid.setVerticalSpacing(8)
-        controls_grid.addWidget(QLabel("Delay mode"), 0, 0)
-        controls_grid.addWidget(self.delay_mode_combo, 0, 1)
-        controls_grid.addWidget(QLabel("Source"), 0, 2)
-        controls_grid.addWidget(self.reference_combo, 0, 3)
-        controls_grid.addWidget(QLabel("Target"), 0, 4)
-        controls_grid.addWidget(self.target_combo, 0, 5)
-        controls_grid.addWidget(QLabel("Raster align"), 1, 0)
-        controls_grid.addWidget(self.raster_align_combo, 1, 1)
-        controls_grid.addWidget(self.advanced_button, 1, 2)
-        controls_grid.addWidget(self.parameter_hint, 1, 3, 1, 3)
-        controls_layout.addLayout(controls_grid)
-
-        helper_row = QHBoxLayout()
-        helper_row.setSpacing(8)
-        helper_row.addWidget(self.manual_pair_check)
-        helper_row.addWidget(QLabel("Map click"))
-        helper_row.addWidget(self.map_pick_combo)
-        helper_row.addWidget(self.significance_button)
-        helper_row.addWidget(self.analyze_button)
-        helper_row.addStretch(1)
-        helper_row.addWidget(QLabel("Analyze runs only after you click Analyze."))
-        controls_layout.addLayout(helper_row)
-
-        right_plots = QVBoxLayout()
-        right_plots.addWidget(self.hist_canvas, 1)
-        right_plots.addWidget(self.delay_raster_canvas, 1)
-        right_plots.addWidget(self.waveform_canvas, 1)
-        plot_area = QHBoxLayout()
-        plot_area.addWidget(self.map_canvas, 3)
-        plot_area.addLayout(right_plots, 2)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(controls_frame)
-        layout.addWidget(self.summary)
-        layout.addLayout(plot_area, 1)
-        self._update_delay_parameter_hint()
-        QTimer.singleShot(0, self._draw)
-        _fix_spinbox_hit_targets(self)
-        self.showMaximized()
-
-    def _mark_analysis_stale(self, *_args) -> None:
-        if not hasattr(self, "summary"):
-            return
-        if self.active_delay_worker is not None:
-            self.summary.setText("Burst delay parameters changed; click Analyze after the current run finishes.")
-            return
-        current = self.summary.text().strip()
-        if current and "click Analyze" not in current:
-            self.summary.setText(f"{current} Parameters changed; click Analyze.")
-        elif not current:
-            self.summary.setText("Burst delay parameters changed; click Analyze.")
-
-    def _open_significance_dialog(self) -> None:
-        dialog = QDialog(self)
-        _enable_standard_window_controls(dialog)
-        dialog.setWindowTitle("Significance Parameters")
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-
-        peak_count = QSpinBox()
-        peak_count.setRange(self.min_peak_count.minimum(), self.min_peak_count.maximum())
-        peak_count.setValue(int(self.min_peak_count.value()))
-
-        peak_fraction = QDoubleSpinBox()
-        peak_fraction.setRange(self.min_peak_fraction.minimum(), self.min_peak_fraction.maximum())
-        peak_fraction.setDecimals(2)
-        peak_fraction.setSingleStep(0.05)
-        peak_fraction.setValue(float(self.min_peak_fraction.value()))
-
-        peak_ratio = QDoubleSpinBox()
-        peak_ratio.setRange(self.min_peak_ratio.minimum(), self.min_peak_ratio.maximum())
-        peak_ratio.setDecimals(1)
-        peak_ratio.setSingleStep(1.0)
-        peak_ratio.setValue(float(self.min_peak_ratio.value()))
-
-        form.addRow("Min peak count", peak_count)
-        form.addRow("Min peak fraction", peak_fraction)
-        form.addRow("Min peak/background", peak_ratio)
-        layout.addLayout(form)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        apply_button = QPushButton("Apply")
-        cancel_button = QPushButton("Cancel")
-        buttons.addWidget(cancel_button)
-        buttons.addWidget(apply_button)
-        layout.addLayout(buttons)
-        apply_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-        _fix_spinbox_hit_targets(dialog)
-
-        if dialog.exec() != QDialog.Accepted:
-            return
-        self.min_peak_count.setValue(int(peak_count.value()))
-        self.min_peak_fraction.setValue(float(peak_fraction.value()))
-        self.min_peak_ratio.setValue(float(peak_ratio.value()))
-        self._update_delay_parameter_hint()
-        self._mark_analysis_stale()
-
-    def _update_delay_parameter_hint(self) -> None:
-        self.parameter_hint.setText(
-            f"Lag {int(self.max_lag_ms.value())} ms, min delay {float(self.min_lag_ms.value()):g} ms, "
-            f"burst window {float(self.burst_window_ms.value()):g} ms, bin {float(self.bin_ms.value()):g} ms"
-        )
-
-    def _open_delay_settings_dialog(self) -> None:
-        dialog = QDialog(self)
-        _enable_standard_window_controls(dialog)
-        dialog.setWindowTitle("Burst Delay Settings")
-        layout = QVBoxLayout(dialog)
-
-        intro = QLabel(
-            "These parameters control the delay-search window and significance filter.\n"
-            "Keep the main panel focused on source/target selection and visualization."
-        )
-        intro.setObjectName("MutedText")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        form = QFormLayout()
-
-        max_lag = QSpinBox()
-        max_lag.setRange(self.max_lag_ms.minimum(), self.max_lag_ms.maximum())
-        max_lag.setValue(int(self.max_lag_ms.value()))
-        max_lag.setSuffix(" ms")
-        max_lag.setToolTip("Maximum searched delay magnitude. Typical range: 20-200 ms.")
-
-        min_lag = QDoubleSpinBox()
-        min_lag.setRange(self.min_lag_ms.minimum(), self.min_lag_ms.maximum())
-        min_lag.setDecimals(self.min_lag_ms.decimals())
-        min_lag.setSingleStep(self.min_lag_ms.singleStep())
-        min_lag.setValue(float(self.min_lag_ms.value()))
-        min_lag.setSuffix(" ms")
-        min_lag.setToolTip("Ignore ultra-small delays. Typical range: 0.5-5 ms.")
-
-        burst_window = QDoubleSpinBox()
-        burst_window.setRange(self.burst_window_ms.minimum(), self.burst_window_ms.maximum())
-        burst_window.setDecimals(self.burst_window_ms.decimals())
-        burst_window.setSingleStep(self.burst_window_ms.singleStep())
-        burst_window.setValue(float(self.burst_window_ms.value()))
-        burst_window.setSuffix(" ms")
-        burst_window.setToolTip("Analyze only onset + X ms inside each burst. 0 means full burst.")
-
-        bin_ms = QDoubleSpinBox()
-        bin_ms.setRange(self.bin_ms.minimum(), self.bin_ms.maximum())
-        bin_ms.setDecimals(self.bin_ms.decimals())
-        bin_ms.setSingleStep(self.bin_ms.singleStep())
-        bin_ms.setValue(float(self.bin_ms.value()))
-        bin_ms.setSuffix(" ms")
-        bin_ms.setToolTip("Delay histogram bin size. Typical range: 1-5 ms.")
-
-        max_channels = QSpinBox()
-        max_channels.setRange(self.max_channels.minimum(), self.max_channels.maximum())
-        max_channels.setValue(int(self.max_channels.value()))
-        max_channels.setToolTip("Upper bound on analyzed channels for speed.")
-
-        max_map_pairs = QSpinBox()
-        max_map_pairs.setRange(self.max_map_pairs.minimum(), self.max_map_pairs.maximum())
-        max_map_pairs.setValue(int(self.max_map_pairs.value()))
-        max_map_pairs.setToolTip("Maximum number of significant pairs rendered on the map.")
-
-        form.addRow("Max lag", max_lag)
-        form.addRow("Min delay", min_lag)
-        form.addRow("Burst onset window", burst_window)
-        form.addRow("Histogram bin", bin_ms)
-        form.addRow("Max analyzed channels", max_channels)
-        form.addRow("Max map pairs", max_map_pairs)
-        layout.addLayout(form)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel = QPushButton("Cancel")
-        apply_button = QPushButton("Apply")
-        buttons.addWidget(cancel)
-        buttons.addWidget(apply_button)
-        layout.addLayout(buttons)
-        cancel.clicked.connect(dialog.reject)
-        apply_button.clicked.connect(dialog.accept)
-        _fix_spinbox_hit_targets(dialog)
-
-        if dialog.exec() != QDialog.Accepted:
-            return
-        self.max_lag_ms.setValue(int(max_lag.value()))
-        self.min_lag_ms.setValue(float(min_lag.value()))
-        self.burst_window_ms.setValue(float(burst_window.value()))
-        self.bin_ms.setValue(float(bin_ms.value()))
-        self.max_channels.setValue(int(max_channels.value()))
-        self.max_map_pairs.setValue(int(max_map_pairs.value()))
-        self._update_delay_parameter_hint()
-        self._mark_analysis_stale()
-
-    def _draw(self):
-        if self.active_delay_worker is not None:
-            self.summary.setText("Burst delay analysis is already running.")
-            return
-        self._analysis_pending = False
-        self._set_controls_enabled(False)
-        self.delay_progress = _create_progress_dialog(self, "Burst delay", "Starting burst delay analysis...", 100)
-        worker = BurstDelayWorker(
-            self.spike_series,
-            self.burst_intervals,
-            max_channels=int(self.max_channels.value()),
-            max_lag_ms=float(self.max_lag_ms.value()),
-            min_lag_ms=float(self.min_lag_ms.value()),
-            delay_mode=str(self.delay_mode_combo.currentData() or "burst_first"),
-            burst_window_ms=(
-                float(self.burst_window_ms.value())
-                if str(self.delay_mode_combo.currentData() or "burst_first") != "all_spikes"
-                else 0.0
-            ),
-            bin_ms=float(self.bin_ms.value()),
-            min_peak_count=int(self.min_peak_count.value()),
-            min_peak_fraction=float(self.min_peak_fraction.value()),
-            min_peak_ratio=float(self.min_peak_ratio.value()),
-        )
-        self.delay_progress.canceled.connect(worker.cancel)
-        worker.signals.progress.connect(lambda value, message: _set_progress_dialog(self.delay_progress, message, value))
-        worker.signals.finished.connect(lambda result, worker=worker: self._analysis_finished(result, worker))
-        worker.signals.failed.connect(lambda details, worker=worker: self._analysis_failed(details, worker))
-        worker.signals.canceled.connect(lambda message, worker=worker: self._analysis_canceled(message, worker))
-        self.active_delay_worker = worker
-        self.thread_pool.start(worker)
-
-    def _set_controls_enabled(self, enabled: bool):
-        for widget in [
-            self.max_channels,
-            self.max_lag_ms,
-            self.min_lag_ms,
-            self.burst_window_ms,
-            self.bin_ms,
-            self.min_peak_count,
-            self.min_peak_fraction,
-            self.min_peak_ratio,
-            self.max_map_pairs,
-            self.delay_mode_combo,
-            self.map_pick_combo,
-            self.mode_combo,
-            self.manual_pair_check,
-            self.advanced_button,
-            self.significance_button,
-            self.analyze_button,
-            self.reference_combo,
-            self.target_combo,
-            self.raster_align_combo,
-        ]:
-            widget.setEnabled(enabled)
-
-    def _finish_active_worker(self, worker: BurstDelayWorker):
-        if self.active_delay_worker is worker:
-            self.active_delay_worker = None
-        _close_progress_dialog(self.delay_progress)
-        self.delay_progress = None
-        self._set_controls_enabled(True)
-
-    def _analysis_finished(self, result: dict, worker: BurstDelayWorker):
-        previous_reference = self.reference_combo.currentText()
-        previous_target = self.target_combo.currentText()
-        self._finish_active_worker(worker)
-        self.channels = list(result.get("channels", []))
-        self.intervals = list(result.get("intervals", []))
-        self.first_times = np.asarray(result.get("first_times", np.zeros((0, 0))), dtype=float)
-        self.channel_trains = [np.asarray(train, dtype=float) for train in result.get("channel_trains", [])]
-        self.delay_mode = str(result.get("delay_mode", "burst_first"))
-        self.aligned_pairs = list(result.get("aligned_pairs", []))
-        truncated_bursts = max((int(item.get("truncated_bursts", 0)) for item in self.aligned_pairs), default=0)
-        note = (
-            f"{self._delay_mode_label()} analyzed {len(self.channels)} channels across {len(self.intervals)} bursts; "
-            f"{len(self.aligned_pairs)} aligned delay patterns available for the map."
-        )
-        if truncated_bursts:
-            note += f" {truncated_bursts} dense bursts were limited to the most active channels for responsiveness."
-        burst_window_ms = float(self.burst_window_ms.value())
-        if self.delay_mode != "all_spikes" and burst_window_ms > 0:
-            note += f" Burst window: onset + {burst_window_ms:g} ms."
-        self.summary.setText(note)
-        self._refresh_channel_combos(previous_reference, previous_target)
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-        if self._analysis_pending:
-            QTimer.singleShot(0, self._draw)
-
-    def _analysis_failed(self, details: str, worker: BurstDelayWorker):
-        self._finish_active_worker(worker)
-        _show_error_message(self, "Burst delay failed", details.splitlines()[-1] if details else "Unknown error")
-        if self._analysis_pending:
-            QTimer.singleShot(0, self._draw)
-
-    def _analysis_canceled(self, message: str, worker: BurstDelayWorker):
-        self._finish_active_worker(worker)
-        self.summary.setText(message or "Burst delay analysis cancelled")
-        if self._analysis_pending:
-            QTimer.singleShot(0, self._draw)
-
-    def closeEvent(self, event):  # noqa: N802 - Qt override
-        if self.active_delay_worker is not None:
-            self.active_delay_worker.cancel()
-        _close_progress_dialog(self.delay_progress)
-        self.delay_progress = None
-        event.accept()
-
-    def _channel_map_point_arrays(self):
-        recorded_points = []
-        background_points = []
-        for _electrode, (x, y, payload) in self.electrode_positions.items():
-            recorded = bool(payload.get("channel")) or bool(payload.get("routed"))
-            target = recorded_points if recorded else background_points
-            target.append((float(x), float(y)))
-        recorded_xy = np.asarray(recorded_points, dtype=float) if recorded_points else np.zeros((0, 2), dtype=float)
-        background_xy = np.asarray(background_points, dtype=float) if background_points else np.zeros((0, 2), dtype=float)
-        return recorded_xy, background_xy
-
-    def _refresh_channel_position_cache(self):
-        indices = []
-        points = []
-        labels = []
-        for index, channel in enumerate(self.channels):
-            position = _position_for_channel(channel, self.position_lookup)
-            if position is None:
-                continue
-            indices.append(index)
-            points.append((float(position[0]), float(position[1])))
-            labels.append(str(channel))
-        self._map_channel_indices = np.asarray(indices, dtype=int) if indices else np.array([], dtype=int)
-        self._map_channel_xy = np.asarray(points, dtype=float) if points else np.zeros((0, 2), dtype=float)
-        self._map_channel_labels = labels
-
-    def _refresh_channel_combos(self, previous_reference: str, previous_target: str, anchor: str | None = None):
-        self._refresh_channel_position_cache()
-        pairs = self._significant_pair_records()
-        self._pair_combo_updating = True
-        try:
-            if not pairs:
-                self.reference_combo.clear()
-                self.target_combo.clear()
-                self._pair_anchor = None
-                return
-
-            all_sources = sorted({reference for reference, _target, _result in pairs}, key=self._channel_index_sort_key)
-            previous_reference_index = self._channel_index_for_label(previous_reference)
-            previous_target_index = self._channel_index_for_label(previous_target)
-            current_reference_index = self._combo_channel_index(self.reference_combo)
-            current_target_index = self._combo_channel_index(self.target_combo)
-            reference_index = previous_reference_index if previous_reference_index in all_sources else current_reference_index
-            if reference_index not in all_sources:
-                reference_index = -1
-
-            target_options = []
-            if reference_index >= 0:
-                target_options = sorted(
-                    {target for reference, target, _result in pairs if reference == reference_index},
-                    key=self._channel_index_sort_key,
-                )
-            if anchor == "source":
-                target_index = -1
-            else:
-                target_index = previous_target_index if previous_target_index in target_options else current_target_index
-                if target_index not in target_options:
-                    target_index = -1
-
-            self._pair_anchor = "source" if reference_index >= 0 else None
-            self._populate_pair_combo(self.reference_combo, all_sources, reference_index)
-            self._populate_pair_combo(self.target_combo, target_options, target_index)
-        finally:
-            self._pair_combo_updating = False
-
-    def _significant_pair_records(self) -> list[tuple[int, int, dict]]:
-        records = []
-        for result in self.aligned_pairs:
-            try:
-                reference_index = int(result.get("reference_index", -1))
-                target_index = int(result.get("target_index", -1))
-            except (TypeError, ValueError):
-                continue
-            if 0 <= reference_index < len(self.channels) and 0 <= target_index < len(self.channels):
-                records.append((reference_index, target_index, result))
-        return records
-
-    def _channel_index_sort_key(self, index: int):
-        label = self.channels[int(index)] if 0 <= int(index) < len(self.channels) else ""
-        return _channel_sort_key(str(label))
-
-    def _channel_index_for_label(self, label: str) -> int:
-        if label in self.channels:
-            return int(self.channels.index(label))
-        return -1
-
-    def _populate_pair_combo(self, combo: QComboBox, indices: list[int], selected_index: int) -> None:
-        combo.blockSignals(True)
-        try:
-            combo.clear()
-            combo.addItem("None", -1)
-            for index in indices:
-                combo.addItem(self.channels[index], index)
-            item_index = combo.findData(int(selected_index))
-            combo.setCurrentIndex(item_index if item_index >= 0 else 0)
-        finally:
-            combo.blockSignals(False)
-
-    def _pair_result(self, reference_index: int, target_index: int) -> dict | None:
-        for result_reference, result_target, result in self._significant_pair_records():
-            if result_reference == int(reference_index) and result_target == int(target_index):
-                return result
-        return None
-
-    def _selected_pair_result(self) -> dict | None:
-        if self._manual_pair_active or self.manual_pair_check.isChecked():
-            return self._manual_pair_result(self._manual_reference_index, self._manual_target_index)
-        reference_index = self._combo_channel_index(self.reference_combo)
-        target_index = self._combo_channel_index(self.target_combo)
-        result = self._pair_result(reference_index, target_index)
-        return result
-
-    def _manual_pair_result(self, reference_index: int, target_index: int) -> dict | None:
-        if reference_index < 0 or target_index < 0 or reference_index == target_index:
-            return None
-        if reference_index >= len(self.channels) or target_index >= len(self.channels):
-            return None
-        values = self._pair_delay_values(reference_index, target_index)
-        if values.size == 0:
-            delay_ms = 0.0
-            peak_count = 0
-            delay_window_count = 0
-            total_count = 0
-        else:
-            bin_ms = max(0.1, float(self.bin_ms.value()))
-            max_lag = max(1.0, float(self.max_lag_ms.value()))
-            if self.delay_mode == "burst_first":
-                bin_count = max(1, int(np.floor((2.0 * max_lag) / bin_ms)) + 1)
-                bin_indices = np.floor((values + max_lag) / bin_ms + 0.5).astype(int)
-            else:
-                bin_count = max(1, int(np.floor(max_lag / bin_ms)) + 1)
-                bin_indices = np.floor(values / bin_ms + 0.5).astype(int)
-            bin_indices = np.clip(bin_indices, 0, bin_count - 1)
-            counts = np.bincount(bin_indices, minlength=bin_count)
-            peak_index = int(np.argmax(counts))
-            delay_window_indices = range(max(0, peak_index - 2), min(bin_count, peak_index + 3))
-            window_mask = np.isin(bin_indices, list(delay_window_indices))
-            window_values = values[window_mask]
-            delay_ms = float(np.mean(window_values)) if window_values.size else float(np.mean(values))
-            peak_count = int(counts[peak_index])
-            delay_window_count = int(window_values.size)
-            total_count = int(values.size)
-        return {
-            "reference_index": int(reference_index),
-            "target_index": int(target_index),
-            "reference": str(self.channels[reference_index]),
-            "target": str(self.channels[target_index]),
-            "delay_ms": float(delay_ms),
-            "peak_center_ms": float(delay_ms),
-            "peak_count": int(peak_count),
-            "delay_window_count": int(delay_window_count),
-            "total_count": int(total_count),
-            "peak_fraction": 0.0,
-            "peak_to_background": 0.0,
-            "background_count": 0.0,
-            "std_ms": 0.0,
-            "truncated_bursts": 0,
-            "manual": True,
-        }
-
-    def _delay_mode_label(self) -> str:
-        labels = {
-            "burst_first": "Burst first-spike delay",
-            "burst_all": "Burst all-spike delay",
-            "all_spikes": "All-spike delay",
-        }
-        return labels.get(str(self.delay_mode), "Burst delay")
-
-    def _selected_pair_delay_values(self, selected_pair: dict | None) -> np.ndarray:
-        if selected_pair is None:
-            return np.array([], dtype=float)
-        try:
-            reference_index = int(selected_pair["reference_index"])
-            target_index = int(selected_pair["target_index"])
-        except (KeyError, TypeError, ValueError):
-            return np.array([], dtype=float)
-        return self._pair_delay_values(reference_index, target_index)
-
-    def _pair_delay_values(self, reference_index: int, target_index: int) -> np.ndarray:
-        max_lag = max(1.0, float(self.max_lag_ms.value()))
-        min_lag = max(0.0, float(self.min_lag_ms.value()))
-        if self.delay_mode == "burst_first":
-            if self.first_times.ndim != 2 or reference_index >= self.first_times.shape[1] or target_index >= self.first_times.shape[1]:
-                return np.array([], dtype=float)
-            return _burst_delay_pair_values(
-                self.first_times,
-                reference_index,
-                target_index,
-                max_lag,
-                min_abs_delay_ms=min_lag,
-            )
-        if reference_index >= len(self.channel_trains) or target_index >= len(self.channel_trains):
-            return np.array([], dtype=float)
-        intervals = self.intervals if self.delay_mode == "burst_all" else None
-        return _source_interval_delay_values(
-            self.channel_trains[reference_index],
-            self.channel_trains[target_index],
-            max_lag,
-            min_lag,
-            intervals,
-        )
-
-    def _selected_pair_delay_matches(self, selected_pair: dict | None) -> np.ndarray:
-        if selected_pair is None:
-            return np.zeros((0, 3), dtype=float)
-        try:
-            reference_index = int(selected_pair["reference_index"])
-            target_index = int(selected_pair["target_index"])
-        except (KeyError, TypeError, ValueError):
-            return np.zeros((0, 3), dtype=float)
-        if reference_index >= len(self.channel_trains) or target_index >= len(self.channel_trains):
-            return np.zeros((0, 3), dtype=float)
-        intervals = self.intervals if self.delay_mode == "burst_all" else None
-        return _source_interval_delay_matches(
-            self.channel_trains[reference_index],
-            self.channel_trains[target_index],
-            max(1.0, float(self.max_lag_ms.value())),
-            max(0.0, float(self.min_lag_ms.value())),
-            intervals,
-        )
-
-    def _combo_channel_index(self, combo: QComboBox) -> int:
-        data = combo.currentData()
-        try:
-            return int(data)
-        except (TypeError, ValueError):
-            return -1
-
-    def _set_combo_channel_index(self, combo: QComboBox, channel_index: int) -> None:
-        item_index = combo.findData(int(channel_index))
-        if item_index < 0 and 0 <= int(channel_index) < len(self.channels):
-            insert_at = max(0, combo.count() - 1 if combo.count() and combo.itemData(combo.count() - 1) == -1 else combo.count())
-            combo.insertItem(insert_at, self.channels[int(channel_index)], int(channel_index))
-            item_index = insert_at
-        if item_index >= 0:
-            combo.setCurrentIndex(item_index)
-
-    def _map_clicked(self, event) -> None:
-        if event.inaxes is not self._map_ax or event.xdata is None or event.ydata is None:
-            return
-        if self._map_channel_xy.size == 0:
-            return
-        display_points = self._map_ax.transData.transform(self._map_channel_xy)
-        click = np.asarray([float(event.x), float(event.y)], dtype=float)
-        distances = np.sum((display_points - click) ** 2, axis=1)
-        nearest_pos = int(np.argmin(distances))
-        nearest_distance = float(np.sqrt(distances[nearest_pos]))
-        if nearest_distance > 12.0:
-            return
-        channel_index = int(self._map_channel_indices[nearest_pos])
-        if channel_index < 0 or channel_index >= len(self.channels):
-            return
-
-        role = self.map_pick_combo.currentData()
-        if event.button == 3:
-            role = "target"
-        elif event.button == 1 and role not in {"source", "target"}:
-            role = "source"
-        self._highlight_channel_index = int(channel_index)
-        self._manual_pair_active = True
-        self._set_manual_pair_channel(role, channel_index)
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-
-    def _pair_selection_changed(self, role: str) -> None:
-        if self._pair_combo_updating:
-            return
-        self._manual_pair_active = False
-        self._highlight_channel_index = -1
-        if role == "target" and self._combo_channel_index(self.reference_combo) < 0:
-            self._refresh_channel_combos("", "", anchor=None)
-            self._draw_histogram()
-            self._draw_delay_raster()
-            self._draw_waveforms()
-            self._draw_channel_map()
-            return
-        self._refresh_channel_combos(
-            self.reference_combo.currentText(),
-            self.target_combo.currentText(),
-            anchor=role,
-        )
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-
-    def _manual_pair_toggled(self):
-        if self.manual_pair_check.isChecked():
-            self._manual_pair_active = True
-            self._manual_reference_index = self._combo_channel_index(self.reference_combo)
-            self._manual_target_index = self._combo_channel_index(self.target_combo)
-        else:
-            self._manual_pair_active = False
-        self._refresh_channel_combos(self.reference_combo.currentText(), self.target_combo.currentText(), anchor=self._pair_anchor)
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-
-    def _set_manual_pair_channel(self, role: str, channel_index: int) -> None:
-        if role == "target":
-            self._manual_target_index = int(channel_index)
-            if self._manual_reference_index == self._manual_target_index:
-                self._manual_reference_index = -1
-        else:
-            self._manual_reference_index = int(channel_index)
-            if self._manual_target_index == self._manual_reference_index:
-                self._manual_target_index = -1
-
-    def _ensure_distinct_pair_selection(self) -> None:
-        reference_index = self._combo_channel_index(self.reference_combo)
-        target_index = self._combo_channel_index(self.target_combo)
-        if reference_index < 0 or target_index < 0 or reference_index != target_index:
-            return
-        for index in range(len(self.channels)):
-            if index != reference_index:
-                self.target_combo.blockSignals(True)
-                self._set_combo_channel_index(self.target_combo, index)
-                self.target_combo.blockSignals(False)
-                return
-
-    def _select_matching_aligned_pair(self) -> None:
-        reference_index = self._combo_channel_index(self.reference_combo)
-        target_index = self._combo_channel_index(self.target_combo)
-        if reference_index < 0 or target_index < 0:
-            return
-        for row, result in enumerate(self.aligned_pairs[:BURST_DELAY_TABLE_ROW_LIMIT]):
-            if int(result.get("reference_index", -1)) == reference_index and int(result.get("target_index", -1)) == target_index:
-                self.aligned_table.blockSignals(True)
-                self.aligned_table.selectRow(row)
-                self.aligned_table.blockSignals(False)
-                return
-        self.aligned_table.blockSignals(True)
-        self.aligned_table.clearSelection()
-        self.aligned_table.blockSignals(False)
-
-    def _refresh_aligned_pairs(self):
-        if self.delay_mode == "burst_first":
-            self.aligned_pairs = _burst_delay_aligned_pairs(
-                self.channels,
-                self.first_times,
-                max_abs_delay_ms=float(self.max_lag_ms.value()),
-                min_abs_delay_ms=float(self.min_lag_ms.value()),
-                bin_ms=float(self.bin_ms.value()),
-                min_peak_count=int(self.min_peak_count.value()),
-                min_peak_fraction=float(self.min_peak_fraction.value()),
-                min_peak_to_background=float(self.min_peak_ratio.value()),
-            )
-        else:
-            intervals = self.intervals if self.delay_mode == "burst_all" else None
-            self.aligned_pairs = _spike_train_delay_aligned_pairs(
-                self.channels,
-                self.channel_trains,
-                intervals,
-                max_abs_delay_ms=float(self.max_lag_ms.value()),
-                min_abs_delay_ms=float(self.min_lag_ms.value()),
-                bin_ms=float(self.bin_ms.value()),
-                min_peak_count=int(self.min_peak_count.value()),
-                min_peak_fraction=float(self.min_peak_fraction.value()),
-                min_peak_to_background=float(self.min_peak_ratio.value()),
-                mode=self.delay_mode,
-            )
-        self._refresh_channel_combos(self.reference_combo.currentText(), self.target_combo.currentText(), anchor=self._pair_anchor)
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-
-    def _populate_aligned_table(self):
-        self.aligned_table.blockSignals(True)
-        try:
-            display_pairs = self.aligned_pairs[:BURST_DELAY_TABLE_ROW_LIMIT]
-            self.aligned_table.setRowCount(len(display_pairs))
-            for row, result in enumerate(display_pairs):
-                values = [
-                    result["reference"],
-                    result["target"],
-                    f"{result['delay_ms']:.3f}",
-                    str(result["peak_count"]),
-                    str(result["total_count"]),
-                    f"{result['peak_fraction']:.3f}",
-                    f"{result['peak_to_background']:.1f}",
-                    f"{result['std_ms']:.3f}",
-                ]
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    if column == 0:
-                        item.setData(Qt.ItemDataRole.UserRole, row)
-                    self.aligned_table.setItem(row, column, item)
-            self.aligned_table.resizeColumnsToContents()
-        finally:
-            self.aligned_table.blockSignals(False)
-
-    def _aligned_pair_selected(self):
-        items = self.aligned_table.selectedItems()
-        if not items:
-            return
-        row = items[0].row()
-        source_row = items[0].data(Qt.ItemDataRole.UserRole)
-        if source_row is not None:
-            try:
-                row = int(source_row)
-            except (TypeError, ValueError):
-                pass
-        if row < 0 or row >= len(self.aligned_pairs):
-            return
-        result = self.aligned_pairs[row]
-        reference_index = int(result["reference_index"])
-        target_index = int(result["target_index"])
-        if reference_index >= len(self.channels) or target_index >= len(self.channels):
-            return
-        self._manual_pair_active = False
-        self._highlight_channel_index = -1
-        self.reference_combo.blockSignals(True)
-        self.target_combo.blockSignals(True)
-        self._set_combo_channel_index(self.reference_combo, reference_index)
-        self._set_combo_channel_index(self.target_combo, target_index)
-        self.reference_combo.blockSignals(False)
-        self.target_combo.blockSignals(False)
-        mode_index = self.mode_combo.findData("pair")
-        if mode_index >= 0:
-            self.mode_combo.setCurrentIndex(mode_index)
-        self._draw_histogram()
-        self._draw_delay_raster()
-        self._draw_waveforms()
-        self._draw_channel_map()
-
-    def _delay_connected_components(self) -> list[list[int]]:
-        adjacency: dict[int, set[int]] = {}
-        for reference_index, target_index, _result in self._significant_pair_records():
-            adjacency.setdefault(reference_index, set()).add(target_index)
-            adjacency.setdefault(target_index, set()).add(reference_index)
-        components = []
-        visited = set()
-        for start in sorted(adjacency, key=self._channel_index_sort_key):
-            if start in visited:
-                continue
-            stack = [start]
-            visited.add(start)
-            component = []
-            while stack:
-                current = stack.pop()
-                component.append(current)
-                for neighbor in sorted(adjacency.get(current, ()), key=self._channel_index_sort_key, reverse=True):
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        stack.append(neighbor)
-            components.append(sorted(component, key=self._channel_index_sort_key))
-        return components
-
-    def _component_colors(self, components: list[list[int]]) -> dict[int, str]:
-        palette = [
-            "#22c55e",
-            "#38bdf8",
-            "#f97316",
-            "#e879f9",
-            "#facc15",
-            "#a78bfa",
-            "#14b8a6",
-            "#ef4444",
-            "#84cc16",
-            "#06b6d4",
-            "#f43f5e",
-            "#8b5cf6",
-            "#10b981",
-            "#f59e0b",
-            "#0ea5e9",
-            "#d946ef",
-            "#65a30d",
-            "#fb7185",
-            "#2dd4bf",
-            "#c084fc",
-        ]
-        colors = {}
-        for component_index, component in enumerate(components):
-            if component_index < len(palette):
-                color = palette[component_index]
-            else:
-                hue = (component_index * 0.61803398875) % 1.0
-                red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 0.95)
-                color = f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
-            for channel_index in component:
-                colors[int(channel_index)] = color
-        return colors
-
-    def _first_spike_probability_window_ms(self) -> float:
-        burst_window_ms = max(0.0, float(self.burst_window_ms.value())) if self.delay_mode != "all_spikes" else 0.0
-        if burst_window_ms > 0:
-            return float(burst_window_ms)
-        durations = [float(stop - start) * 1000.0 for start, stop in self.intervals if float(stop) > float(start)]
-        if durations:
-            return max(1.0, max(durations))
-        return max(1.0, float(self.max_lag_ms.value()))
-
-    def _first_spike_peak_times_by_channel(self) -> dict[int, float]:
-        if not self.channels or not self.intervals:
-            return {}
-        right_ms = self._first_spike_probability_window_ms()
-        peak_times = {}
-        for channel_index in range(len(self.channels)):
-            fit = self._first_spike_probability_fit(channel_index, 0.0, right_ms)
-            if fit is None or fit["spike_count"] <= 0 or not fit["centers_ms"].size:
-                continue
-            probabilities = np.asarray(fit["fit_probability"], dtype=float)
-            if not probabilities.size or not np.any(np.isfinite(probabilities)):
-                continue
-            peak_index = int(np.nanargmax(probabilities))
-            if probabilities[peak_index] <= 0:
-                continue
-            peak_times[int(channel_index)] = float(fit["centers_ms"][peak_index])
-        return peak_times
-
-    def _first_spike_peak_color(self, value_ms: float, low_ms: float, high_ms: float) -> str:
-        if not np.isfinite(value_ms):
-            return "#64748b"
-        if high_ms <= low_ms:
-            fraction = 0.5
-        else:
-            fraction = (float(value_ms) - float(low_ms)) / max(float(high_ms) - float(low_ms), 1e-9)
-            fraction = max(0.0, min(1.0, fraction))
-        blue = np.asarray([0, 22, 120], dtype=float)
-        green = np.asarray([0, 230, 118], dtype=float)
-        red = np.asarray([139, 0, 0], dtype=float)
-        if fraction <= 0.5:
-            local = fraction * 2.0
-            color = blue + (green - blue) * local
-        else:
-            local = (fraction - 0.5) * 2.0
-            color = green + (red - green) * local
-        return f"#{int(color[0]):02x}{int(color[1]):02x}{int(color[2]):02x}"
-
-    def _channel_position_array(self, channel_indices: list[int]) -> np.ndarray:
-        points = []
-        for channel_index in channel_indices:
-            if 0 <= int(channel_index) < len(self.channels):
-                position = _position_for_channel(self.channels[int(channel_index)], self.position_lookup)
-            else:
-                position = None
-            if position is None:
-                points.append((np.nan, np.nan))
-            else:
-                points.append((float(position[0]), float(position[1])))
-        return np.asarray(points, dtype=float) if points else np.zeros((0, 2), dtype=float)
-
-    def _propagation_paths(self, components: list[list[int]]) -> list[dict]:
-        pair_records = self._significant_pair_records()
-        if not pair_records:
-            return []
-        pair_lookup = {(reference, target): result for reference, target, result in pair_records}
-        paths = []
-        for component in components:
-            component = [int(index) for index in component]
-            if len(component) < 10:
-                continue
-            local_index = {channel_index: pos for pos, channel_index in enumerate(component)}
-            edges = [
-                (reference, target, float(result.get("delay_ms", 0.0)))
-                for reference, target, result in pair_records
-                if reference in local_index and target in local_index and float(result.get("delay_ms", 0.0)) > 0
-            ]
-            if len(edges) < 2:
-                continue
-            outgoing: dict[int, list[tuple[int, dict]]] = {index: [] for index in component}
-            in_degree = {index: 0 for index in component}
-            out_degree = {index: 0 for index in component}
-            for reference, target, _delay_ms in edges:
-                result = pair_lookup.get((reference, target), {})
-                outgoing.setdefault(reference, []).append((target, result))
-                out_degree[reference] = out_degree.get(reference, 0) + 1
-                in_degree[target] = in_degree.get(target, 0) + 1
-
-            rows = []
-            values = []
-            for reference, target, delay_ms in edges:
-                row = np.zeros(len(component), dtype=float)
-                row[local_index[target]] = 1.0
-                row[local_index[reference]] = -1.0
-                rows.append(row)
-                values.append(delay_ms)
-            if not rows:
-                continue
-            matrix = np.vstack(rows)
-            vector = np.asarray(values, dtype=float)
-            anchored = np.vstack([matrix, np.ones(len(component), dtype=float)])
-            anchored_values = np.concatenate([vector, np.array([0.0])])
-            try:
-                times_ms = np.linalg.lstsq(anchored, anchored_values, rcond=None)[0]
-            except np.linalg.LinAlgError:
-                continue
-            times_ms = times_ms - float(np.nanmin(times_ms))
-            positions = self._channel_position_array(component)
-            if not positions.size or not np.all(np.isfinite(positions)):
-                continue
-
-            def node_score(index: int) -> float:
-                incoming = float(in_degree.get(index, 0))
-                outgoing_count = float(out_degree.get(index, 0))
-                return min(incoming, outgoing_count) + 0.12 * (incoming + outgoing_count)
-
-            def edge_score(result: dict) -> float:
-                peak_count = max(1.0, float(result.get("peak_count", 1.0)))
-                peak_fraction = max(0.0, float(result.get("peak_fraction", 0.0)))
-                peak_ratio = max(1.0, float(result.get("peak_to_background", 1.0)))
-                return np.log1p(peak_count) * (1.0 + peak_fraction) * min(4.0, peak_ratio)
-
-            sorted_nodes = sorted(component, key=lambda index: float(times_ms[local_index[index]]))
-            start_candidates = sorted(
-                [index for index in component if out_degree.get(index, 0) > 0],
-                key=lambda index: (
-                    out_degree.get(index, 0) - in_degree.get(index, 0),
-                    out_degree.get(index, 0),
-                    -float(times_ms[local_index[index]]),
-                ),
-                reverse=True,
-            )
-            end_candidates = sorted(
-                [index for index in component if in_degree.get(index, 0) > 0],
-                key=lambda index: (
-                    in_degree.get(index, 0) - out_degree.get(index, 0),
-                    in_degree.get(index, 0),
-                    float(times_ms[local_index[index]]),
-                ),
-                reverse=True,
-            )
-            if not start_candidates or not end_candidates:
-                continue
-            start_candidates = start_candidates[: max(3, min(8, len(start_candidates)))]
-            end_candidate_set = set(end_candidates[: max(3, min(8, len(end_candidates)))])
-
-            best_score = {index: -np.inf for index in component}
-            previous = {index: None for index in component}
-            path_length = {index: 1 for index in component}
-            for start in start_candidates:
-                start_purity = max(0, out_degree.get(start, 0) - in_degree.get(start, 0))
-                best_score[start] = max(best_score[start], float(start_purity + out_degree.get(start, 0)))
-
-            for source in sorted_nodes:
-                if not np.isfinite(best_score.get(source, -np.inf)):
-                    continue
-                source_time = float(times_ms[local_index[source]])
-                for target, result in outgoing.get(source, []):
-                    if target not in local_index:
-                        continue
-                    target_time = float(times_ms[local_index[target]])
-                    if target_time <= source_time:
-                        continue
-                    score = best_score[source] + edge_score(result) + node_score(target)
-                    if score > best_score.get(target, -np.inf):
-                        best_score[target] = float(score)
-                        previous[target] = source
-                        path_length[target] = path_length[source] + 1
-
-            viable_ends = [
-                index
-                for index in end_candidate_set
-                if np.isfinite(best_score.get(index, -np.inf)) and path_length.get(index, 0) >= 3
-            ]
-            if not viable_ends:
-                viable_ends = [
-                    index
-                    for index in component
-                    if in_degree.get(index, 0) > out_degree.get(index, 0)
-                    and np.isfinite(best_score.get(index, -np.inf))
-                    and path_length.get(index, 0) >= 3
-                ]
-            if not viable_ends:
-                continue
-            end = max(
-                viable_ends,
-                key=lambda index: (
-                    best_score[index],
-                    in_degree.get(index, 0) - out_degree.get(index, 0),
-                    float(times_ms[local_index[index]]),
-                ),
-            )
-            path_nodes = []
-            current = end
-            while current is not None:
-                path_nodes.append(int(current))
-                current = previous.get(current)
-            path_nodes.reverse()
-            if len(path_nodes) < 3:
-                continue
-            path_edges = list(zip(path_nodes[:-1], path_nodes[1:]))
-            paths.append(
-                {
-                    "component": component,
-                    "layers": [[index] for index in path_nodes],
-                    "times_ms": {component[pos]: float(times_ms[pos]) for pos in range(len(component))},
-                    "edges": path_edges,
-                    "pair_lookup": pair_lookup,
-                }
-            )
-        return paths
-
-    def _draw_channel_map(self):
-        figure = self.map_canvas.figure
-        if hasattr(figure, "set_layout_engine"):
-            figure.set_layout_engine(None)
-        else:
-            figure.set_tight_layout(False)
-        figure.clear()
-        figure.patch.set_facecolor("#ffffff")
-        figure.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
-        ax = figure.add_axes([0.0, 0.0, 1.0, 1.0])
-        ax.set_facecolor("#ffffff")
-        self._map_ax = ax
-        if not self.position_lookup:
-            ax.text(0.5, 0.5, "No channel map coordinates available", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.map_canvas.draw_idle()
-            return
-
-        components = self._delay_connected_components()
-        component_colors = self._component_colors(components)
-        subset_indices = set(component_colors)
-        propagation_paths = self._propagation_paths(components)
-        peak_times = self._first_spike_peak_times_by_channel()
-        peak_values = np.asarray(list(peak_times.values()), dtype=float) if peak_times else np.array([], dtype=float)
-        finite_peak_values = peak_values[np.isfinite(peak_values)]
-        peak_low = float(np.nanmin(finite_peak_values)) if finite_peak_values.size else 0.0
-        peak_high = float(np.nanmax(finite_peak_values)) if finite_peak_values.size else 0.0
-        peak_rank_fraction = {}
-        if peak_times:
-            sorted_peak_items = sorted(peak_times.items(), key=lambda item: (float(item[1]), self._channel_index_sort_key(item[0])))
-            denominator = max(1, len(sorted_peak_items) - 1)
-            for rank, (channel_index, _value) in enumerate(sorted_peak_items):
-                peak_rank_fraction[int(channel_index)] = float(rank) / float(denominator)
-
-        if self._map_background_xy.size:
-            ax.scatter(
-                self._map_background_xy[:, 0],
-                self._map_background_xy[:, 1],
-                s=3,
-                color="#e5e7eb",
-                alpha=0.9,
-                linewidths=0,
-                zorder=1,
-                rasterized=True,
-            )
-        if self._map_recorded_xy.size:
-            ax.scatter(
-                self._map_recorded_xy[:, 0],
-                self._map_recorded_xy[:, 1],
-                s=7,
-                color="#cbd5e1",
-                alpha=0.85,
-                linewidths=0,
-                zorder=2,
-                rasterized=True,
-            )
-        if self._map_channel_xy.size:
-            point_colors = []
-            point_sizes = []
-            for channel_index in self._map_channel_indices:
-                channel_index = int(channel_index)
-                if channel_index in peak_times:
-                    rank_fraction = peak_rank_fraction.get(channel_index)
-                    if rank_fraction is None:
-                        point_colors.append(self._first_spike_peak_color(peak_times[channel_index], peak_low, peak_high))
-                    else:
-                        point_colors.append(self._first_spike_peak_color(rank_fraction, 0.0, 1.0))
-                else:
-                    point_colors.append("#64748b")
-                point_sizes.append(120 if channel_index in subset_indices else 78)
-            ax.scatter(
-                self._map_channel_xy[:, 0],
-                self._map_channel_xy[:, 1],
-                s=point_sizes,
-                color=point_colors,
-                edgecolors="#ffffff",
-                marker="s",
-                linewidths=0.8,
-                alpha=0.96,
-                zorder=3.2,
-                rasterized=True,
-            )
-        selected_pair = self._selected_pair_result()
-        selected_key = None
-        if selected_pair is not None:
-            selected_key = (int(selected_pair["reference_index"]), int(selected_pair["target_index"]))
-
-        highlight_index = int(self._highlight_channel_index)
-        for path_index, path in enumerate(propagation_paths):
-            path_color = "#475569"
-            for source, target in path.get("edges", []):
-                if selected_key == (int(source), int(target)):
-                    continue
-                is_highlighted = highlight_index in {int(source), int(target)}
-                source_pos = _position_for_channel(self.channels[int(source)], self.position_lookup)
-                target_pos = _position_for_channel(self.channels[int(target)], self.position_lookup)
-                if source_pos is None or target_pos is None:
-                    continue
-                ax.plot(
-                    [float(source_pos[0]), float(target_pos[0])],
-                    [float(source_pos[1]), float(target_pos[1])],
-                    color="#111827",
-                    linewidth=5.4 if is_highlighted else 4.0,
-                    alpha=0.18 if is_highlighted else 0.06,
-                    solid_capstyle="round",
-                    zorder=4.5,
-                )
-                ax.annotate(
-                    "",
-                    xy=(float(target_pos[0]), float(target_pos[1])),
-                    xytext=(float(source_pos[0]), float(source_pos[1])),
-                    arrowprops={
-                        "arrowstyle": "-|>",
-                        "color": "#d97706" if is_highlighted else path_color,
-                        "lw": 3.0 if is_highlighted else 1.55,
-                        "alpha": 0.96 if is_highlighted else 0.38,
-                        "shrinkA": 8,
-                        "shrinkB": 8,
-                        "mutation_scale": 16 if is_highlighted else 10,
-                    },
-                    zorder=6.5 if is_highlighted else 4.8,
-                )
-
-        for reference_index, target_index, result in self._significant_pair_records():
-            ref_pos = _position_for_channel(result["reference"], self.position_lookup)
-            target_pos = _position_for_channel(result["target"], self.position_lookup)
-            if ref_pos is None or target_pos is None:
-                continue
-            is_selected = selected_key == (reference_index, target_index)
-            is_highlighted = highlight_index in {int(reference_index), int(target_index)}
-            ax.annotate(
-                "",
-                xy=(float(target_pos[0]), float(target_pos[1])),
-                xytext=(float(ref_pos[0]), float(ref_pos[1])),
-                arrowprops={
-                    "arrowstyle": "->",
-                    "color": "#f97316" if is_selected else "#d97706" if is_highlighted else "#475569",
-                    "lw": 3.0 if is_selected else 2.4 if is_highlighted else 1.1,
-                    "alpha": 0.95 if is_selected or is_highlighted else 0.28,
-                    "shrinkA": 5,
-                    "shrinkB": 5,
-                    "mutation_scale": 12 if is_selected or is_highlighted else 7,
-                },
-                zorder=7 if is_selected or is_highlighted else 4,
-            )
-
-        for component_index, component in enumerate(components):
-            points = []
-            for channel_index in component:
-                if 0 <= channel_index < len(self.channels):
-                    position = _position_for_channel(self.channels[channel_index], self.position_lookup)
-                    if position is not None:
-                        points.append((float(position[0]), float(position[1])))
-            if not points:
-                continue
-            xy = np.asarray(points, dtype=float)
-            ax.scatter(
-                xy[:, 0],
-                xy[:, 1],
-                s=140,
-                facecolors="none",
-                edgecolors="#64748b",
-                linewidths=0.9,
-                alpha=0.32,
-                zorder=6,
-            )
-            centroid = np.mean(xy, axis=0)
-            ax.text(
-                float(centroid[0]),
-                float(centroid[1]),
-                str(component_index + 1),
-                color="#111827",
-                fontsize=7,
-                fontweight="bold",
-                ha="center",
-                va="center",
-                zorder=8,
-            )
-
-        for path_index, path in enumerate(propagation_paths):
-            for layer_number, layer in enumerate(path.get("layers", []), start=1):
-                positions = self._channel_position_array([int(index) for index in layer])
-                if positions.size == 0 or not np.all(np.isfinite(positions)):
-                    continue
-                centroid = np.mean(positions, axis=0)
-                ax.text(
-                    float(centroid[0]),
-                    float(centroid[1]) - 0.018,
-                    f"P{path_index + 1}.{layer_number}",
-                    color="#334155",
-                    fontsize=6.5,
-                    fontweight="bold",
-                    ha="center",
-                    va="bottom",
-                    zorder=10,
-                    bbox={"boxstyle": "round,pad=0.10", "facecolor": "#ffffff", "edgecolor": "#94a3b8", "alpha": 0.82},
-                )
-
-        delay_note = f"{len(components)} sets; {len(propagation_paths)} paths"
-        if finite_peak_values.size:
-            delay_note += f"\nfirst-spike peak color: {peak_low:.1f}-{peak_high:.1f} ms"
-        selected_pair = self._selected_pair_result()
-        if selected_pair is None:
-            if self._manual_pair_active or self.manual_pair_check.isChecked():
-                source_label = (
-                    self.channels[self._manual_reference_index]
-                    if 0 <= self._manual_reference_index < len(self.channels)
-                    else "None"
-                )
-                target_label = (
-                    self.channels[self._manual_target_index]
-                    if 0 <= self._manual_target_index < len(self.channels)
-                    else "None"
-                )
-                delay_note += f"\nmanual source: {source_label}; target: {target_label}"
-            else:
-                delay_note += "\nSelect source, then target"
-        else:
-            ref_pos = _position_for_channel(selected_pair["reference"], self.position_lookup)
-            target_pos = _position_for_channel(selected_pair["target"], self.position_lookup)
-            if ref_pos is None or target_pos is None:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "Selected pair is not present in the channel map",
-                    ha="center",
-                    va="center",
-                    color="#334155",
-                    transform=ax.transAxes,
-                )
-            else:
-                rx, ry = float(ref_pos[0]), float(ref_pos[1])
-                tx, ty = float(target_pos[0]), float(target_pos[1])
-                delay = float(selected_pair.get("delay_ms", 0.0))
-                pair_prefix = "manual" if selected_pair.get("manual") else "selected"
-                delay_note += f"\n{pair_prefix}: {selected_pair['reference']} -> {selected_pair['target']} ({delay:.2f} ms)"
-                ax.scatter([rx], [ry], s=64, color="#16a34a", edgecolors="#111827", linewidths=1.0, zorder=9)
-                ax.scatter([tx], [ty], s=72, color="#dc2626", edgecolors="#111827", linewidths=1.0, zorder=9)
-
-        ax.set_xlim(-0.015, 1.015)
-        ax.set_ylim(1.015, -0.015)
-        ax.set_aspect("auto")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        ax.text(
-            0.01,
-            0.99,
-            delay_note,
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=6.5,
-            color="#334155",
-            bbox={"boxstyle": "round,pad=0.10", "facecolor": "#ffffff", "edgecolor": "#cbd5e1", "alpha": 0.88},
-        )
-        self.map_canvas.draw_idle()
-
-    def _waveforms_for_channel(self, channel: str) -> np.ndarray:
-        channel_text = str(channel)
-        chunks = []
-        for label, waveforms in self.waveform_series.items():
-            label_text = str(label)
-            if label_text != channel_text and _base_channel_from_raster_label(label_text) != channel_text:
-                continue
-            array = np.asarray(waveforms, dtype=float)
-            if array.ndim == 1:
-                array = array.reshape(1, -1)
-            if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
-                continue
-            finite_rows = np.any(np.isfinite(array), axis=1)
-            array = array[finite_rows]
-            if array.size:
-                chunks.append(array)
-        if not chunks:
-            return np.zeros((0, 0), dtype=float)
-        width = min(chunk.shape[1] for chunk in chunks)
-        if width <= 0:
-            return np.zeros((0, 0), dtype=float)
-        return np.vstack([chunk[:, :width] for chunk in chunks])
-
-    def _waveform_display_subset(self, waveforms: np.ndarray, max_traces: int = 120) -> np.ndarray:
-        array = np.asarray(waveforms, dtype=float)
-        if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
-            return np.zeros((0, 0), dtype=float)
-        finite_rows = np.any(np.isfinite(array), axis=1)
-        array = array[finite_rows]
-        if array.shape[0] > max_traces:
-            array = array[_display_indices(array.shape[0], max_traces)]
-        return array
-
-    def _draw_waveform_axis(
-        self,
-        ax,
-        channel: str,
-        role: str,
-        waveforms: np.ndarray,
-        color: str,
-        mean_color: str,
-        ylim: tuple[float, float] | None,
-    ) -> None:
-        ax.set_title(f"{role}: {channel}")
-        ax.set_xlabel("Time (ms)" if self.sampling_rate else "Sample")
-        ax.set_ylabel("Amplitude")
-        if waveforms.size == 0:
-            ax.text(0.5, 0.5, "No waveform data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            return
-
-        x = _waveform_time_axis(waveforms.shape[1], self.sampling_rate)
-        for waveform in waveforms:
-            ax.plot(x, waveform, color=color, linewidth=0.65, alpha=0.16)
-        ax.plot(x, np.nanmean(waveforms, axis=0), color=mean_color, linewidth=2.0, label="mean")
-        if ylim is not None:
-            ax.set_ylim(*ylim)
-        ax.text(
-            0.98,
-            0.95,
-            f"n={waveforms.shape[0]}",
-            transform=ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=8,
-            bbox={"boxstyle": "round,pad=0.18", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.85},
-        )
-        ax.legend(loc="best", fontsize=8)
-
-    def _draw_waveforms(self):
-        figure = self.waveform_canvas.figure
-        figure.clear()
-        selected_pair = self._selected_pair_result()
-        if selected_pair is None:
-            ax = figure.add_subplot(111)
-            ax.text(0.5, 0.5, "Select source, then target", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.waveform_canvas.draw_idle()
-            return
-
-        source = str(selected_pair.get("reference", ""))
-        target = str(selected_pair.get("target", ""))
-        source_waveforms = self._waveform_display_subset(self._waveforms_for_channel(source))
-        target_waveforms = self._waveform_display_subset(self._waveforms_for_channel(target))
-        visible = [values.reshape(-1) for values in (source_waveforms, target_waveforms) if values.size]
-        ylim = None
-        if visible:
-            samples = np.concatenate(visible)
-            samples = samples[np.isfinite(samples)]
-            if samples.size:
-                ymin, ymax = np.nanpercentile(samples, [1, 99])
-                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
-                    ymin = float(np.nanmin(samples))
-                    ymax = float(np.nanmax(samples))
-                if ymin == ymax:
-                    ymin -= 1.0
-                    ymax += 1.0
-                pad = (float(ymax) - float(ymin)) * 0.08
-                ylim = (float(ymin) - pad, float(ymax) + pad)
-
-        axes = figure.subplots(1, 2, squeeze=False)[0]
-        self._draw_waveform_axis(axes[0], source, "Source", source_waveforms, "#16a34a", "#15803d", ylim)
-        self._draw_waveform_axis(axes[1], target, "Target", target_waveforms, "#dc2626", "#991b1b", ylim)
-        self.waveform_canvas.draw_idle()
-
-    def _delay_raster_points(self, selected_pair: dict | None):
-        if selected_pair is None:
-            return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
-        reference_index = int(selected_pair["reference_index"])
-        target_index = int(selected_pair["target_index"])
-        max_lag = max(1.0, float(self.max_lag_ms.value()))
-
-        if self.delay_mode == "burst_first":
-            if self.first_times.ndim != 2 or self.first_times.shape[0] == 0:
-                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
-            if reference_index >= self.first_times.shape[1] or target_index >= self.first_times.shape[1]:
-                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
-
-            source_ms = np.asarray(self.first_times[:, reference_index], dtype=float) * 1000.0
-            target_ms = np.asarray(self.first_times[:, target_index], dtype=float) * 1000.0
-            delay_ms = target_ms - source_ms
-            min_lag = max(0.0, float(self.min_lag_ms.value()))
-            valid = np.isfinite(source_ms) & np.isfinite(target_ms) & (np.abs(delay_ms) >= min_lag) & (np.abs(delay_ms) <= max_lag)
-            rows = np.flatnonzero(valid).astype(int)
-            if not rows.size:
-                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
-            source_x = source_ms[rows]
-            target_x = target_ms[rows]
-        else:
-            matches = self._selected_pair_delay_matches(selected_pair)
-            if matches.size == 0:
-                return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=int), 0.0
-            if self.delay_mode == "burst_all":
-                rows = matches[:, 2].astype(int, copy=False)
-                starts = np.asarray(
-                    [self.intervals[row][0] if 0 <= row < len(self.intervals) else matches[index, 0] for index, row in enumerate(rows)],
-                    dtype=float,
-                )
-                source_x = (matches[:, 0] - starts) * 1000.0
-                target_x = (matches[:, 1] - starts) * 1000.0
-            else:
-                rows = np.arange(matches.shape[0], dtype=int)
-                finite_starts = [
-                    float(train[0])
-                    for train in self.channel_trains
-                    if np.asarray(train, dtype=float).size and np.isfinite(np.asarray(train, dtype=float)[0])
-                ]
-                baseline = min(finite_starts) if finite_starts else float(matches[0, 0])
-                source_x = (matches[:, 0] - baseline) * 1000.0
-                target_x = (matches[:, 1] - baseline) * 1000.0
-
-        anchor_ms = 0.0
-        if self.raster_align_combo.currentData() == "source":
-            anchor_ms = max(5.0, min(50.0, max_lag * 0.2))
-            target_x = anchor_ms + (target_x - source_x)
-            source_x = np.full_like(target_x, anchor_ms, dtype=float)
-        return source_x.astype(float), target_x.astype(float), rows.astype(int), float(anchor_ms)
-
-    def _delay_raster_xlim(self, anchor_ms: float) -> tuple[float, float, str]:
-        max_lag = max(1.0, float(self.max_lag_ms.value()))
-        burst_window_ms = max(0.0, float(self.burst_window_ms.value())) if self.delay_mode != "all_spikes" else 0.0
-        if self.raster_align_combo.currentData() == "source":
-            span_ms = min(max_lag, burst_window_ms) if burst_window_ms > 0 else max_lag
-            return float(anchor_ms - span_ms), float(anchor_ms + span_ms), "Time (ms, source anchored)"
-        if self.delay_mode == "all_spikes":
-            starts = []
-            stops = []
-            for train in self.channel_trains:
-                values = np.asarray(train, dtype=float)
-                values = values[np.isfinite(values)]
-                if values.size:
-                    starts.append(float(values[0]))
-                    stops.append(float(values[-1]))
-            if starts and stops:
-                duration_ms = max(1.0, (max(stops) - min(starts)) * 1000.0)
-            else:
-                duration_ms = max_lag
-            return 0.0, float(duration_ms), "Time from recording start (ms)"
-        if burst_window_ms > 0:
-            return 0.0, float(max(1.0, burst_window_ms)), f"Time from burst onset, first {burst_window_ms:g} ms"
-        burst_duration_ms = max(
-            [float(stop - start) * 1000.0 for start, stop in self.intervals if float(stop) > float(start)] or [max_lag]
-        )
-        return 0.0, float(max(max_lag, burst_duration_ms)), "Time from burst onset (ms)"
-
-    def _channel_first_spike_times_ms(self, channel_index: int) -> np.ndarray:
-        if channel_index < 0 or channel_index >= len(self.channels):
-            return np.array([], dtype=float)
-        if not self.intervals:
-            return np.array([], dtype=float)
-        if (
-            self.delay_mode == "burst_first"
-            and self.first_times.ndim == 2
-            and self.first_times.shape[0] == len(self.intervals)
-            and channel_index < self.first_times.shape[1]
-        ):
-            values_ms = np.asarray(self.first_times[:, channel_index], dtype=float) * 1000.0
-            return values_ms[np.isfinite(values_ms)]
-        if channel_index >= len(self.channel_trains):
-            return np.array([], dtype=float)
-        train = np.asarray(self.channel_trains[channel_index], dtype=float)
-        train = np.sort(train[np.isfinite(train)])
-        if train.size == 0:
-            return np.array([], dtype=float)
-        values = []
-        for start_s, stop_s in self.intervals:
-            lo = int(np.searchsorted(train, float(start_s), side="left"))
-            if lo < train.size and train[lo] <= float(stop_s):
-                values.append((float(train[lo]) - float(start_s)) * 1000.0)
-        return np.asarray(values, dtype=float)
-
-    def _first_spike_probability_fit(self, channel_index: int, left_ms: float, right_ms: float) -> dict | None:
-        burst_count = len(self.intervals)
-        if burst_count <= 0:
-            return None
-        left_ms = max(0.0, float(left_ms))
-        right_ms = max(left_ms + 1.0, float(right_ms))
-        bin_ms = max(0.5, float(self.bin_ms.value()))
-        edges = np.arange(left_ms, right_ms + bin_ms * 0.5, bin_ms, dtype=float)
-        if edges.size < 2 or edges[-1] < right_ms:
-            edges = np.append(edges, right_ms)
-        centers = (edges[:-1] + edges[1:]) * 0.5
-        first_spikes = self._channel_first_spike_times_ms(channel_index)
-        first_spikes = first_spikes[(first_spikes >= left_ms) & (first_spikes <= right_ms)]
-        counts, _ = np.histogram(first_spikes, bins=edges)
-        counts = counts.astype(float, copy=False)
-        sigma_bins = max(0.75, min(4.0, 5.0 / bin_ms))
-        fitted_counts = gaussian_filter(counts, sigma=sigma_bins, mode="nearest", truncate=3.0)
-        probability = np.clip(fitted_counts / float(burst_count), 0.0, 1.0)
-        count_se = np.sqrt(np.maximum(fitted_counts, 1e-9))
-        lower = np.clip((fitted_counts - 1.96 * count_se) / float(burst_count), 0.0, 1.0)
-        upper = np.clip((fitted_counts + 1.96 * count_se) / float(burst_count), 0.0, 1.0)
-        observed = counts / float(burst_count)
-        return {
-            "centers_ms": centers,
-            "observed_probability": observed,
-            "fit_probability": probability,
-            "lower_probability": lower,
-            "upper_probability": upper,
-            "burst_count": int(burst_count),
-            "spike_count": int(first_spikes.size),
-        }
-
-    def _draw_first_spike_probability_overlay(self, ax, selected_pair: dict, left_ms: float, right_ms: float):
-        if self.delay_mode == "all_spikes" or self.raster_align_combo.currentData() == "source":
-            return None
-        try:
-            source_index = int(selected_pair["reference_index"])
-            target_index = int(selected_pair["target_index"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        source_fit = self._first_spike_probability_fit(source_index, left_ms, right_ms)
-        target_fit = self._first_spike_probability_fit(target_index, left_ms, right_ms)
-        fits = [
-            ("source", source_fit, "#16a34a", "#86efac"),
-            ("target", target_fit, "#dc2626", "#fecaca"),
-        ]
-        if not any(fit is not None and fit["centers_ms"].size for _role, fit, _line, _fill in fits):
-            return None
-        prob_ax = ax.twinx()
-        max_probability = 0.0
-        for role, fit, line_color, fill_color in fits:
-            if fit is None or not fit["centers_ms"].size:
-                continue
-            x = fit["centers_ms"]
-            y = fit["fit_probability"]
-            lower = fit["lower_probability"]
-            upper = fit["upper_probability"]
-            observed = fit["observed_probability"]
-            max_probability = max(max_probability, float(np.nanmax(upper)) if upper.size else 0.0)
-            prob_ax.fill_between(x, lower, upper, color=fill_color, alpha=0.20, linewidth=0)
-            prob_ax.plot(x, y, color=line_color, linewidth=1.8, linestyle="-", label=f"{role} Poisson fit")
-            prob_ax.scatter(x, observed, s=10, color=line_color, alpha=0.35, linewidths=0)
-        prob_ax.set_ylabel("First-spike probability")
-        prob_ax.set_ylim(0.0, min(1.0, max(0.05, max_probability * 1.15)))
-        prob_ax.tick_params(axis="y", labelsize=8, colors="#475569")
-        prob_ax.spines["right"].set_color("#94a3b8")
-        return prob_ax
-
-    def _draw_delay_raster(self):
-        figure = self.delay_raster_canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        selected_pair = self._selected_pair_result()
-        source_x, target_x, burst_rows, anchor_ms = self._delay_raster_points(selected_pair)
-        if selected_pair is None:
-            ax.text(0.5, 0.5, "Select source, then target", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.delay_raster_canvas.draw_idle()
-            return
-        if not burst_rows.size:
-            ax.text(0.5, 0.5, "No source/target spike matches", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.delay_raster_canvas.draw_idle()
-            return
-
-        ax.scatter(source_x, burst_rows + 1, s=14, color="#16a34a", label="source", alpha=0.88)
-        ax.scatter(target_x, burst_rows + 1, s=14, color="#dc2626", label="target", alpha=0.88)
-        for sx, tx, row in zip(source_x, target_x, burst_rows):
-            ax.plot([sx, tx], [row + 1, row + 1], color="#94a3b8", linewidth=0.65, alpha=0.42)
-        left, right, xlabel = self._delay_raster_xlim(anchor_ms)
-        if self.raster_align_combo.currentData() == "source":
-            ax.axvline(anchor_ms, color="#16a34a", linewidth=1.0, linestyle="--", alpha=0.75)
-
-        ax.set_xlim(left, right)
-        ax.set_ylim(max(0.5, burst_rows.min() + 0.5), burst_rows.max() + 1.5)
-        ax.invert_yaxis()
-        ax.set_title(f"{self._delay_mode_label()} raster")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Event" if self.delay_mode == "all_spikes" else "Burst")
-        prob_ax = self._draw_first_spike_probability_overlay(ax, selected_pair, left, right)
-        handles, labels = ax.get_legend_handles_labels()
-        if prob_ax is not None:
-            probability_handles, probability_labels = prob_ax.get_legend_handles_labels()
-            handles.extend(probability_handles)
-            labels.extend(probability_labels)
-        if handles:
-            ax.legend(handles, labels, loc="best", fontsize=7)
-        self.delay_raster_canvas.draw_idle()
-
-    def _draw_histogram(self):
-        figure = self.hist_canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        if len(self.channels) < 2:
-            ax.text(0.5, 0.5, "No burst delay data", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.hist_canvas.draw_idle()
-            return
-
-        max_lag = max(1.0, float(self.max_lag_ms.value()))
-        selected_pair = self._selected_pair_result()
-        if selected_pair is None:
-            values = np.array([], dtype=float)
-            title = f"Selected-pair {self._delay_mode_label().lower()} distribution"
-        else:
-            values = self._selected_pair_delay_values(selected_pair)
-            title = f"{selected_pair['reference']} -> {selected_pair['target']} {self._delay_mode_label().lower()}"
-
-        if values.size == 0:
-            message = "No matched spikes for selected pair" if selected_pair and selected_pair.get("manual") else "No matched bursts for selected significant pair"
-            ax.text(0.5, 0.5, message, ha="center", va="center")
-            ax.set_xlim((-max_lag, max_lag) if self.delay_mode == "burst_first" else (0.0, max_lag))
-        else:
-            bin_ms = max(0.1, float(self.bin_ms.value()))
-            start = -max_lag if self.delay_mode == "burst_first" else 0.0
-            bins = np.arange(start, max_lag + bin_ms * 1.5, bin_ms)
-            ax.hist(values, bins=bins, color="#2563eb", alpha=0.78, edgecolor="#1e3a8a")
-            mean_delay = float(selected_pair.get("delay_ms", np.mean(values)))
-            ax.axvline(0.0, color="#475569", linewidth=1.0)
-            ax.axvline(mean_delay, color="#dc2626", linewidth=1.5, linestyle="--", label=f"5-bin mean {mean_delay:.2f} ms")
-            ax.legend(loc="best", fontsize=8)
-            ax.text(
-                0.98,
-                0.96,
-                f"n={values.size}\n5-bin mean={mean_delay:.2f} ms",
-                transform=ax.transAxes,
-                ha="right",
-                va="top",
-                fontsize=9,
-                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
-            )
-        ax.set_title(title)
-        ax.set_xlabel("Delay (ms)")
-        ax.set_ylabel("Count")
-        ax.set_xlim((-max_lag, max_lag) if self.delay_mode == "burst_first" else (0.0, max_lag))
-        self.hist_canvas.draw_idle()
-
 class BurstTrajectoryWindow(AppDialog):
     def __init__(
         self,
@@ -15214,968 +12544,6 @@ class GenericAnalysisWindow(AppDialog):
             )
         )
 
-
-class BurstClusteringWindow(AppDialog):
-    def __init__(self, spike_series, burst_intervals, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Burst Clustering")
-        self.resize(1280, 760)
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
-        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
-        self.current = None
-        self.manual_groups = np.array([], dtype=np.int32)
-        self._analysis_signature = None
-        self.undo_stack = []
-        self.lasso = None
-        self.lasso_mode = None
-        self.pending_assignment_label = 0
-        self.embedding_ax = None
-
-        self.bin_ms = QDoubleSpinBox()
-        self.bin_ms.setRange(0.5, 500.0)
-        self.bin_ms.setDecimals(1)
-        self.bin_ms.setSingleStep(1.0)
-        self.bin_ms.setValue(5.0)
-        self.bin_ms.setSuffix(" ms")
-        self.bin_ms.valueChanged.connect(self._draw)
-        self.bin_ms.valueChanged.connect(lambda *_: self._update_cluster_settings_summary())
-
-        self.window_ms = QSpinBox()
-        self.window_ms.setRange(0, 60000)
-        self.window_ms.setSingleStep(10)
-        self.window_ms.setValue(0)
-        self.window_ms.setSuffix(" ms")
-        self.window_ms.valueChanged.connect(self._draw)
-        self.window_ms.valueChanged.connect(lambda *_: self._update_cluster_settings_summary())
-
-        self.cluster_count = QSpinBox()
-        self.cluster_count.setRange(1, 20)
-        self.cluster_count.setValue(3)
-        self.cluster_count.valueChanged.connect(self._draw)
-        self.cluster_count.valueChanged.connect(lambda *_: self._update_cluster_settings_summary())
-
-        self.reducer = NoWheelComboBox()
-        self.reducer.addItem("PCA", "pca")
-        self.reducer.addItem("t-SNE", "tsne")
-        self.reducer.currentIndexChanged.connect(self._draw)
-        self.reducer.currentIndexChanged.connect(lambda *_: self._update_cluster_settings_summary())
-
-        self.normalize = NoWheelComboBox()
-        self.normalize.addItem("Per burst", "per_burst")
-        self.normalize.addItem("Time-bin z-score", "unit_zscore")
-        self.normalize.addItem("None", "none")
-        self.normalize.currentIndexChanged.connect(self._draw)
-        self.normalize.currentIndexChanged.connect(lambda *_: self._update_cluster_settings_summary())
-
-        self.trace_scale = NoWheelComboBox()
-        self.trace_scale.addItem("Shape (per burst peak)", "per_trace_peak")
-        self.trace_scale.addItem("Log count", "log")
-        self.trace_scale.addItem("Robust count", "robust")
-        self.trace_scale.addItem("Raw count", "raw")
-        self.trace_scale.currentIndexChanged.connect(self._draw)
-        self.trace_scale.currentIndexChanged.connect(lambda *_: self._update_cluster_settings_summary())
-        self.trace_scale.setToolTip("Controls how burst trajectories are scaled before plotting.")
-
-        self.analysis_settings_button = QPushButton("Analysis settings...")
-        self.analysis_settings_button.clicked.connect(self._open_cluster_settings_dialog)
-        self.analysis_settings_button.setToolTip("Choose the vectorization window and trace display scaling.")
-        self.analysis_settings_summary = QLabel()
-        self.analysis_settings_summary.setObjectName("MutedText")
-        self.analysis_settings_summary.setWordWrap(True)
-
-        self.cluster_id = QSpinBox()
-        self.cluster_id.setRange(0, 99)
-        self.cluster_id.setValue(0)
-        self.lasso_button = QPushButton("Assign Cluster")
-        self.lasso_button.setCheckable(True)
-        self.lasso_button.clicked.connect(self._start_lasso)
-        self.noise_button = QPushButton("Assign Noise")
-        self.noise_button.setCheckable(True)
-        self.noise_button.clicked.connect(self._start_noise_lasso)
-        self.recluster_clean_button = QPushButton("Recluster Clean")
-        self.recluster_clean_button.clicked.connect(self._recluster_clean_bursts)
-        self.hide_noise = QCheckBox("Hide noise")
-        self.hide_noise.stateChanged.connect(lambda *_: self._redraw_current())
-        self.cluster_filter = NoWheelComboBox()
-        self.cluster_filter.currentIndexChanged.connect(lambda *_: self._redraw_current())
-        self.undo_button = QPushButton("Undo")
-        self.undo_button.clicked.connect(self._undo_manual_assignment)
-        self.undo_button.setEnabled(False)
-
-        self.summary = QLabel()
-        self.summary.setObjectName("MutedText")
-        self.status = QLabel("Ready")
-        self.status.setObjectName("MutedText")
-        self.embedding_canvas = FigureCanvas(Figure(figsize=(6, 4), tight_layout=True))
-        self.trace_canvas = FigureCanvas(Figure(figsize=(7, 4), tight_layout=True))
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Bin"))
-        controls.addWidget(self.bin_ms)
-        controls.addWidget(QLabel("Window"))
-        controls.addWidget(self.window_ms)
-        controls.addWidget(QLabel("Clusters"))
-        controls.addWidget(self.cluster_count)
-        controls.addWidget(QLabel("Reducer"))
-        controls.addWidget(self.reducer)
-        controls.addWidget(QLabel("Normalize"))
-        controls.addWidget(self.normalize)
-        controls.addWidget(self.analysis_settings_button)
-        controls.addStretch(1)
-
-        manual_controls = QHBoxLayout()
-        manual_controls.addWidget(QLabel("Assign cluster"))
-        manual_controls.addWidget(self.cluster_id)
-        manual_controls.addWidget(self.lasso_button)
-        manual_controls.addWidget(self.noise_button)
-        manual_controls.addWidget(self.recluster_clean_button)
-        manual_controls.addWidget(self.hide_noise)
-        manual_controls.addWidget(QLabel("Show"))
-        manual_controls.addWidget(self.cluster_filter)
-        manual_controls.addWidget(self.undo_button)
-        manual_controls.addWidget(self.status, 1)
-
-        plots = QHBoxLayout()
-        plots.addWidget(self.embedding_canvas, 1)
-        plots.addWidget(self.trace_canvas, 1)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
-        layout.addWidget(self.analysis_settings_summary)
-        layout.addLayout(manual_controls)
-        layout.addWidget(self.summary)
-        layout.addLayout(plots, 1)
-        self._update_cluster_settings_summary()
-        self._draw()
-        _fix_spinbox_hit_targets(self)
-        self.showMaximized()
-
-    def _draw(self):
-        if self.lasso_mode is not None:
-            self._stop_lasso_mode("Assignment mode off")
-        intervals, centers_ms, vectors, durations = _burst_total_spike_vectors(
-            self.spike_series,
-            self.burst_intervals,
-            bin_ms=float(self.bin_ms.value()),
-            window_ms=float(self.window_ms.value()),
-        )
-        burst_count = vectors.shape[0]
-        feature_vectors = _normalize_burst_features(vectors, self.normalize.currentData())
-        embedding = _burst_embedding(feature_vectors, self.reducer.currentData()) if burst_count else np.zeros((0, 2), dtype=float)
-        auto_groups = _kmeans_groups(feature_vectors, int(self.cluster_count.value())) if burst_count else np.array([], dtype=int)
-        signature = self._current_analysis_signature()
-        if signature != self._analysis_signature or self.manual_groups.size != auto_groups.size:
-            self.manual_groups = auto_groups.astype(np.int32, copy=True)
-            self.undo_stack = []
-            self.undo_button.setEnabled(False)
-            self._analysis_signature = signature
-        groups = self.manual_groups.astype(np.int32, copy=False)
-        self.current = {
-            "intervals": intervals,
-            "centers_ms": centers_ms,
-            "vectors": vectors,
-            "features": feature_vectors,
-            "embedding": embedding,
-            "groups": groups,
-            "durations": durations,
-        }
-        self._refresh_cluster_filter()
-        self._draw_embedding(embedding, groups, intervals)
-        self._draw_traces(centers_ms, vectors, groups)
-        self._update_summary()
-
-    def _current_analysis_signature(self):
-        return (
-            round(float(self.bin_ms.value()), 6),
-            int(self.window_ms.value()),
-            int(self.cluster_count.value()),
-            str(self.reducer.currentData()),
-            str(self.normalize.currentData()),
-            len(self.burst_intervals),
-        )
-
-    def _redraw_current(self):
-        if not self.current:
-            self._draw()
-            return
-        self._draw_embedding(self.current["embedding"], self.current["groups"], self.current["intervals"])
-        self._draw_traces(self.current["centers_ms"], self.current["vectors"], self.current["groups"])
-        self._update_summary()
-
-    def _update_summary(self):
-        if not self.current:
-            self.summary.setText("No burst clustering result")
-            return
-        vectors = np.asarray(self.current.get("vectors", []), dtype=float)
-        groups = np.asarray(self.current.get("groups", []), dtype=np.int32)
-        burst_count = int(vectors.shape[0]) if vectors.ndim >= 2 else int(groups.size)
-        active = int(np.count_nonzero(np.sum(vectors, axis=1) > 0)) if vectors.ndim == 2 and vectors.size else 0
-        vector_bins = int(vectors.shape[1]) if vectors.ndim == 2 else 0
-        window_text = "auto" if self.window_ms.value() <= 0 else f"{self.window_ms.value()} ms"
-        group_count = len(set(int(value) for value in groups if int(value) != -1)) if groups.size else 0
-        noise_count = int(np.count_nonzero(groups == -1)) if groups.size else 0
-        self.summary.setText(
-            f"Bursts: {burst_count} | Active bursts: {active} | Vector length: {vector_bins} bins | "
-            f"Window: {window_text} | Clusters: {group_count} | Noise: {noise_count}"
-        )
-
-    def _update_cluster_settings_summary(self) -> None:
-        window_text = "auto burst duration" if self.window_ms.value() <= 0 else f"{self.window_ms.value()} ms"
-        normalize_label = self.normalize.currentText()
-        trace_label = self.trace_scale.currentText()
-        self.analysis_settings_summary.setText(
-            "Feature build: "
-            f"{self.bin_ms.value():g} ms bins within {window_text}. "
-            "Preprocessing: "
-            f"{normalize_label}. "
-            "Trace display: "
-            f"{trace_label}. "
-            "Use PCA for stable overview; switch to t-SNE when you want local neighborhood structure."
-        )
-
-    def _open_cluster_settings_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Burst clustering settings")
-        layout = QVBoxLayout(dialog)
-        intro = QLabel(
-            "These settings define how each burst is converted into a spike-count vector before clustering, "
-            "and how the mean trajectories are displayed."
-        )
-        intro.setObjectName("MutedText")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        bin_field = QDoubleSpinBox()
-        bin_field.setRange(self.bin_ms.minimum(), self.bin_ms.maximum())
-        bin_field.setDecimals(self.bin_ms.decimals())
-        bin_field.setSingleStep(self.bin_ms.singleStep())
-        bin_field.setValue(self.bin_ms.value())
-        bin_field.setSuffix(" ms")
-        bin_field.setToolTip("Time bin used to convert each burst into a spike-count vector. Typical range: 2-20 ms.")
-        form.addRow("Vector bin", bin_field)
-
-        window_field = QSpinBox()
-        window_field.setRange(self.window_ms.minimum(), self.window_ms.maximum())
-        window_field.setSingleStep(self.window_ms.singleStep())
-        window_field.setValue(self.window_ms.value())
-        window_field.setSuffix(" ms")
-        window_field.setToolTip("Fixed burst window. Set to 0 to use each burst's native duration.")
-        form.addRow("Analysis window", window_field)
-
-        trace_scale_field = NoWheelComboBox()
-        for index in range(self.trace_scale.count()):
-            trace_scale_field.addItem(self.trace_scale.itemText(index), self.trace_scale.itemData(index))
-        trace_scale_field.setCurrentIndex(max(0, trace_scale_field.findData(self.trace_scale.currentData())))
-        trace_scale_field.setToolTip("How to scale the trajectory panel: shape-emphasis, robust counts, log counts, or raw counts.")
-        form.addRow("Trace scale", trace_scale_field)
-
-        layout.addLayout(form)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        ok_button = QPushButton("Apply")
-        cancel_button = QPushButton("Cancel")
-        ok_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-        buttons.addWidget(cancel_button)
-        buttons.addWidget(ok_button)
-        layout.addLayout(buttons)
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.bin_ms.setValue(float(bin_field.value()))
-        self.window_ms.setValue(int(window_field.value()))
-        self.trace_scale.setCurrentIndex(max(0, self.trace_scale.findData(trace_scale_field.currentData())))
-        self._update_cluster_settings_summary()
-
-    def _draw_embedding(self, embedding: np.ndarray, groups: np.ndarray, intervals):
-        figure = self.embedding_canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        self.embedding_ax = ax
-        if embedding.shape[0] < 2:
-            ax.text(0.5, 0.5, "Need at least two bursts", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-        else:
-            visible_mask = self._visible_group_mask(groups)
-            color_map = _cluster_color_map(groups)
-            plotted = False
-            for group in sorted(np.unique(groups)):
-                indices = np.flatnonzero((groups == group) & visible_mask)
-                if indices.size == 0:
-                    continue
-                plotted = True
-                legend_label = "noise" if int(group) == -1 else f"cluster {int(group)}"
-                ax.scatter(
-                    embedding[indices, 0],
-                    embedding[indices, 1],
-                    s=42,
-                    alpha=0.86,
-                    color=color_map[int(group)],
-                    label=legend_label,
-                )
-                for index in indices:
-                    ax.text(
-                        float(embedding[index, 0]),
-                        float(embedding[index, 1]),
-                        str(index + 1),
-                        fontsize=7,
-                        color="#111827",
-                    )
-            if plotted:
-                ax.legend(loc="best", fontsize=8)
-            else:
-                ax.text(0.5, 0.5, "No bursts match the current cluster filter", ha="center", va="center")
-            ax.set_xlabel("Component 1")
-            ax.set_ylabel("Component 2")
-        ax.set_title("Burst spike-count vector embedding")
-        self.embedding_canvas.draw_idle()
-
-    def _draw_traces(self, centers_ms: np.ndarray, vectors: np.ndarray, groups: np.ndarray):
-        figure = self.trace_canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        if vectors.shape[0] == 0:
-            ax.text(0.5, 0.5, "No detected bursts", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-        else:
-            display_vectors, ylabel = _scale_burst_trace_vectors(vectors, self.trace_scale.currentData())
-            color_map = _cluster_color_map(groups)
-            visible_mask = self._visible_group_mask(groups)
-            plotted = False
-            for group in sorted(np.unique(groups)):
-                indices = np.flatnonzero((groups == group) & visible_mask)
-                if indices.size == 0:
-                    continue
-                plotted = True
-                color = color_map[int(group)]
-                draw_indices = indices[_display_indices(indices.size, 40)] if indices.size else indices
-                for index in draw_indices:
-                    ax.plot(centers_ms, display_vectors[index], color=color, alpha=0.18, linewidth=0.9)
-                mean_trace = np.mean(display_vectors[indices], axis=0) if indices.size else np.zeros_like(centers_ms)
-                legend_label = "noise" if int(group) == -1 else f"cluster {int(group)} mean"
-                ax.plot(centers_ms, mean_trace, color=color, linewidth=2.4, label=legend_label)
-            if plotted:
-                ax.legend(loc="best", fontsize=8)
-            else:
-                ax.text(0.5, 0.5, "No bursts match the current cluster filter", ha="center", va="center")
-            ax.set_xlabel("Time from burst onset (ms)")
-            ax.set_ylabel(ylabel)
-        ax.set_title("Cluster mean burst trajectories")
-        self.trace_canvas.draw_idle()
-
-    def _refresh_cluster_filter(self):
-        previous = self.cluster_filter.currentData()
-        if previous is None:
-            previous = "all"
-        labels = sorted(int(label) for label in np.unique(self.manual_groups)) if self.manual_groups.size else []
-        self.cluster_filter.blockSignals(True)
-        self.cluster_filter.clear()
-        self.cluster_filter.addItem("All clusters", "all")
-        for label in labels:
-            text = "noise" if label == -1 else f"cluster {label}"
-            self.cluster_filter.addItem(text, label)
-        index = self.cluster_filter.findData(previous)
-        self.cluster_filter.setCurrentIndex(index if index >= 0 else 0)
-        self.cluster_filter.blockSignals(False)
-
-    def _active_cluster_filter(self):
-        value = self.cluster_filter.currentData()
-        return None if value in (None, "all") else int(value)
-
-    def _visible_group_mask(self, groups: np.ndarray) -> np.ndarray:
-        labels = np.asarray(groups, dtype=np.int32)
-        mask = np.ones(labels.shape[0], dtype=bool)
-        if self.hide_noise.isChecked():
-            mask &= labels != -1
-        active_cluster = self._active_cluster_filter()
-        if active_cluster is not None:
-            mask &= labels == active_cluster
-        return mask
-
-    def _start_lasso(self):
-        self._toggle_lasso_mode("cluster", int(self.cluster_id.value()))
-
-    def _start_noise_lasso(self):
-        self._toggle_lasso_mode("noise", -1)
-
-    def _toggle_lasso_mode(self, mode: str, label: int):
-        if self.lasso_mode == mode:
-            self._stop_lasso_mode("Assignment mode off")
-            return
-        self.lasso_mode = mode
-        self.pending_assignment_label = int(label)
-        self._refresh_lasso_button_states()
-        message = "Draw regions to mark noise; right-click to exit" if mode == "noise" else (
-            f"Draw regions to assign cluster {label}; right-click to exit"
-        )
-        self._begin_lasso(message)
-
-    def _begin_lasso(self, message: str):
-        if self.current is None or self.current["embedding"].shape[0] == 0:
-            _show_info_message(self, "Burst Clustering", "Need an embedding before manual cluster assignment.")
-            self._stop_lasso_mode("Assignment mode off")
-            return
-        if self.embedding_ax is None:
-            return
-        if self.lasso is not None:
-            self.lasso.disconnect_events()
-        self.status.setText(message)
-        self.lasso = LassoSelector(self.embedding_ax, self._finish_lasso)
-        self.lasso.connect_event("button_press_event", self._lasso_button_press)
-
-    def _lasso_button_press(self, event):
-        if event.button == 3:
-            self._stop_lasso_mode("Assignment mode off")
-
-    def _stop_lasso_mode(self, message: str):
-        if self.lasso is not None:
-            self.lasso.disconnect_events()
-            self.lasso = None
-        self.lasso_mode = None
-        self._refresh_lasso_button_states()
-        self.status.setText(message)
-
-    def _refresh_lasso_button_states(self):
-        self.lasso_button.setChecked(self.lasso_mode == "cluster")
-        self.noise_button.setChecked(self.lasso_mode == "noise")
-
-    def _finish_lasso(self, vertices):
-        if self.lasso is not None:
-            self.lasso.disconnect_events()
-            self.lasso = None
-        if self.current is None:
-            return
-        points = np.asarray(self.current["embedding"], dtype=float)
-        if points.ndim != 2 or points.shape[1] == 0:
-            return
-        if points.shape[1] == 1:
-            points = np.column_stack([points[:, 0], np.zeros(points.shape[0])])
-        else:
-            points = points[:, :2]
-        selected = np.zeros(points.shape[0], dtype=bool)
-        finite_points = np.isfinite(points).all(axis=1)
-        if np.any(finite_points):
-            selected[finite_points] = MplPath(vertices).contains_points(points[finite_points])
-        if self.manual_groups.size == selected.size:
-            selected &= self._visible_group_mask(self.manual_groups)
-        count = int(np.count_nonzero(selected))
-        if count:
-            self.undo_stack.append(self.manual_groups.copy())
-            if len(self.undo_stack) > 50:
-                self.undo_stack = self.undo_stack[-50:]
-            self.manual_groups[selected] = int(self.pending_assignment_label)
-            self.current["groups"] = self.manual_groups.astype(np.int32, copy=True)
-            self.undo_button.setEnabled(True)
-            self._refresh_cluster_filter()
-            self._redraw_current()
-        target = "noise" if self.pending_assignment_label == -1 else f"cluster {self.pending_assignment_label}"
-        self.status.setText(f"Assigned {count} bursts to {target}")
-        if self.lasso_mode is not None:
-            mode = self.lasso_mode
-            message = "Draw another region to mark noise; right-click to exit" if mode == "noise" else (
-                f"Draw another region to assign cluster {self.pending_assignment_label}; right-click to exit"
-            )
-            self._begin_lasso(message)
-
-    def _push_group_undo(self) -> None:
-        self.undo_stack.append(self.manual_groups.copy())
-        if len(self.undo_stack) > 50:
-            self.undo_stack = self.undo_stack[-50:]
-        self.undo_button.setEnabled(True)
-
-    def _recluster_clean_bursts(self):
-        if self.lasso_mode is not None:
-            self._stop_lasso_mode("Assignment mode off")
-        if self.current is None or self.manual_groups.size == 0:
-            self.status.setText("No burst clustering result to recluster")
-            return
-        features = np.asarray(self.current.get("features", []), dtype=float)
-        if features.ndim != 2 or features.shape[0] != self.manual_groups.size:
-            self.status.setText("Cannot recluster: feature matrix is not aligned")
-            return
-        clean_mask = self.manual_groups != -1
-        clean_count = int(np.count_nonzero(clean_mask))
-        if clean_count < 2:
-            self.status.setText("Need at least two non-noise bursts to recluster")
-            return
-
-        self._push_group_undo()
-        new_groups = self.manual_groups.copy()
-        new_groups[clean_mask] = _kmeans_groups(features[clean_mask], int(self.cluster_count.value()))
-        self.manual_groups = new_groups.astype(np.int32, copy=False)
-        self.current["groups"] = self.manual_groups.astype(np.int32, copy=True)
-        self._refresh_cluster_filter()
-        self._redraw_current()
-        noise_count = int(np.count_nonzero(self.manual_groups == -1))
-        self.status.setText(f"Reclustered {clean_count} non-noise bursts; kept {noise_count} noise bursts")
-
-    def _undo_manual_assignment(self):
-        if not self.undo_stack:
-            self.status.setText("No manual clustering step to undo")
-            self.undo_button.setEnabled(False)
-            return
-        self.manual_groups = self.undo_stack.pop()
-        if self.current is not None:
-            self.current["groups"] = self.manual_groups.astype(np.int32, copy=True)
-        self.undo_button.setEnabled(bool(self.undo_stack))
-        self._refresh_cluster_filter()
-        self._redraw_current()
-        self.status.setText("Undid last manual burst clustering change")
-
-
-class BurstCorrelationWindow(AppDialog):
-    def __init__(self, spike_series, burst_intervals, parent=None, channel_map: ChannelMap | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("Burst Correlation")
-        self.resize(820, 640)
-        self.spike_series = [(label, np.asarray(times, dtype=float)) for label, times in spike_series]
-        self.burst_intervals = [(float(start), float(stop)) for start, stop in burst_intervals]
-        self.channel_map = channel_map
-        self.summary = QLabel()
-        self.summary.setObjectName("MutedText")
-        self.current_analysis = None
-        self.current_order = np.array([], dtype=int)
-        self.selected_pair = None
-        self.matrix_ax = None
-
-        self.method_combo = NoWheelComboBox()
-        for label, key in [
-            ("Global statistics", "global_stats"),
-            ("Propagation latency", "latency"),
-            ("Spatial propagation", "spatial"),
-            ("Template matching", "template"),
-            ("Embedding clustering", "embedding"),
-            ("Dynamic time warping", "dtw"),
-            ("Propagation graph", "graph"),
-        ]:
-            self.method_combo.addItem(label, key)
-        self.method_combo.setCurrentIndex(self.method_combo.findData("template"))
-        self.method_combo.currentIndexChanged.connect(self._method_changed)
-        self.param_stack = QStackedWidget()
-        self.param_pages = {}
-        self._build_method_pages()
-        self.canvas = FigureCanvas(Figure(figsize=(7, 5)))
-        self.canvas.mpl_connect("button_press_event", self._matrix_clicked)
-        self.sequence_canvas = FigureCanvas(Figure(figsize=(6, 5)))
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Method"))
-        controls.addWidget(self.method_combo)
-        controls.addStretch()
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
-        layout.addWidget(self.param_stack)
-        layout.addWidget(self.summary)
-        plot_area = QHBoxLayout()
-        plot_area.addWidget(self.canvas, 1)
-        plot_area.addWidget(self.sequence_canvas, 1)
-        layout.addLayout(plot_area, 1)
-        self._method_changed()
-        self._draw()
-        _fix_spinbox_hit_targets(self)
-        self.showMaximized()
-
-    def _build_method_pages(self):
-        self.global_bin_ms = self._double_spin(1.0, 100.0, 10.0, " ms")
-        self.global_block_threshold = self._threshold_spin()
-        self.global_normalize = self._normalize_combo("unit_zscore")
-        self._add_param_page(
-            "global_stats",
-            [("Stats bin", self.global_bin_ms), ("Block threshold", self.global_block_threshold), ("Normalize", self.global_normalize)],
-        )
-
-        self.latency_window_ms = self._spin(0, 5000, 0, " ms")
-        self.latency_block_threshold = self._threshold_spin()
-        self.latency_normalize = self._normalize_combo("unit_zscore")
-        self._add_param_page(
-            "latency",
-            [("Window", self.latency_window_ms), ("Block threshold", self.latency_block_threshold), ("Normalize", self.latency_normalize)],
-        )
-
-        self.spatial_bin_ms = self._double_spin(1.0, 100.0, 5.0, " ms")
-        self.spatial_window_ms = self._spin(0, 5000, 0, " ms")
-        self.spatial_block_threshold = self._threshold_spin()
-        self.spatial_normalize = self._normalize_combo("per_burst")
-        self._add_param_page(
-            "spatial",
-            [
-                ("Time bin", self.spatial_bin_ms),
-                ("Window", self.spatial_window_ms),
-                ("Block threshold", self.spatial_block_threshold),
-                ("Normalize", self.spatial_normalize),
-            ],
-        )
-
-        self.template_bin_ms = self._double_spin(1.0, 100.0, 5.0, " ms")
-        self.template_window_ms = self._spin(0, 5000, 0, " ms")
-        self.template_count = self._spin(1, 20, 3, "")
-        self.template_normalize = self._normalize_combo("per_burst")
-        self._add_param_page(
-            "template",
-            [
-                ("Time bin", self.template_bin_ms),
-                ("Window", self.template_window_ms),
-                ("Templates", self.template_count),
-                ("Normalize", self.template_normalize),
-            ],
-        )
-
-        self.embedding_bin_ms = self._double_spin(1.0, 100.0, 5.0, " ms")
-        self.embedding_window_ms = self._spin(0, 5000, 0, " ms")
-        self.embedding_count = self._spin(1, 20, 3, "")
-        self.embedding_reducer = NoWheelComboBox()
-        self.embedding_reducer.addItem("PCA", "pca")
-        self.embedding_reducer.addItem("t-SNE", "tsne")
-        self.embedding_reducer.currentIndexChanged.connect(self._draw)
-        self.embedding_normalize = self._normalize_combo("per_burst")
-        self._add_param_page(
-            "embedding",
-            [
-                ("Time bin", self.embedding_bin_ms),
-                ("Window", self.embedding_window_ms),
-                ("Clusters", self.embedding_count),
-                ("Reducer", self.embedding_reducer),
-                ("Normalize", self.embedding_normalize),
-            ],
-        )
-
-        self.dtw_bin_ms = self._double_spin(1.0, 100.0, 5.0, " ms")
-        self.dtw_window_ms = self._spin(0, 5000, 0, " ms")
-        self.dtw_warp_bins = self._spin(0, 20, 2, " bins")
-        self.dtw_block_threshold = self._threshold_spin()
-        self.dtw_normalize = self._normalize_combo("per_burst")
-        self._add_param_page(
-            "dtw",
-            [
-                ("Time bin", self.dtw_bin_ms),
-                ("Window", self.dtw_window_ms),
-                ("Warp", self.dtw_warp_bins),
-                ("Block threshold", self.dtw_block_threshold),
-                ("Normalize", self.dtw_normalize),
-            ],
-        )
-
-        self.graph_window_ms = self._double_spin(0.1, 200.0, 10.0, " ms")
-        self.graph_block_threshold = self._threshold_spin()
-        self.graph_normalize = self._normalize_combo("unit_zscore")
-        self._add_param_page(
-            "graph",
-            [("Edge window", self.graph_window_ms), ("Block threshold", self.graph_block_threshold), ("Normalize", self.graph_normalize)],
-        )
-
-        self.time_bin_ms = self.template_bin_ms
-        self.window_ms = self.template_window_ms
-        self.normalize = self.template_normalize
-
-    def _spin(self, minimum: int, maximum: int, value: int, suffix: str):
-        field = QSpinBox()
-        field.setRange(minimum, maximum)
-        field.setSingleStep(1 if maximum <= 100 else 10)
-        field.setValue(value)
-        if suffix:
-            field.setSuffix(suffix)
-        field.valueChanged.connect(self._draw)
-        return field
-
-    def _double_spin(self, minimum: float, maximum: float, value: float, suffix: str):
-        field = QDoubleSpinBox()
-        field.setRange(minimum, maximum)
-        field.setDecimals(1)
-        field.setSingleStep(1.0)
-        field.setValue(value)
-        if suffix:
-            field.setSuffix(suffix)
-        field.valueChanged.connect(self._draw)
-        return field
-
-    def _threshold_spin(self):
-        field = QDoubleSpinBox()
-        field.setRange(0.01, 2.0)
-        field.setDecimals(2)
-        field.setSingleStep(0.05)
-        field.setValue(0.45)
-        field.valueChanged.connect(self._draw)
-        return field
-
-    def _normalize_combo(self, current: str):
-        combo = NoWheelComboBox()
-        combo.addItem("Per burst", "per_burst")
-        combo.addItem("Unit z-score", "unit_zscore")
-        combo.addItem("None", "none")
-        combo.setCurrentIndex(max(0, combo.findData(current)))
-        combo.currentIndexChanged.connect(self._draw)
-        return combo
-
-    def _add_param_page(self, key: str, rows):
-        page = QWidget()
-        layout = QFormLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        for label, widget in rows:
-            layout.addRow(label, widget)
-        self.param_pages[key] = page
-        self.param_stack.addWidget(page)
-
-    def _method_changed(self):
-        key = self.method_combo.currentData()
-        page = self.param_pages.get(key)
-        if page is not None:
-            self.param_stack.setCurrentWidget(page)
-        self._draw()
-
-    def _draw(self):
-        figure = self.canvas.figure
-        figure.clear()
-        ax = figure.add_subplot(111)
-        self.matrix_ax = ax
-        method = self.method_combo.currentData()
-        params = self._current_params(method)
-        analysis = _burst_correlation_analysis(
-            self.spike_series,
-            self.burst_intervals,
-            channel_map=self.channel_map,
-            method=method,
-            **params,
-        )
-        self.current_analysis = analysis
-        correlation = analysis["correlation"]
-        order = analysis["order"]
-        self.current_order = order
-        intervals = analysis["intervals"]
-
-        if correlation.shape[0] < 2:
-            ax.text(0.5, 0.5, "Need at least two detected bursts", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.summary.setText("Detected bursts: 0" if not intervals else "Detected bursts: 1")
-            self.canvas.draw_idle()
-            self._draw_selected_burst_sequences()
-            return
-
-        ordered = correlation[np.ix_(order, order)]
-        image = ax.imshow(ordered, vmin=-1.0, vmax=1.0, cmap="coolwarm", interpolation="nearest", aspect="auto")
-        figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
-
-        ordered_groups = analysis["groups"][order]
-        boundaries = np.flatnonzero(ordered_groups[1:] != ordered_groups[:-1]) + 0.5
-        for boundary in boundaries:
-            ax.axhline(boundary, color="#0f172a", linewidth=1.0, alpha=0.8)
-            ax.axvline(boundary, color="#0f172a", linewidth=1.0, alpha=0.8)
-
-        if self.selected_pair is None or any(index >= correlation.shape[0] for index in self.selected_pair):
-            self.selected_pair = (int(order[0]), int(order[1] if len(order) > 1 else order[0]))
-        ordered_positions = {int(burst): position for position, burst in enumerate(order)}
-        if self.selected_pair[0] in ordered_positions and self.selected_pair[1] in ordered_positions:
-            y = ordered_positions[self.selected_pair[0]]
-            x = ordered_positions[self.selected_pair[1]]
-            ax.scatter([x], [y], s=92, facecolors="none", edgecolors="#111827", linewidths=1.8)
-            ax.scatter([y], [x], s=92, facecolors="none", edgecolors="#111827", linewidths=1.8)
-
-        burst_labels = [f"B{index + 1}\n{intervals[index][0]:.2f}s" for index in order]
-        tick_indices = _display_indices(len(order), 18)
-        ax.set_xticks(tick_indices)
-        ax.set_xticklabels([burst_labels[index] for index in tick_indices], rotation=90, fontsize=7)
-        ax.set_yticks(tick_indices)
-        ax.set_yticklabels([burst_labels[index] for index in tick_indices], fontsize=7)
-        ax.set_title("Burst pattern correlation")
-        ax.set_xlabel("Burst")
-        ax.set_ylabel("Burst")
-
-        group_count = len(set(int(value) for value in ordered_groups))
-        mean_corr = float(np.mean(ordered[np.triu_indices_from(ordered, k=1)]))
-        active_rows = int(np.count_nonzero(np.any(analysis["activity"] > 0, axis=(0, 2))))
-        window_value = params.get("window_ms", 0.0)
-        window_text = "auto" if not window_value else f"{window_value:g} ms"
-        block_text = (
-            f"threshold {params['block_threshold']:.2f}"
-            if "block_threshold" in params
-            else f"clusters {params.get('cluster_count', 'n/a')}"
-        )
-        self.summary.setText(
-            f"Method: {self.method_combo.currentText()} | Bursts: {len(order)} | Active rows: {active_rows} | "
-            f"Blocks: {group_count} ({block_text}) | Mean corr: {mean_corr:.3f} | Window: {window_text}"
-        )
-        self.canvas.draw_idle()
-        self._draw_selected_burst_sequences()
-
-    def _matrix_clicked(self, event):
-        if self.current_analysis is None or event.inaxes is not self.matrix_ax:
-            return
-        if event.xdata is None or event.ydata is None or self.current_order.size == 0:
-            return
-        col = int(round(float(event.xdata)))
-        row = int(round(float(event.ydata)))
-        if row < 0 or col < 0 or row >= self.current_order.size or col >= self.current_order.size:
-            return
-        self.selected_pair = (int(self.current_order[row]), int(self.current_order[col]))
-        self._draw()
-
-    def _draw_selected_burst_sequences(self):
-        figure = self.sequence_canvas.figure
-        figure.clear()
-        if self.current_analysis is None or self.selected_pair is None:
-            ax = figure.add_subplot(111)
-            ax.text(0.5, 0.5, "Click a matrix cell to compare two bursts", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.sequence_canvas.draw_idle()
-            return
-
-        intervals = self.current_analysis.get("intervals", [])
-        labels = self.current_analysis.get("labels", [])
-        if len(intervals) < 2 or not labels:
-            ax = figure.add_subplot(111)
-            ax.text(0.5, 0.5, "No burst sequence data", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            self.sequence_canvas.draw_idle()
-            return
-
-        first, second = self.selected_pair
-        if first >= len(intervals) or second >= len(intervals):
-            self.sequence_canvas.draw_idle()
-            return
-
-        row_indices = np.arange(len(labels), dtype=int)
-        max_duration_ms = max((intervals[index][1] - intervals[index][0]) * 1000.0 for index in [first, second])
-        max_duration_ms = max(1.0, float(max_duration_ms))
-        axes = figure.subplots(2, 1, sharex=True)
-        for ax, burst_index in zip(axes, [first, second]):
-            start_s, stop_s = intervals[burst_index]
-            for display_row, source_row in enumerate(row_indices):
-                spike_times = np.asarray(self.spike_series[source_row][1], dtype=float)
-                lo = int(np.searchsorted(spike_times, start_s, side="left"))
-                hi = int(np.searchsorted(spike_times, stop_s, side="right"))
-                if hi <= lo:
-                    continue
-                relative_ms = (spike_times[lo:hi] - start_s) * 1000.0
-                ax.vlines(relative_ms, display_row - 0.36, display_row + 0.36, color="#2563eb", linewidth=0.9, alpha=0.95)
-            ax.set_title(f"B{burst_index + 1}: {start_s:.3f}-{stop_s:.3f} s")
-            ax.set_ylabel("Row")
-            ax.set_ylim(row_indices.size - 0.5, -0.5)
-            ax.set_xlim(0.0, max_duration_ms)
-            tick_indices = _display_indices(row_indices.size, 10) if row_indices.size else np.array([], dtype=int)
-            ax.set_yticks(tick_indices)
-            ax.set_yticklabels([str(labels[row_indices[index]]) for index in tick_indices], fontsize=7)
-        axes[-1].set_xlabel("Time from burst start (ms)")
-        self.sequence_canvas.draw_idle()
-
-    def _current_params(self, method: str) -> dict:
-        if method == "global_stats":
-            return {
-                "time_bin_ms": float(self.global_bin_ms.value()),
-                "block_threshold": float(self.global_block_threshold.value()),
-                "normalization": self.global_normalize.currentData(),
-            }
-        if method == "latency":
-            return {
-                "latency_window_ms": float(self.latency_window_ms.value()),
-                "block_threshold": float(self.latency_block_threshold.value()),
-                "normalization": self.latency_normalize.currentData(),
-            }
-        if method == "spatial":
-            return {
-                "time_bin_ms": float(self.spatial_bin_ms.value()),
-                "window_ms": float(self.spatial_window_ms.value()),
-                "block_threshold": float(self.spatial_block_threshold.value()),
-                "normalization": self.spatial_normalize.currentData(),
-            }
-        if method == "embedding":
-            return {
-                "time_bin_ms": float(self.embedding_bin_ms.value()),
-                "window_ms": float(self.embedding_window_ms.value()),
-                "cluster_count": int(self.embedding_count.value()),
-                "embedding_method": self.embedding_reducer.currentData(),
-                "normalization": self.embedding_normalize.currentData(),
-            }
-        if method == "dtw":
-            return {
-                "time_bin_ms": float(self.dtw_bin_ms.value()),
-                "window_ms": float(self.dtw_window_ms.value()),
-                "dtw_warp_bins": int(self.dtw_warp_bins.value()),
-                "block_threshold": float(self.dtw_block_threshold.value()),
-                "normalization": self.dtw_normalize.currentData(),
-            }
-        if method == "graph":
-            return {
-                "graph_window_ms": float(self.graph_window_ms.value()),
-                "block_threshold": float(self.graph_block_threshold.value()),
-                "normalization": self.graph_normalize.currentData(),
-            }
-        return {
-            "time_bin_ms": float(self.template_bin_ms.value()),
-            "window_ms": float(self.template_window_ms.value()),
-            "cluster_count": int(self.template_count.value()),
-            "normalization": self.template_normalize.currentData(),
-        }
-
-
-class HeatmapGifExportDialog(AppDialog):
-    def __init__(self, min_time: float, max_time: float, frame_step_ms: int, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Export Heatmap GIF")
-        self.min_time = float(min_time)
-        self.max_time = float(max_time)
-
-        lower = min(self.min_time, self.max_time)
-        upper = max(self.min_time, self.max_time)
-        if upper <= lower:
-            upper = lower + 1.0
-
-        self.start_s = QDoubleSpinBox()
-        self.start_s.setRange(lower, upper)
-        self.start_s.setDecimals(3)
-        self.start_s.setSingleStep(0.1)
-        self.start_s.setValue(lower)
-        self.start_s.setSuffix(" s")
-
-        self.end_s = QDoubleSpinBox()
-        self.end_s.setRange(lower, upper)
-        self.end_s.setDecimals(3)
-        self.end_s.setSingleStep(0.1)
-        self.end_s.setValue(upper)
-        self.end_s.setSuffix(" s")
-
-        self.frame_step_ms = QSpinBox()
-        self.frame_step_ms.setRange(10, 60000)
-        self.frame_step_ms.setSingleStep(10)
-        self.frame_step_ms.setValue(max(10, int(frame_step_ms)))
-        self.frame_step_ms.setSuffix(" ms")
-
-        export_button = QPushButton("Export")
-        export_button.clicked.connect(self.accept)
-        cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.reject)
-
-        form = QFormLayout()
-        form.addRow("Start time", self.start_s)
-        form.addRow("End time", self.end_s)
-        form.addRow("Frame step", self.frame_step_ms)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        buttons.addWidget(cancel_button)
-        buttons.addWidget(export_button)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addLayout(buttons)
-        _fix_spinbox_hit_targets(self)
-
-    def values(self) -> tuple[float, float, int]:
-        start = float(self.start_s.value())
-        end = float(self.end_s.value())
-        if end < start:
-            start, end = end, start
-        return start, end, int(self.frame_step_ms.value())
-
-
 class SpikeRasterWindow(AppDialog):
     def __init__(
         self,
@@ -16278,32 +12646,6 @@ class SpikeRasterWindow(AppDialog):
         self.play_button = QPushButton("Play")
         self.play_button.setCheckable(True)
         self.play_button.clicked.connect(self._toggle_playback)
-        self.ibi_button = QPushButton("IBI")
-        self.ibi_button.clicked.connect(self._open_ibi_window)
-        self.isi_button = QPushButton("ISI")
-        self.isi_button.clicked.connect(self._open_isi_window)
-        self.burst_corr_button = QPushButton("Burst Corr")
-        self.burst_corr_button.clicked.connect(self._open_burst_correlation_window)
-        self.burst_delay_button = QPushButton("Burst Delay")
-        self.burst_delay_button.clicked.connect(self._open_burst_delay_window)
-        self.burst_cluster_button = QPushButton("Burst Cluster")
-        self.burst_cluster_button.clicked.connect(self._open_burst_clustering_window)
-        self.save_bursts_button = QPushButton("Save Bursts")
-        self.save_bursts_button.clicked.connect(self._save_bursts)
-        self.export_heatmap_gif_button = QPushButton("Export GIF")
-        self.export_heatmap_gif_button.clicked.connect(self._export_heatmap_gif)
-        self.raster_action_combo = NoWheelComboBox()
-        self.raster_action_combo.addItem("Choose action...", "")
-        self.raster_action_combo.addItem("IBI", "ibi")
-        self.raster_action_combo.addItem("ISI", "isi")
-        self.raster_action_combo.addItem("Burst correlation", "burst_corr")
-        self.raster_action_combo.addItem("Burst delay", "burst_delay")
-        self.raster_action_combo.addItem("Burst clustering", "burst_cluster")
-        self.raster_action_combo.addItem("Save bursts", "save_bursts")
-        self.raster_action_combo.addItem("Export heatmap GIF", "export_heatmap_gif")
-        self.raster_action_combo.setMinimumWidth(170)
-        self.raster_action_combo.activated.connect(self._raster_action_selected)
-        self.raster_action_combo.setToolTip("Choose a downstream analysis or export action for the current raster.")
 
         self.well_combo = None
         if self.channel_groups:
@@ -16361,7 +12703,7 @@ class SpikeRasterWindow(AppDialog):
         self.burst_threshold_z.setRange(0.5, 20.0)
         self.burst_threshold_z.setSingleStep(0.5)
         self.burst_threshold_z.setDecimals(1)
-        self.burst_threshold_z.setValue(4.0)
+        self.burst_threshold_z.setValue(8.0)
         self.burst_threshold_z.setFixedWidth(58)
         self.burst_threshold_z.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.burst_threshold_z.setCursor(Qt.CursorShape.ArrowCursor)
@@ -16457,8 +12799,8 @@ class SpikeRasterWindow(AppDialog):
         parameter_frame = QFrame()
         parameter_layout = QGridLayout(parameter_frame)
         parameter_layout.setContentsMargins(0, 0, 0, 0)
-        parameter_layout.setHorizontalSpacing(10)
-        parameter_layout.setVerticalSpacing(6)
+        parameter_layout.setHorizontalSpacing(8)
+        parameter_layout.setVerticalSpacing(5)
         parameter_layout.addWidget(QLabel("Window"), 0, 0)
         parameter_layout.addWidget(
             self._number_stepper(self.window_minus_button, self.window_grids, self.window_plus_button),
@@ -16482,13 +12824,11 @@ class SpikeRasterWindow(AppDialog):
             parameter_layout.addWidget(QLabel("Well"), 0, next_column)
             parameter_layout.addWidget(self.well_combo, 0, next_column + 1)
             next_column += 2
-        parameter_layout.addWidget(QLabel("Action"), 0, next_column)
-        parameter_layout.addWidget(self.raster_action_combo, 0, next_column + 1)
-        parameter_layout.addWidget(self.display_settings_button, 0, next_column + 2)
-        parameter_layout.addWidget(self.burst_settings_button, 0, next_column + 3)
+        parameter_layout.addWidget(self.display_settings_button, 0, next_column)
+        parameter_layout.addWidget(self.burst_settings_button, 0, next_column + 1)
         parameter_layout.addWidget(self.row_label, 1, 0, 1, 2)
-        parameter_layout.addWidget(self.raster_settings_summary, 1, 2, 1, max(8, next_column + 2))
-        parameter_layout.setColumnStretch(next_column + 1, 1)
+        parameter_layout.addWidget(self.raster_settings_summary, 1, 2, 1, max(6, next_column))
+        parameter_layout.setColumnStretch(max(0, next_column + 2), 1)
 
         layout = QVBoxLayout(self)
         raster_area = QWidget()
@@ -16581,26 +12921,6 @@ class SpikeRasterWindow(AppDialog):
             self.canvas.set_selected_channel(self.selected_channel)
         self._last_waveform_view = None
         self._refresh_waveforms_for_window(force=True)
-
-    def _raster_action_selected(self, index: int) -> None:
-        action = str(self.raster_action_combo.itemData(int(index)) or "")
-        if not action:
-            return
-        self.raster_action_combo.blockSignals(True)
-        self.raster_action_combo.setCurrentIndex(0)
-        self.raster_action_combo.blockSignals(False)
-        handlers = {
-            "ibi": self._open_ibi_window,
-            "isi": self._open_isi_window,
-            "burst_corr": self._open_burst_correlation_window,
-            "burst_delay": self._open_burst_delay_window,
-            "burst_cluster": self._open_burst_clustering_window,
-            "save_bursts": self._save_bursts,
-            "export_heatmap_gif": self._export_heatmap_gif,
-        }
-        handler = handlers.get(action)
-        if handler is not None:
-            handler()
 
     def _update_raster_settings_summary(self) -> None:
         window_ms = self._window_ms()
@@ -16755,7 +13075,7 @@ class SpikeRasterWindow(AppDialog):
         threshold_field.setDecimals(self.burst_threshold_z.decimals())
         threshold_field.setSingleStep(self.burst_threshold_z.singleStep())
         threshold_field.setValue(self.burst_threshold_z.value())
-        threshold_field.setToolTip("Z-score threshold above baseline population activity. Typical range: 3-6.")
+        threshold_field.setToolTip("Z-score threshold above baseline population activity. Typical range: 6-10.")
         form.addRow("Burst z-threshold", threshold_field)
 
         min_spikes_field = QSpinBox()
@@ -16956,20 +13276,6 @@ class SpikeRasterWindow(AppDialog):
         self._refresh_heatmap_scale()
         self._refresh_heatmap_for_view(force=True)
 
-    def _heatmap_gif_frame_times(self, start_s: float, end_s: float, frame_step_ms: int) -> np.ndarray:
-        start_s = max(float(self.min_time), float(start_s))
-        end_s = min(float(self.max_time), float(end_s))
-        step_s = max(0.01, float(frame_step_ms) / 1000.0)
-        if end_s < start_s:
-            start_s, end_s = end_s, start_s
-        if end_s <= start_s:
-            return np.asarray([start_s], dtype=float)
-        values = np.arange(start_s, end_s + step_s * 0.5, step_s, dtype=float)
-        values = values[values <= end_s + 1e-9]
-        if values.size == 0 or values[-1] < end_s:
-            values = np.append(values, end_s)
-        return values.astype(float, copy=False)
-
     def _refresh_heatmap_scale(self):
         heatmap_duration_s = max(0.001, self.heatmap_ms.value() / 1000.0)
         cache_key = round(float(heatmap_duration_s), 6)
@@ -17018,79 +13324,6 @@ class SpikeRasterWindow(AppDialog):
         self.heatmap_scale_count = int(scale)
         self._heatmap_scale_cache[cache_key] = self.heatmap_scale_count
         self.heatmap_canvas.set_scale_max_count(self.heatmap_scale_count)
-
-    def _export_heatmap_gif(self):
-        if self.channel_map is None:
-            _show_info_message(self, "Export Heatmap GIF", "Set a channel map before exporting a heatmap GIF.")
-            return False
-
-        dialog = HeatmapGifExportDialog(self.min_time, self.max_time, self.heatmap_ms.value(), self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
-        start_s, end_s, frame_step_ms = dialog.values()
-        frame_times = self._heatmap_gif_frame_times(start_s, end_s, frame_step_ms)
-        if frame_times.size == 0:
-            _show_info_message(self, "Export Heatmap GIF", "No frames are available for the selected time range.")
-            return False
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export firing-rate heatmap GIF",
-            str(Path("data") / "heatmap_activity.gif"),
-            "GIF image (*.gif);;All files (*)",
-        )
-        if not path:
-            return False
-        if Path(path).suffix.lower() != ".gif":
-            path = f"{path}.gif"
-
-        try:
-            from PIL import Image
-        except ImportError:
-            _show_error_message(self, "Export Heatmap GIF failed", "Pillow is required to export animated GIF files.")
-            return False
-
-        self._refresh_heatmap_scale()
-        progress = self._start_progress("Export Heatmap GIF", "Rendering heatmap frames...", int(frame_times.size))
-        frames = []
-        heatmap_duration_s = max(0.001, self.heatmap_ms.value() / 1000.0)
-        selected_start_s = max(float(self.min_time), min(float(start_s), float(end_s)))
-        resolution = max(128, min(512, int(max(self.heatmap_canvas.width(), self.heatmap_canvas.height(), 320))))
-        try:
-            for frame_index, stop_s in enumerate(frame_times):
-                QApplication.processEvents()
-                if _progress_cancel_requested(progress):
-                    self._log("Heatmap GIF export cancelled")
-                    return False
-                window_start_s = max(selected_start_s, float(stop_s) - heatmap_duration_s)
-                counts = self._window_channel_counts(window_start_s, float(stop_s))
-                rgb = self.heatmap_canvas.render_counts_rgb(
-                    counts,
-                    resolution=resolution,
-                    scale_max_count=self.heatmap_scale_count,
-                )
-                frames.append(Image.fromarray(rgb, mode="RGB"))
-                _set_progress_dialog(progress, f"Rendering frame {frame_index + 1}/{frame_times.size}", frame_index + 1)
-
-            if not frames:
-                _show_info_message(self, "Export Heatmap GIF", "No frames were rendered for the selected time range.")
-                return False
-            frames[0].save(
-                path,
-                save_all=True,
-                append_images=frames[1:],
-                duration=max(10, int(frame_step_ms)),
-                loop=0,
-                optimize=False,
-            )
-        except Exception as exc:
-            _show_error_message(self, "Export Heatmap GIF failed", str(exc))
-            return False
-        finally:
-            self._finish_progress(progress)
-
-        _show_info_message(self, "Export Heatmap GIF", f"Saved heatmap GIF:\n{path}")
-        return True
 
     def _toggle_playback(self):
         if self.play_button.isChecked():
@@ -17196,63 +13429,6 @@ class SpikeRasterWindow(AppDialog):
         finally:
             self._finish_progress(progress)
 
-    def _open_ibi_window(self):
-        if not self._ensure_bursts_ready():
-            return None
-        progress = self._start_progress("IBI", "Preparing IBI histogram...", 0)
-        try:
-            window = IBIWindow(self.burst_intervals, self)
-        finally:
-            self._finish_progress(progress)
-        return self._show_analysis_window(window)
-
-    def _open_isi_window(self):
-        progress = self._start_progress("ISI", "Preparing ISI histogram...", 0)
-        try:
-            window = ISIWindow(self.spike_series, self)
-        finally:
-            self._finish_progress(progress)
-        return self._show_analysis_window(window)
-
-    def _open_burst_correlation_window(self):
-        if not self._ensure_bursts_ready():
-            return None
-        progress = self._start_progress("Burst correlation", "Computing burst correlation...", 0)
-        try:
-            window = BurstCorrelationWindow(self.spike_series, self.burst_intervals, self, self.channel_map)
-        finally:
-            self._finish_progress(progress)
-        return self._show_analysis_window(window)
-
-    def _open_burst_delay_window(self):
-        if not self._ensure_bursts_ready():
-            return None
-        for window in list(self.analysis_windows):
-            if isinstance(window, BurstDelayWindow):
-                window.show()
-                window.raise_()
-                window.activateWindow()
-                return window
-        window = BurstDelayWindow(
-            self.spike_series,
-            self.burst_intervals,
-            self,
-            self.channel_map,
-            waveform_series=self.waveform_series,
-            sampling_rate=self.sampling_rate,
-        )
-        return self._show_analysis_window(window)
-
-    def _open_burst_clustering_window(self):
-        if not self._ensure_bursts_ready():
-            return None
-        progress = self._start_progress("Burst clustering", "Preparing burst clustering...", 0)
-        try:
-            window = BurstClusteringWindow(self.spike_series, self.burst_intervals, self)
-        finally:
-            self._finish_progress(progress)
-        return self._show_analysis_window(window)
-
     def _open_burst_trajectory_window(self):
         if not self._ensure_bursts_ready():
             return None
@@ -17262,35 +13438,6 @@ class SpikeRasterWindow(AppDialog):
         finally:
             self._finish_progress(progress)
         return self._show_analysis_window(window)
-
-    def _save_bursts(self):
-        if not self._ensure_bursts_ready():
-            return False
-        if not self.burst_intervals:
-            _show_info_message(self, "Save Bursts", "No detected bursts are available to save.")
-            return False
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save burst sequences",
-            str(Path("data") / "burst_sequences.npy"),
-            "NumPy array (*.npy);;All files (*)",
-        )
-        if not path:
-            return False
-        if Path(path).suffix.lower() != ".npy":
-            path = f"{path}.npy"
-        progress = self._start_progress("Save bursts", "Preparing burst sequences...", 0)
-        try:
-            payload = _burst_sequence_payload(self.spike_series, self.burst_intervals)
-            _set_progress_dialog(progress, "Saving burst sequences...")
-            np.save(path, payload, allow_pickle=True)
-        except Exception as exc:
-            _show_error_message(self, "Save failed", str(exc))
-            return False
-        finally:
-            self._finish_progress(progress)
-        _show_info_message(self, "Save Bursts", f"Saved {payload['burst_count']} bursts: {path}")
-        return True
 
     def _show_analysis_window(self, window: QDialog):
         self.analysis_windows.append(window)
@@ -18207,7 +14354,11 @@ class ClosedLoopControlDialog(AppDialog):
             meta = getattr(record.get("raw_data"), "meta", {}) if record.get("raw_data") is not None else {}
             if isinstance(meta, dict) and meta.get("cfg_path"):
                 return str(meta.get("cfg_path"))
-        return os.environ.get("MAXWELL_CFG_PATH", "")
+        env_path = os.environ.get("MAXWELL_CFG_PATH", "").strip()
+        if env_path:
+            return env_path
+        now = dt.datetime.now()
+        return f"/home/maxwell/configs/{now:%y%m%d}/{now:%Hh%Mm%Ss}.cfg"
 
     def _backend_changed(self) -> None:
         backend = str(self.backend_combo.currentData() or "simulation")
@@ -19264,6 +15415,7 @@ class SortingWorkspaceWindow(AppDialog):
         self.active_sorting_workers = []
         self.sorting_progress = None
         self.lasso = None
+        self.waveform_lasso = None
         self.lasso_mode = None
         self.embedding_view_limits = None
         self.selected_spike_index = None
@@ -19298,9 +15450,11 @@ class SortingWorkspaceWindow(AppDialog):
         self.cluster_id.setRange(0, 99)
         self.cluster_id.setValue(0)
         self.lasso_button = QPushButton("Assign Cluster")
+        self.lasso_button.setToolTip("Draw/lasso in either waveform view or reduction space; both views update from the same labels.")
         self.lasso_button.setCheckable(True)
         self.lasso_button.clicked.connect(self._start_lasso)
-        self.noise_button = QPushButton("Assign Noise")
+        self.noise_button = QPushButton("Mark Tail/Noise")
+        self.noise_button.setToolTip("Draw/lasso waveform tails or reduction-space points to mark them as noise.")
         self.noise_button.setCheckable(True)
         self.noise_button.clicked.connect(self._start_noise_lasso)
         self.hide_noise = QCheckBox("Hide noise")
@@ -19320,6 +15474,7 @@ class SortingWorkspaceWindow(AppDialog):
         self.embedding_canvas = FigureCanvas(Figure(figsize=(6, 5), tight_layout=True))
         self.embedding_canvas.mpl_connect("scroll_event", self._embedding_scroll_zoom)
         self.embedding_canvas.mpl_connect("button_press_event", self._embedding_clicked)
+        self.waveform_ax = None
         self.embedding_ax = None
 
         controls = QHBoxLayout()
@@ -19668,20 +15823,34 @@ class SortingWorkspaceWindow(AppDialog):
         self.lasso_mode = mode
         self.pending_assignment_label = label
         self._refresh_lasso_button_states()
-        message = "Draw regions to mark noise; right-click to exit" if mode == "noise" else (
-            f"Draw regions to assign cluster {label}; right-click to exit"
-        )
+        message = self._assignment_mode_message(initial=True)
         self._begin_lasso(message)
 
     def _begin_lasso(self, message: str):
-        if self.current_embedding.ndim != 2 or self.current_embedding.shape[0] == 0:
-            _show_info_message(self, "Sorting", "Compute an embedding before manual cluster assignment.")
-            return
         if self.lasso is not None:
             self.lasso.disconnect_events()
+            self.lasso = None
+        if self.waveform_lasso is not None:
+            self.waveform_lasso.disconnect_events()
+            self.waveform_lasso = None
+        embedding_ready = (
+            self.embedding_ax is not None
+            and self.current_embedding.ndim == 2
+            and self.current_embedding.shape[0] > 0
+        )
+        waveforms = np.asarray(self.data.waveforms.get(self._channel(), []), dtype=float)
+        waveform_ready = self.waveform_ax is not None and waveforms.ndim == 2 and waveforms.shape[0] > 0
+        if not embedding_ready and not waveform_ready:
+            _show_info_message(self, "Sorting", "No waveform or embedding view is available for manual assignment.")
+            self._stop_lasso_mode("Assignment mode off")
+            return
         self.status.setText(message)
-        self.lasso = LassoSelector(self.embedding_ax, self._finish_lasso)
-        self.lasso.connect_event("button_press_event", self._lasso_button_press)
+        if embedding_ready:
+            self.lasso = LassoSelector(self.embedding_ax, self._finish_lasso)
+            self.lasso.connect_event("button_press_event", self._lasso_button_press)
+        if waveform_ready:
+            self.waveform_lasso = LassoSelector(self.waveform_ax, self._finish_waveform_lasso)
+            self.waveform_lasso.connect_event("button_press_event", self._lasso_button_press)
 
     def _lasso_button_press(self, event):
         if event.button == 3:
@@ -19691,6 +15860,9 @@ class SortingWorkspaceWindow(AppDialog):
         if self.lasso is not None:
             self.lasso.disconnect_events()
             self.lasso = None
+        if self.waveform_lasso is not None:
+            self.waveform_lasso.disconnect_events()
+            self.waveform_lasso = None
         self.lasso_mode = None
         self._refresh_lasso_button_states()
         self.status.setText(message)
@@ -19703,6 +15875,9 @@ class SortingWorkspaceWindow(AppDialog):
         if self.lasso is not None:
             self.lasso.disconnect_events()
             self.lasso = None
+        if self.waveform_lasso is not None:
+            self.waveform_lasso.disconnect_events()
+            self.waveform_lasso = None
         points = self._embedding_xy()
         selected = np.zeros(points.shape[0], dtype=bool)
         finite_points = np.isfinite(points).all(axis=1)
@@ -19710,21 +15885,65 @@ class SortingWorkspaceWindow(AppDialog):
             selected[finite_points] = MplPath(vertices).contains_points(points[finite_points])
         if self.current_labels.size == selected.size:
             selected &= self._visible_label_mask(self.current_labels)
+        self._apply_manual_assignment_mask(selected, "reduction space")
+
+    def _finish_waveform_lasso(self, vertices):
+        if self.lasso is not None:
+            self.lasso.disconnect_events()
+            self.lasso = None
+        if self.waveform_lasso is not None:
+            self.waveform_lasso.disconnect_events()
+            self.waveform_lasso = None
+        selected = self._waveform_lasso_mask(vertices)
+        self._apply_manual_assignment_mask(selected, "waveform view")
+
+    def _waveform_lasso_mask(self, vertices) -> np.ndarray:
+        channel = self._channel()
+        waveforms = np.asarray(self.data.waveforms.get(channel, []), dtype=float)
+        labels = self.current_labels
+        if waveforms.ndim != 2 or labels.size != waveforms.shape[0]:
+            return np.zeros(0, dtype=bool)
+        x = _waveform_time_axis(waveforms.shape[1], self.data.sr)
+        if not np.isfinite(x).all():
+            x = np.arange(waveforms.shape[1], dtype=float)
+        path = MplPath(vertices)
+        visible_indices = np.flatnonzero(self._visible_label_mask(labels))
+        selected = np.zeros(waveforms.shape[0], dtype=bool)
+        for start in range(0, visible_indices.size, 512):
+            chunk = visible_indices[start : start + 512]
+            chunk_waveforms = waveforms[chunk]
+            x_values = np.broadcast_to(x.reshape(1, -1), chunk_waveforms.shape)
+            points = np.column_stack([x_values.reshape(-1), chunk_waveforms.reshape(-1)])
+            finite = np.isfinite(points).all(axis=1)
+            inside = np.zeros(points.shape[0], dtype=bool)
+            if np.any(finite):
+                inside[finite] = path.contains_points(points[finite])
+            selected[chunk] = inside.reshape(chunk_waveforms.shape).any(axis=1)
+        return selected
+
+    def _apply_manual_assignment_mask(self, selected: np.ndarray, source: str) -> None:
+        if self.current_labels.size != selected.size:
+            selected = np.zeros(self.current_labels.size, dtype=bool)
         count = int(np.count_nonzero(selected))
+        target = "noise" if self.pending_assignment_label == -1 else f"cluster {self.pending_assignment_label}"
         if count:
             self._push_undo()
             self.current_labels[selected] = self.pending_assignment_label
             self._save_current_channel()
             self._draw_all()
             self.undo_button.setEnabled(True)
-        target = "noise" if self.pending_assignment_label == -1 else f"cluster {self.pending_assignment_label}"
-        self.status.setText(f"Assigned {count} spikes to {target}")
+        self.status.setText(f"Assigned {count} spikes to {target} from {source}")
         if self.lasso_mode is not None:
-            mode = self.lasso_mode
-            message = "Draw another region to mark noise; right-click to exit" if mode == "noise" else (
-                f"Draw another region to assign cluster {self.pending_assignment_label}; right-click to exit"
-            )
-            self._begin_lasso(message)
+            self._begin_lasso(self._assignment_mode_message(initial=False))
+
+    def _assignment_mode_message(self, *, initial: bool) -> str:
+        prefix = "Draw regions" if initial else "Draw another region"
+        if self.pending_assignment_label == -1:
+            return f"{prefix} in waveforms or reduction space to mark noise; right-click to exit"
+        return (
+            f"{prefix} in waveforms or reduction space to assign cluster "
+            f"{self.pending_assignment_label}; right-click to exit"
+        )
 
     def _push_undo(self):
         channel = self._channel()
@@ -19835,7 +16054,8 @@ class SortingWorkspaceWindow(AppDialog):
     def _draw_waveforms(self):
         figure = self.waveform_canvas.figure
         figure.clear()
-        ax = figure.add_subplot(111)
+        self.waveform_ax = figure.add_subplot(111)
+        ax = self.waveform_ax
         channel = self._channel()
         waveforms = np.asarray(self.data.waveforms.get(channel, []), dtype=float)
         labels = self.current_labels
@@ -20304,6 +16524,8 @@ class StimulusBlockPhase:
 
 
 class StimulusGenerationDialog(AppDialog):
+    RECORD_ONLY_BLOCK_PHASE_KEY = "__record_only__"
+
     def __init__(self, records: list[dict], parent=None, channel_map: ChannelMap | None = None):
         super().__init__(parent)
         self.setWindowTitle("Stimulus Generation")
@@ -20537,46 +16759,71 @@ class StimulusGenerationDialog(AppDialog):
         form.setColumnStretch(1, 1)
         form.setColumnStretch(2, 0)
         form.setColumnStretch(3, 1)
-        self.protocol_fields: dict[str, QLineEdit] = {}
+        self.protocol_fields: dict[str, QWidget] = {}
         self.protocol_field_labels: dict[str, QLabel] = {}
+        self.protocol_option_fields: dict[str, NoWheelComboBox] = {}
+        self.protocol_category = NoWheelComboBox()
+        self.protocol_category.addItems([name for name, _types in stimulus_builder.PROTOCOL_TYPE_GROUPS])
+        self.protocol_category_label = QLabel("Mode group")
+        self.protocol_category_label.setMaximumWidth(92)
+        form.addWidget(self.protocol_category_label, 0, 0)
+        form.addWidget(self.protocol_category, 0, 1)
         self.protocol_type = NoWheelComboBox()
-        self.protocol_type.addItems(list(stimulus_builder.PROTOCOL_TYPES))
         self.protocol_type_label = self._required_label("Type")
         self.protocol_type_label.setMaximumWidth(92)
-        form.addWidget(self.protocol_type_label, 0, 0)
-        form.addWidget(self.protocol_type, 0, 1)
+        form.addWidget(self.protocol_type_label, 0, 2)
+        form.addWidget(self.protocol_type, 0, 3)
+        self.protocol_fields["name"] = QLineEdit()
+        self.protocol_fields["name"].setVisible(False)
         required_protocol = {
-            "name",
             "amplitude_mv",
             "pulse_width_us",
             "pulse_frequency_hz",
             "pulses_per_burst",
-            "interpulse_interval_ms",
             "burst_count",
-            "burst_interval_ms",
+            "burst_frequency_hz",
             "start_ms",
             "channel",
             "poisson_duration_s",
+            "pool_event_count",
+            "pool_event_interval_ms",
+            "pool_electrodes_per_event",
+            "pool_selection_mode",
         }
         compact_rows = [
-            ("Name", "name"),
             ("Amplitude mV", "amplitude_mv"),
             ("Pulse width us", "pulse_width_us"),
             ("Pulse frequency Hz", "pulse_frequency_hz"),
             ("Pulses per burst", "pulses_per_burst"),
-            ("Interpulse ms", "interpulse_interval_ms"),
+            ("Random IPI", "randomize_burst_pulse_intervals"),
+            ("IPI min ms", "burst_pulse_interval_min_ms"),
+            ("IPI max ms", "burst_pulse_interval_max_ms"),
             ("Burst count", "burst_count"),
-            ("Burst interval ms", "burst_interval_ms"),
+            ("Burst frequency Hz", "burst_frequency_hz"),
             ("Start ms", "start_ms"),
             ("DAC channel", "channel"),
             ("Poisson duration s", "poisson_duration_s"),
+            ("Pool events", "pool_event_count"),
+            ("Pool interval ms", "pool_event_interval_ms"),
+            ("Electrodes/stim", "pool_electrodes_per_event"),
+            ("Pool select", "pool_selection_mode"),
         ]
-        for index, (label, key) in enumerate(compact_rows, start=1):
-            field = QLineEdit()
+        option_rows = {
+            "randomize_burst_pulse_intervals": [("Off", "false"), ("On", "true")],
+            "pool_selection_mode": [("Random", "random"), ("Cycle", "cycle"), ("All", "all")],
+        }
+        for index, (label, key) in enumerate(compact_rows):
+            if key in option_rows:
+                field = NoWheelComboBox()
+                for item_label, item_value in option_rows[key]:
+                    field.addItem(item_label, item_value)
+                self.protocol_option_fields[key] = field
+            else:
+                field = QLineEdit()
             field.setMinimumWidth(150)
             field.setMaximumWidth(240)
             self.protocol_fields[key] = field
-            grid_row = index // 2
+            grid_row = 1 + index // 2
             grid_col = (index % 2) * 2
             label_widget = self._required_label(label) if key in required_protocol else QLabel(label)
             label_widget.setMaximumWidth(112)
@@ -20598,7 +16845,7 @@ class StimulusGenerationDialog(AppDialog):
         self.lambda_mode = NoWheelComboBox()
         self.lambda_mode.addItems(["scale", "normal"])
         self.lambda_mode.currentIndexChanged.connect(lambda *_: self._update_protocol_type_fields())
-        lambda_row = (len(compact_rows) + 1) // 2
+        lambda_row = 1 + (len(compact_rows) + 1) // 2
         self.lambda_mode_label = QLabel("Lambda mode")
         self.lambda_mode_label.setMaximumWidth(112)
         form.addWidget(self.lambda_mode_label, lambda_row, 2)
@@ -20633,6 +16880,12 @@ class StimulusGenerationDialog(AppDialog):
         self.custom_points_label = QLabel("Custom sequence")
         edit_layout.addWidget(self.custom_points_label)
         edit_layout.addWidget(self.custom_points)
+        self.pool_event_groups = QTextEdit()
+        self.pool_event_groups.setMaximumHeight(64)
+        self.pool_event_groups.setPlaceholderText("Optional: one event per line or separated by |, e.g. 7317,7318 | 7420,7421")
+        self.pool_event_groups_label = QLabel("Per-stim electrodes")
+        edit_layout.addWidget(self.pool_event_groups_label)
+        edit_layout.addWidget(self.pool_event_groups)
         buttons = QHBoxLayout()
         save = QPushButton("Add")
         save.clicked.connect(self._save_protocol)
@@ -20646,6 +16899,8 @@ class StimulusGenerationDialog(AppDialog):
         edit_layout.addLayout(buttons)
         scroll.setWidget(editor)
         layout.addWidget(scroll, 1)
+        self._refresh_protocol_type_options("single_pulse")
+        self.protocol_category.currentIndexChanged.connect(self._protocol_category_changed)
         self.protocol_type.currentIndexChanged.connect(self._protocol_type_changed)
         self.protocol_fields["name"].textChanged.connect(self._protocol_name_changed)
         self._update_protocol_type_fields()
@@ -20659,8 +16914,8 @@ class StimulusGenerationDialog(AppDialog):
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
         left.addWidget(hint)
-        self.block_table = QTableWidget(0, 3)
-        self.block_table.setHorizontalHeaderLabels(["Block", "Group", "Protocol"])
+        self.block_table = QTableWidget(0, 4)
+        self.block_table.setHorizontalHeaderLabels(["Block", "Mode", "Group", "Protocol"])
         self.block_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.block_table.itemSelectionChanged.connect(self._load_selected_block)
         self.block_phase_table = QTableWidget(0, 3)
@@ -20700,7 +16955,12 @@ class StimulusGenerationDialog(AppDialog):
         self.block_protocol = NoWheelComboBox()
         self.block_phase_combo = NoWheelComboBox()
         self.block_phase_combo.currentIndexChanged.connect(self._block_phase_combo_changed)
-        form.addRow("Stim block phase", self.block_phase_combo)
+        self.block_phase_combo.addItem("Record only (no stimulation)", self.RECORD_ONLY_BLOCK_PHASE_KEY)
+        form.addRow("Stim block phase / mode", self.block_phase_combo)
+        self.block_mode_combo = NoWheelComboBox()
+        self.block_mode_combo.addItem("Stimulate", "open_loop")
+        self.block_mode_combo.addItem("Record only", "record_only")
+        form.addRow("Block mode", self.block_mode_combo)
         self.phase_duration_fields: dict[str, QLineEdit] = {}
         self.phase_mode_combos: dict[str, QComboBox] = {}
         phase_labels = {
@@ -20718,10 +16978,16 @@ class StimulusGenerationDialog(AppDialog):
         save.clicked.connect(self._save_block)
         remove = QPushButton("Remove")
         remove.clicked.connect(self._remove_block)
+        move_up = QPushButton("Up")
+        move_up.clicked.connect(self._move_block_up)
+        move_down = QPushButton("Down")
+        move_down.clicked.connect(self._move_block_down)
         self.block_add_button = save
         self.block_remove_button = remove
         buttons.addWidget(save)
         buttons.addWidget(remove)
+        buttons.addWidget(move_up)
+        buttons.addWidget(move_down)
         edit_layout.addLayout(buttons)
         edit_layout.addStretch(1)
         self.block_editor = editor
@@ -20888,6 +17154,11 @@ class StimulusGenerationDialog(AppDialog):
         self.preview_map_detail = QLabel("Click an electrode to inspect it.")
         self.preview_map_detail.setObjectName("MutedText")
         self.preview_map_detail.setWordWrap(True)
+        self.preview_distribution_canvas = FigureCanvas(Figure(figsize=(4.8, 1.75)))
+        self.preview_distribution_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.preview_distribution_canvas.setMinimumHeight(132)
+        self.preview_distribution_canvas.setMaximumHeight(185)
+        self.preview_distribution_canvas.setVisible(False)
         map_panel = QVBoxLayout()
         map_panel.setContentsMargins(0, 0, 0, 0)
         map_panel.setSpacing(4)
@@ -20895,6 +17166,7 @@ class StimulusGenerationDialog(AppDialog):
         map_panel.addWidget(self.preview_map_detail)
         preview_stack.addWidget(self.preview_canvas, 2)
         preview_stack.addLayout(map_panel, 3)
+        preview_stack.addWidget(self.preview_distribution_canvas, 1)
         right.addLayout(preview_stack, 1)
         layout.addLayout(right, 2)
 
@@ -20903,8 +17175,8 @@ class StimulusGenerationDialog(AppDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         hint = QLabel(
-            "Generate writes a standalone MaxWell experiment package with config YAML, Python runner, C++ scaffold, "
-            "and exported firing-rate sources for random stimulation."
+            "Generate writes a standalone MaxWell experiment package into a unique subfolder under the output root. "
+            "Each generated code environment is preserved instead of overwriting earlier packages."
         )
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
@@ -20921,7 +17193,7 @@ class StimulusGenerationDialog(AppDialog):
         browse = QPushButton("Browse")
         browse.clicked.connect(self._browse_output)
         row_layout.addWidget(browse)
-        form.addRow("Output directory", row)
+        form.addRow("Output root", row)
         layout.addWidget(self.generate_form_widget)
         generate = QPushButton("Generate")
         generate.setObjectName("PrimaryButton")
@@ -20951,23 +17223,32 @@ class StimulusGenerationDialog(AppDialog):
         block_hint.setWordWrap(True)
         block_layout.addWidget(block_hint)
         self.block_phase_table.setMinimumHeight(120)
-        self.block_phase_table.setMaximumHeight(150)
+        self.block_phase_table.setMaximumHeight(16777215)
         self.block_table.setMinimumHeight(146)
-        self.block_table.setMaximumHeight(180)
-        phase_row = QHBoxLayout()
-        phase_list = QVBoxLayout()
-        phase_list.addWidget(QLabel("Block phases"))
-        phase_list.addWidget(self.block_phase_table, 1)
-        phase_row.addLayout(phase_list, 1)
-        phase_row.addWidget(self.block_phase_controls, 0)
-        block_layout.addLayout(phase_row)
-        block_row = QHBoxLayout()
-        block_list = QVBoxLayout()
-        block_list.addWidget(QLabel("Blocks"))
-        block_list.addWidget(self.block_table, 1)
-        block_row.addLayout(block_list, 1)
-        block_row.addWidget(self.block_editor, 0)
-        block_layout.addLayout(block_row)
+        self.block_table.setMaximumHeight(16777215)
+        phase_panel = QWidget()
+        phase_panel_layout = QVBoxLayout(phase_panel)
+        phase_panel_layout.setContentsMargins(0, 0, 0, 0)
+        phase_panel_layout.setSpacing(6)
+        phase_panel_layout.addWidget(QLabel("Block phases"))
+        phase_panel_layout.addWidget(self.block_phase_table, 1)
+        phase_panel_layout.addWidget(self.block_phase_controls)
+
+        block_panel = QWidget()
+        block_panel_layout = QVBoxLayout(block_panel)
+        block_panel_layout.setContentsMargins(0, 0, 0, 0)
+        block_panel_layout.setSpacing(6)
+        block_panel_layout.addWidget(QLabel("Blocks"))
+        block_panel_layout.addWidget(self.block_table, 1)
+        block_panel_layout.addWidget(self.block_editor, 0)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(phase_panel)
+        split.addWidget(block_panel)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        split.setChildrenCollapsible(False)
+        block_layout.addWidget(split, 1)
         self.experiment_blocks_container.addWidget(block_section)
 
         generate_section = QFrame()
@@ -21037,7 +17318,8 @@ class StimulusGenerationDialog(AppDialog):
     def _refresh_block_table(self) -> None:
         self.block_table.setRowCount(len(self.blocks))
         for row, block in enumerate(self.blocks):
-            for column, value in enumerate([block.name, block.electrode_group, block.protocol]):
+            mode = self._block_mode_label(self._block_mode_for_block(block))
+            for column, value in enumerate([block.name, mode, block.electrode_group, block.protocol]):
                 self.block_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.block_table.resizeColumnsToContents()
 
@@ -21052,6 +17334,7 @@ class StimulusGenerationDialog(AppDialog):
         current_phase = self.block_phase_combo.currentData()
         self.block_phase_combo.blockSignals(True)
         self.block_phase_combo.clear()
+        self.block_phase_combo.addItem("Record only (no stimulation)", self.RECORD_ONLY_BLOCK_PHASE_KEY)
         for phase in self.block_phases:
             self.block_phase_combo.addItem(phase.name, phase.name)
         self.block_group.clear()
@@ -21065,6 +17348,7 @@ class StimulusGenerationDialog(AppDialog):
         if self.block_phase_combo.currentIndex() < 0 and self.block_phase_combo.count() > 0:
             self.block_phase_combo.setCurrentIndex(0)
         self._block_phase_combo_changed()
+        self._sync_block_mode_combo()
 
     def _refresh_preview_combo(self) -> None:
         current = self.preview_combo.currentData()
@@ -21139,6 +17423,30 @@ class StimulusGenerationDialog(AppDialog):
         phase = next((item for item in self.block_phases if item.name == name), None)
         if phase is not None:
             self._apply_block_phase_to_block_form(phase)
+        self._sync_block_mode_combo()
+
+    def _sync_block_mode_combo(self) -> None:
+        if not hasattr(self, "block_mode_combo"):
+            return
+        phase_key = str(self.block_phase_combo.currentData() or "")
+        if phase_key == self.RECORD_ONLY_BLOCK_PHASE_KEY:
+            self._set_combo_data(self.block_mode_combo, "record_only")
+        else:
+            self._set_combo_data(self.block_mode_combo, "open_loop")
+
+    @staticmethod
+    def _block_mode_for_block(block) -> str:
+        for phase in getattr(block, "phases", []) or []:
+            if getattr(phase, "id", "") == "02_stim":
+                return str(getattr(phase, "mode", "open_loop") or "open_loop")
+        return "open_loop"
+
+    @staticmethod
+    def _block_mode_label(mode: str) -> str:
+        value = str(mode or "").strip().lower()
+        if value in {"record_only", "recording_only", "no_stim", "none"}:
+            return "Record only"
+        return "Stimulate"
 
     def _fill_group_form(self, group) -> None:
         self.group_name.setText(group.name)
@@ -21151,18 +17459,93 @@ class StimulusGenerationDialog(AppDialog):
             self.preview_group_name.blockSignals(False)
             self.preview_group_electrodes.blockSignals(False)
 
+    def _protocol_group_for_type(self, protocol_type: str) -> str:
+        protocol_type = str(protocol_type or "")
+        for group_name, types in stimulus_builder.PROTOCOL_TYPE_GROUPS:
+            if protocol_type in types:
+                return group_name
+        return str(self.protocol_category.currentText() or "")
+
+    def _protocol_types_for_group(self, group_name: str) -> tuple[str, ...]:
+        for name, types in stimulus_builder.PROTOCOL_TYPE_GROUPS:
+            if name == group_name:
+                return tuple(types)
+        return tuple(stimulus_builder.PROTOCOL_TYPES)
+
+    def _protocol_type_value(self) -> str:
+        value = self.protocol_type.currentData()
+        return str(value if value is not None else self.protocol_type.currentText())
+
+    def _refresh_protocol_type_options(self, selected_type: str | None = None) -> None:
+        if not hasattr(self, "protocol_type") or not hasattr(self, "protocol_category"):
+            return
+        current = str(selected_type or self._protocol_type_value() or "")
+        types = self._protocol_types_for_group(str(self.protocol_category.currentText() or ""))
+        if current not in types:
+            current = types[0] if types else ""
+        self.protocol_type.blockSignals(True)
+        self.protocol_type.clear()
+        for protocol_type in types:
+            self.protocol_type.addItem(stimulus_builder.PROTOCOL_TYPE_LABELS.get(protocol_type, protocol_type), protocol_type)
+        index = self.protocol_type.findData(current)
+        if index >= 0:
+            self.protocol_type.setCurrentIndex(index)
+        self.protocol_type.blockSignals(False)
+
+    def _set_protocol_type(self, protocol_type: str, *, update_name: bool = True) -> None:
+        protocol_type = str(protocol_type or "")
+        group_name = self._protocol_group_for_type(protocol_type)
+        if group_name:
+            self.protocol_category.blockSignals(True)
+            self._set_combo_text(self.protocol_category, group_name)
+            self.protocol_category.blockSignals(False)
+        self._refresh_protocol_type_options(protocol_type)
+        if update_name:
+            self._protocol_type_changed()
+
+    def _set_protocol_field_value(self, key: str, value) -> None:
+        field = self.protocol_fields.get(key)
+        if field is None:
+            return
+        if isinstance(field, QComboBox):
+            text = "true" if value is True else "false" if value is False else str(value)
+            data_index = field.findData(text)
+            if data_index >= 0:
+                field.setCurrentIndex(data_index)
+                return
+            text_index = field.findText(text)
+            if text_index >= 0:
+                field.setCurrentIndex(text_index)
+                return
+            return
+        field.setText(str(value))
+
+    def _protocol_field_value(self, key: str, default: str = "") -> str:
+        field = self.protocol_fields.get(key)
+        if field is None:
+            return str(default)
+        if isinstance(field, QComboBox):
+            value = field.currentData()
+            return str(value if value is not None else field.currentText())
+        return str(field.text() if hasattr(field, "text") else default)
+
     def _fill_protocol_form(self, protocol) -> None:
         self.protocol_fields["name"].setText(protocol.name)
-        self._set_combo_text(self.protocol_type, protocol.type)
+        self._set_protocol_type(protocol.type, update_name=False)
         for key, field in self.protocol_fields.items():
             if key == "name":
                 continue
-            field.setText(str(getattr(protocol, key)))
+            self._set_protocol_field_value(key, getattr(protocol, key))
         self._set_combo_text(self.lambda_mode, protocol.lambda_mode)
         self.custom_points.setPlainText("\n".join(
             f"{point['time_ms']}, {point['amplitude_mv']}, {point.get('duration_us', protocol.pulse_width_us)}, {point.get('channel', protocol.channel)}"
             for point in protocol.custom_points
         ))
+        if hasattr(self, "pool_event_groups"):
+            self.pool_event_groups.setPlainText("\n".join(
+                ", ".join(str(value) for value in group)
+                for group in getattr(protocol, "pool_event_groups", []) or []
+            ))
         self._set_combo_data(self.source_combo, self.protocol_source_paths.get(protocol.name, ""))
         self._update_protocol_type_fields()
 
@@ -21172,7 +17555,13 @@ class StimulusGenerationDialog(AppDialog):
             (phase for phase in self.block_phases if phase.electrode_group == block.electrode_group and phase.protocol == block.protocol),
             None,
         )
-        self._set_combo_data(self.block_phase_combo, matching_phase.name if matching_phase is not None else "")
+        block_mode = self._block_mode_for_block(block)
+        if matching_phase is None and block_mode == "record_only":
+            self._set_combo_data(self.block_phase_combo, self.RECORD_ONLY_BLOCK_PHASE_KEY)
+        else:
+            self._set_combo_data(self.block_phase_combo, matching_phase.name if matching_phase is not None else "")
+        if hasattr(self, "block_mode_combo"):
+            self._set_combo_data(self.block_mode_combo, block_mode)
         self._set_combo_data(self.block_group, block.electrode_group)
         self._set_combo_data(self.block_protocol, block.protocol)
         group = next((item for item in self.groups if item.name == block.electrode_group), None)
@@ -21386,7 +17775,7 @@ class StimulusGenerationDialog(AppDialog):
         if source_path:
             protocol.spontaneous_data_path = source_path
         series = self._preview_series_for_protocol(protocol)
-        if str(getattr(protocol, "type", "")) not in {"poisson_random_electrodes", "custom_sequence"}:
+        if str(getattr(protocol, "type", "")) not in {"poisson_random_electrodes", "custom_sequence", "electrode_pool_sequence"}:
             series = self._apply_preview_site_group_to_series(series, group.electrodes)
         self._render_protocol_preview(protocol, series_override=series, stimulation_override=group.electrodes)
 
@@ -21458,8 +17847,8 @@ class StimulusGenerationDialog(AppDialog):
             _show_error_message(self, "Invalid protocol", str(exc))
             return
         if _database_key_exists(self.protocols, protocol.name):
-            _show_duplicate_database_warning(self, "protocol library", protocol.name)
-            return
+            protocol.name = self._unique_protocol_name(protocol.name)
+            self.protocol_fields["name"].setText(protocol.name)
         source_path = str(self.source_combo.currentData() or "")
         if protocol.type == "poisson_random_electrodes" and not source_path:
             _show_error_message(self, "Invalid protocol", "Select a spontaneous source before adding a poisson random protocol")
@@ -21481,21 +17870,27 @@ class StimulusGenerationDialog(AppDialog):
     def _save_block(self) -> None:
         try:
             phase_name = str(self.block_phase_combo.currentData() or "")
+            block_mode = str(self.block_mode_combo.currentData() or "open_loop") if hasattr(self, "block_mode_combo") else "open_loop"
             selected_phase = next((phase for phase in self.block_phases if phase.name == phase_name), None)
-            if selected_phase is None:
-                raise ValueError("Select a saved block phase for the stim phase")
-            electrode_group = selected_phase.electrode_group
-            protocol_name = selected_phase.protocol
+            if phase_name == self.RECORD_ONLY_BLOCK_PHASE_KEY:
+                electrode_group = ""
+                protocol_name = ""
+                selected_phase = None
+            else:
+                if selected_phase is None:
+                    raise ValueError("Select a saved block phase for the stim phase")
+                electrode_group = selected_phase.electrode_group
+                protocol_name = selected_phase.protocol
             phases = [
                 stimulus_builder.Phase(
                     phase_id,
                     int(self.phase_duration_fields[phase_id].text() or 300),
-                    "open_loop",
+                    block_mode if phase_id == "02_stim" else "open_loop",
                 )
                 for phase_id in stimulus_builder.PHASES
             ]
             block = stimulus_builder.ExperimentBlock(
-                self._block_name_for_phase(selected_phase.name),
+                self._block_name_for_phase(selected_phase.name if selected_phase is not None else "record_only"),
                 electrode_group,
                 protocol_name,
                 phases,
@@ -21510,6 +17905,26 @@ class StimulusGenerationDialog(AppDialog):
         self._select_block_by_name(block.name)
         self._refresh_block_combos()
         self._fill_block_form(block)
+
+    def _move_block_up(self) -> None:
+        row = self._selected_table_row(self.block_table)
+        if row is None or row <= 0 or row >= len(self.blocks):
+            return
+        self.blocks[row - 1], self.blocks[row] = self.blocks[row], self.blocks[row - 1]
+        self._clear_preview_caches()
+        self._refresh_block_table()
+        self.block_table.selectRow(row - 1)
+        self._fill_block_form(self.blocks[row - 1])
+
+    def _move_block_down(self) -> None:
+        row = self._selected_table_row(self.block_table)
+        if row is None or row < 0 or row >= len(self.blocks) - 1:
+            return
+        self.blocks[row + 1], self.blocks[row] = self.blocks[row], self.blocks[row + 1]
+        self._clear_preview_caches()
+        self._refresh_block_table()
+        self.block_table.selectRow(row + 1)
+        self._fill_block_form(self.blocks[row + 1])
 
     def _remove_group(self) -> None:
         row = self._selected_table_row(self.group_table)
@@ -21681,18 +18096,37 @@ class StimulusGenerationDialog(AppDialog):
             index += 1
         return f"{cleaned}_{index}"
 
+    def _unique_protocol_name(self, base: str) -> str:
+        existing = {protocol.name for protocol in self.protocols}
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "protocol"
+        if cleaned not in existing:
+            return cleaned
+        index = 2
+        while f"{cleaned}_{index}" in existing:
+            index += 1
+        return f"{cleaned}_{index}"
+
     def _protocol_from_form(self):
+        protocol_type = self._protocol_type_value().strip()
+        protocol_name = self.protocol_fields["name"].text().strip()
+        if not protocol_name:
+            protocol_name = self._unique_protocol_name(stimulus_builder._default_protocol_name(protocol_type))
         return stimulus_builder.StimulusProtocol(
-            name=self.protocol_fields["name"].text().strip(),
-            type=str(self.protocol_type.currentText()).strip(),
+            name=protocol_name,
+            type=protocol_type,
             amplitude_mv=float(self.protocol_fields["amplitude_mv"].text() or 150),
             pulse_width_us=float(self.protocol_fields["pulse_width_us"].text() or 300),
             inter_phase_interval_us=float(self.protocol_fields["inter_phase_interval_us"].text() or 0),
             pulse_frequency_hz=float(self.protocol_fields["pulse_frequency_hz"].text() or 20),
             pulses_per_burst=int(self.protocol_fields["pulses_per_burst"].text() or 5),
-            interpulse_interval_ms=float(self.protocol_fields["interpulse_interval_ms"].text() or 50),
+            interpulse_interval_ms=0.0,
+            randomize_burst_pulse_intervals=self._protocol_field_value(
+                "randomize_burst_pulse_intervals", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            burst_pulse_interval_min_ms=float(self.protocol_fields["burst_pulse_interval_min_ms"].text() or 10),
+            burst_pulse_interval_max_ms=float(self.protocol_fields["burst_pulse_interval_max_ms"].text() or 100),
             burst_count=int(self.protocol_fields["burst_count"].text() or 3),
-            burst_interval_ms=float(self.protocol_fields["burst_interval_ms"].text() or 200),
+            burst_frequency_hz=float(self.protocol_fields["burst_frequency_hz"].text() or 5),
             start_ms=float(self.protocol_fields["start_ms"].text() or 1500),
             channel=int(self.protocol_fields["channel"].text() or 0),
             custom_points=stimulus_builder.parse_custom_points(self.custom_points.toPlainText()),
@@ -21705,29 +18139,43 @@ class StimulusGenerationDialog(AppDialog):
             lambda_mean_hz=float(self.protocol_fields["lambda_mean_hz"].text() or 1.0),
             lambda_std_hz=float(self.protocol_fields["lambda_std_hz"].text() or 0.25),
             random_seed=int(self.protocol_fields["random_seed"].text() or 42),
+            pool_event_count=int(self.protocol_fields["pool_event_count"].text() or 10),
+            pool_event_interval_ms=float(self.protocol_fields["pool_event_interval_ms"].text() or 1000),
+            pool_electrodes_per_event=int(self.protocol_fields["pool_electrodes_per_event"].text() or 1),
+            pool_selection_mode=self._protocol_field_value("pool_selection_mode", "random").strip() or "random",
+            pool_event_groups=stimulus_builder.parse_electrode_event_groups(self.pool_event_groups.toPlainText()),
             notes="",
         )
+
+    def _protocol_category_changed(self, *_args) -> None:
+        previous_type = str(self._protocol_type_value() or "")
+        self._refresh_protocol_type_options(previous_type)
+        if str(self._protocol_type_value() or "") != previous_type:
+            self._protocol_type_changed()
+        else:
+            self._update_protocol_type_fields()
 
     def _protocol_type_changed(self, *_args) -> None:
         self._clear_preview_caches()
         if getattr(self, "_protocol_name_auto", True):
             self._protocol_name_auto = True
             self.protocol_fields["name"].blockSignals(True)
-            self.protocol_fields["name"].setText(stimulus_builder._default_protocol_name(self.protocol_type.currentText()))
+            self.protocol_fields["name"].setText(stimulus_builder._default_protocol_name(self._protocol_type_value()))
             self.protocol_fields["name"].blockSignals(False)
         self._update_protocol_type_fields()
 
     def _protocol_name_changed(self, text: str) -> None:
-        default_name = stimulus_builder._default_protocol_name(self.protocol_type.currentText())
+        default_name = stimulus_builder._default_protocol_name(self._protocol_type_value())
         self._protocol_name_auto = not str(text or "").strip() or str(text).strip() == default_name
 
-    def _protocol_field_sets_for_type(self, protocol_type: str) -> tuple[set[str], set[str], bool, bool, bool]:
+    def _protocol_field_sets_for_type(self, protocol_type: str) -> tuple[set[str], set[str], bool, bool, bool, bool]:
         protocol_type = str(protocol_type or "")
-        visible = {"name"}
+        visible = set()
         advanced = set()
         show_custom = False
         show_source = False
         show_lambda = False
+        show_pool_events = False
         if protocol_type == "single_pulse":
             visible.update({"amplitude_mv", "pulse_width_us", "start_ms", "channel"})
             advanced.add("inter_phase_interval_us")
@@ -21737,7 +18185,11 @@ class StimulusGenerationDialog(AppDialog):
                 "pulse_width_us",
                 "pulse_frequency_hz",
                 "pulses_per_burst",
-                "interpulse_interval_ms",
+                "randomize_burst_pulse_intervals",
+                "burst_pulse_interval_min_ms",
+                "burst_pulse_interval_max_ms",
+                "burst_count",
+                "burst_frequency_hz",
                 "start_ms",
                 "channel",
             })
@@ -21748,9 +18200,11 @@ class StimulusGenerationDialog(AppDialog):
                 "pulse_width_us",
                 "pulse_frequency_hz",
                 "pulses_per_burst",
-                "interpulse_interval_ms",
+                "randomize_burst_pulse_intervals",
+                "burst_pulse_interval_min_ms",
+                "burst_pulse_interval_max_ms",
                 "burst_count",
-                "burst_interval_ms",
+                "burst_frequency_hz",
                 "start_ms",
                 "channel",
             })
@@ -21761,9 +18215,8 @@ class StimulusGenerationDialog(AppDialog):
                 "pulse_width_us",
                 "pulse_frequency_hz",
                 "pulses_per_burst",
-                "interpulse_interval_ms",
                 "burst_count",
-                "burst_interval_ms",
+                "burst_frequency_hz",
                 "start_ms",
                 "channel",
             })
@@ -21785,12 +18238,24 @@ class StimulusGenerationDialog(AppDialog):
             })
             show_source = True
             show_lambda = True
-        return visible, advanced, show_custom, show_source, show_lambda
+        elif protocol_type == "electrode_pool_sequence":
+            visible.update({
+                "amplitude_mv",
+                "pulse_width_us",
+                "start_ms",
+                "pool_event_count",
+                "pool_event_interval_ms",
+                "pool_electrodes_per_event",
+                "pool_selection_mode",
+            })
+            advanced.update({"inter_phase_interval_us", "random_seed"})
+            show_pool_events = True
+        return visible, advanced, show_custom, show_source, show_lambda, show_pool_events
 
     def _update_protocol_type_fields(self) -> None:
         if not hasattr(self, "protocol_type"):
             return
-        visible, advanced, show_custom, show_source, show_lambda = self._protocol_field_sets_for_type(self.protocol_type.currentText())
+        visible, advanced, show_custom, show_source, show_lambda, show_pool_events = self._protocol_field_sets_for_type(self._protocol_type_value())
         lambda_mode = str(self.lambda_mode.currentText() or "scale")
         if show_lambda:
             if lambda_mode == "normal":
@@ -21809,7 +18274,9 @@ class StimulusGenerationDialog(AppDialog):
         self.source_box.setVisible(show_source)
         self.custom_points.setVisible(show_custom)
         self.custom_points_label.setVisible(show_custom)
-        if self.protocol_type.currentText() == "poisson_random_electrodes":
+        self.pool_event_groups.setVisible(show_pool_events)
+        self.pool_event_groups_label.setVisible(show_pool_events)
+        if self._protocol_type_value() == "poisson_random_electrodes":
             self.protocol_fields["pulses_per_burst"].setVisible(False)
             label = self.protocol_field_labels.get("pulses_per_burst")
             if label is not None:
@@ -21819,7 +18286,7 @@ class StimulusGenerationDialog(AppDialog):
     def _update_protocol_advanced_visibility(self) -> None:
         if not hasattr(self, "advanced_toggle"):
             return
-        _visible, advanced, _show_custom, _show_source, _show_lambda = self._protocol_field_sets_for_type(self.protocol_type.currentText())
+        _visible, advanced, _show_custom, _show_source, _show_lambda, _show_pool_events = self._protocol_field_sets_for_type(self._protocol_type_value())
         if _show_lambda:
             lambda_mode = str(self.lambda_mode.currentText() or "scale")
             if lambda_mode == "normal":
@@ -21867,6 +18334,7 @@ class StimulusGenerationDialog(AppDialog):
         self._clamp_preview_raster_window()
         self._draw_preview_raster_window()
         self._draw_preview_channel_map(protocol, series, stimulation_override=stimulation_override)
+        self._draw_preview_distributions(protocol)
 
     def _draw_preview_raster_window(self) -> None:
         protocol = self.preview_raster_protocol
@@ -22049,9 +18517,11 @@ class StimulusGenerationDialog(AppDialog):
             "inter_phase_interval_us",
             "pulse_frequency_hz",
             "pulses_per_burst",
-            "interpulse_interval_ms",
+            "randomize_burst_pulse_intervals",
+            "burst_pulse_interval_min_ms",
+            "burst_pulse_interval_max_ms",
             "burst_count",
-            "burst_interval_ms",
+            "burst_frequency_hz",
             "start_ms",
             "channel",
             "region_count",
@@ -22064,6 +18534,11 @@ class StimulusGenerationDialog(AppDialog):
             "lambda_std_hz",
             "random_seed",
             "spontaneous_data_path",
+            "pool_event_count",
+            "pool_event_interval_ms",
+            "pool_electrodes_per_event",
+            "pool_selection_mode",
+            "pool_event_groups",
         )
         return tuple((field, repr(getattr(protocol, field, None))) for field in fields) + (("custom_points", custom_points),)
 
@@ -22080,11 +18555,18 @@ class StimulusGenerationDialog(AppDialog):
         rates = None
         source_path = self._preview_source_path_for_protocol(protocol)
         source_record = self._record_by_path(source_path)
+        electrode_pool = None
+        if getattr(protocol, "type", "") == "electrode_pool_sequence":
+            try:
+                electrode_pool = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
+            except Exception:
+                electrode_pool = None
         cache_key = (
             "series",
             self._protocol_preview_signature(protocol),
             source_path,
             self._record_cache_key(source_record),
+            tuple(electrode_pool or []),
         )
         cached = self._preview_series_cache.get(cache_key)
         if cached is not None:
@@ -22097,11 +18579,144 @@ class StimulusGenerationDialog(AppDialog):
             protocol,
             preview_limit_ms=self._preview_generation_limit_ms(protocol),
             spontaneous_rates=rates,
+            electrode_pool=electrode_pool,
         )
         if len(self._preview_series_cache) > 32:
             self._preview_series_cache.clear()
         self._preview_series_cache[cache_key] = self._copy_preview_series(series)
         return self._copy_preview_series(series)
+
+    def _distribution_context_for_protocol(self, protocol) -> tuple[dict[int, float] | None, list[int] | None]:
+        rates = None
+        electrode_pool = None
+        protocol_type = str(getattr(protocol, "type", ""))
+        if protocol_type == "poisson_random_electrodes":
+            source_record = self._record_by_path(self._preview_source_path_for_protocol(protocol))
+            if isinstance(source_record, dict):
+                try:
+                    electrodes, rate_values = self._rate_table_from_record(source_record)
+                    rates = {int(electrode): float(rate) for electrode, rate in zip(electrodes, rate_values)}
+                except Exception:
+                    rates = None
+        elif protocol_type == "electrode_pool_sequence":
+            try:
+                electrode_pool = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
+            except Exception:
+                electrode_pool = None
+        return rates, electrode_pool
+
+    def _draw_preview_distributions(self, protocol) -> None:
+        canvas = getattr(self, "preview_distribution_canvas", None)
+        if canvas is None:
+            return
+        figure = canvas.figure
+        figure.clear()
+        try:
+            rates, electrode_pool = self._distribution_context_for_protocol(protocol)
+            specs = stimulus_builder.distribution_preview_specs(
+                protocol,
+                spontaneous_rates=rates,
+                electrode_pool=electrode_pool,
+            )
+        except Exception as exc:
+            canvas.setVisible(True)
+            ax = figure.add_subplot(111)
+            figure.subplots_adjust(left=0.1, right=0.985, top=0.86, bottom=0.25)
+            ax.text(0.5, 0.5, f"Distribution unavailable: {exc}", transform=ax.transAxes, ha="center", va="center", color="#b91c1c")
+            ax.set_axis_off()
+            canvas.draw_idle()
+            return
+        if not specs:
+            canvas.setVisible(False)
+            canvas.draw_idle()
+            return
+        canvas.setVisible(True)
+        specs = specs[:2]
+        axes = figure.subplots(len(specs), 1, squeeze=False)
+        figure.subplots_adjust(left=0.13, right=0.985, top=0.86, bottom=0.24 if len(specs) == 1 else 0.15, hspace=0.62)
+        for ax, spec in zip(axes.flatten(), specs):
+            self._plot_preview_distribution(ax, spec)
+        canvas.draw_idle()
+
+    def _plot_preview_distribution(self, ax, spec: dict) -> None:
+        values = np.asarray(spec.get("actual", []), dtype=float)
+        values = values[np.isfinite(values)]
+        expected = dict(spec.get("expected", {}) or {})
+        x_min, x_max = self._distribution_xlim(values, expected)
+        if values.size:
+            if values.size == 1 or float(np.nanmax(values)) <= float(np.nanmin(values)):
+                center = float(values[0])
+                width = max(0.5, abs(center) * 0.05)
+                bins = np.linspace(center - width, center + width, 6)
+            else:
+                bins = min(28, max(6, int(np.sqrt(values.size) + 2)))
+            ax.hist(values, bins=bins, density=True, color="#0f766e", alpha=0.55, label=spec.get("actual_label", "Actual"))
+        else:
+            ax.text(0.5, 0.5, "No generated samples", transform=ax.transAxes, ha="center", va="center", color="#64748b")
+        self._plot_expected_distribution(ax, expected, x_min, x_max)
+        ax.set_title(str(spec.get("title", "Random parameter distribution")), fontsize=9, pad=3)
+        ax.set_xlabel(str(spec.get("x_label", "")), fontsize=8)
+        ax.set_ylabel(str(spec.get("y_label", "Density")), fontsize=8)
+        ax.set_xlim(x_min, x_max)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, axis="y", color="#e2e8f0", linewidth=0.7)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="upper right", fontsize=7, frameon=False)
+
+    @staticmethod
+    def _distribution_xlim(values: np.ndarray, expected: dict) -> tuple[float, float]:
+        candidates: list[float] = []
+        if values.size:
+            candidates.extend([float(np.nanmin(values)), float(np.nanmax(values))])
+        kind = str(expected.get("kind", ""))
+        if kind == "uniform":
+            candidates.extend([float(expected.get("min", 0.0)), float(expected.get("max", 1.0))])
+        elif kind == "exponential":
+            mean = max(float(expected.get("mean", 1.0)), 1e-9)
+            candidates.extend([0.0, mean * 5.0])
+        elif kind == "normal":
+            mean = float(expected.get("mean", 0.0))
+            std = max(float(expected.get("std", 0.0)), 1e-9)
+            candidates.extend([mean - 4.0 * std, mean + 4.0 * std, float(expected.get("floor", mean))])
+        finite = [value for value in candidates if np.isfinite(value)]
+        if not finite:
+            return (0.0, 1.0)
+        lo = min(finite)
+        hi = max(finite)
+        if hi <= lo:
+            pad = max(0.5, abs(lo) * 0.05)
+            return (lo - pad, hi + pad)
+        pad = max((hi - lo) * 0.08, 1e-6)
+        return (lo - pad, hi + pad)
+
+    @staticmethod
+    def _plot_expected_distribution(ax, expected: dict, x_min: float, x_max: float) -> None:
+        kind = str(expected.get("kind", ""))
+        label = str(expected.get("label", "Expected"))
+        if kind == "uniform":
+            lo = float(expected.get("min", 0.0))
+            hi = float(expected.get("max", lo))
+            if hi <= lo:
+                ax.axvline(lo, color="#dc2626", linewidth=1.5, label=label)
+                return
+            x = np.asarray([lo, lo, hi, hi], dtype=float)
+            y = np.asarray([0.0, 1.0 / (hi - lo), 1.0 / (hi - lo), 0.0], dtype=float)
+            ax.plot(x, y, color="#dc2626", linewidth=1.6, label=label)
+        elif kind == "exponential":
+            mean = max(float(expected.get("mean", 1.0)), 1e-9)
+            x = np.linspace(max(0.0, x_min), max(max(0.0, x_max), mean * 3.0), 160)
+            y = (1.0 / mean) * np.exp(-x / mean)
+            ax.plot(x, y, color="#dc2626", linewidth=1.6, label=label)
+        elif kind == "normal":
+            mean = float(expected.get("mean", 0.0))
+            std = max(float(expected.get("std", 0.0)), 1e-9)
+            x = np.linspace(x_min, x_max, 180)
+            y = (1.0 / (std * np.sqrt(2.0 * np.pi))) * np.exp(-0.5 * ((x - mean) / std) ** 2)
+            ax.plot(x, y, color="#dc2626", linewidth=1.6, label=label)
+            floor = float(expected.get("floor", np.nan))
+            if np.isfinite(floor) and x_min <= floor <= x_max:
+                ax.axvline(floor, color="#f59e0b", linewidth=1.0, linestyle="--", label="Lambda floor")
 
     def _draw_preview_channel_map(self, protocol, series: list[dict], *, stimulation_override: list[int] | None = None) -> None:
         figure = self.preview_map_canvas.figure
@@ -22390,11 +19005,36 @@ class StimulusGenerationDialog(AppDialog):
             values[key] = text.toPlainText().strip()
         return stimulus_builder.ExperimentInfo(**values)
 
+    def _package_name_slug(self, info, protocols: list, blocks: list) -> str:
+        parts = [str(getattr(info, "name", "") or "maxwell_experiment")]
+        first_protocol = next((protocol for protocol in protocols if str(getattr(protocol, "type", "") or "")), None)
+        if first_protocol is not None:
+            parts.append(str(getattr(first_protocol, "type", "") or "protocol"))
+        if blocks:
+            parts.append(f"b{len(blocks)}")
+        raw = "_".join(part for part in parts if str(part).strip())
+        slug = re.sub(r"[^\w]+", "_", raw, flags=re.UNICODE).strip("_").lower()
+        slug = re.sub(r"_+", "_", slug)
+        return slug[:56].strip("_") or "maxwell_experiment"
+
+    def _unique_package_output_dir(self, output_root: Path, info, protocols: list, blocks: list) -> Path:
+        root = output_root.expanduser().resolve()
+        slug = self._package_name_slug(info, protocols, blocks)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = root / f"{stamp}_{slug}"
+        candidate = base
+        suffix = 2
+        while candidate.exists():
+            candidate = root / f"{stamp}_{slug}_{suffix}"
+            suffix += 1
+        return candidate
+
     def _generate(self) -> None:
         try:
             info = self._sync_info()
-            output = Path(self.output_path.text()).expanduser().resolve()
             protocols = copy.deepcopy(self.protocols)
+            output_root = Path(self.output_path.text() or str(self.output_dir)).expanduser().resolve()
+            output = self._unique_package_output_dir(output_root, info, protocols, self.blocks)
             self._prepare_pipeline_rate_sources(output, protocols)
             result = stimulus_builder.build_package(output, info, self.groups, protocols, self.blocks)
         except Exception as exc:
@@ -22552,7 +19192,7 @@ class StimulusGenerationDialog(AppDialog):
             self.info_fields["cfg_path"].setText(path)
 
     def _browse_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select output directory", self.output_path.text() or ".")
+        path = QFileDialog.getExistingDirectory(self, "Select output root", self.output_path.text() or ".")
         if path:
             self.output_path.setText(path)
 
@@ -22713,19 +19353,15 @@ class MainWindow(QMainWindow):
         self.database_table.setHorizontalHeaderLabels(["File", "Kind", "Label", "Channels", "Spikes", "Waveforms", "Folder"])
         self.database_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.database_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
-        self.database_table.setMinimumHeight(150)
+        self.database_table.setMinimumHeight(320)
         self.database_table.itemSelectionChanged.connect(self._database_selection_changed)
         table_header = self.database_table.horizontalHeader()
         table_header.setSectionsClickable(True)
         table_header.setSortIndicatorShown(False)
         table_header.sectionClicked.connect(self._database_header_clicked)
-        content_layout.addWidget(self.database_table, 1)
+        content_layout.addWidget(self.database_table, 4)
 
-        processed_header = QLabel("Processed data database")
-        processed_header.setObjectName("Header")
-        content_layout.addWidget(processed_header)
-
-        self.processed_table = QTableWidget(0, 6)
+        self.processed_table = QTableWidget(0, 6, self)
         self.processed_table.setHorizontalHeaderLabels(["Name", "Source", "Type", "Samples", "Features", "Origin"])
         self.processed_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.processed_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
@@ -22735,18 +19371,18 @@ class MainWindow(QMainWindow):
         processed_header_widget.setSectionsClickable(True)
         processed_header_widget.setSortIndicatorShown(False)
         processed_header_widget.sectionClicked.connect(self._processed_header_clicked)
-        content_layout.addWidget(self.processed_table, 1)
+        self.processed_table.hide()
 
         self.data_preview = QTextEdit()
         self.data_preview.setReadOnly(True)
-        self.data_preview.setMinimumHeight(220)
-        self.data_preview.setPlaceholderText("Open data files to build a database, then select a raw or processed row to show a summary.")
-        content_layout.addWidget(self.data_preview, 2)
+        self.data_preview.setMinimumHeight(180)
+        self.data_preview.setPlaceholderText("Open data files to build a database, then select a loaded file to show a summary.")
+        content_layout.addWidget(self.data_preview, 1)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Activity log")
-        self.log.setMinimumHeight(150)
+        self.log.setMinimumHeight(130)
         content_layout.addWidget(self.log, 1)
         self._update_data_preview()
         self._set_app_status("Idle", "Open data files to build a database. Processed datasets are cached automatically as you preview and analyze data.")
@@ -23925,6 +20561,17 @@ class MainWindow(QMainWindow):
 
     def _refresh_processed_database_table(self) -> None:
         self._ensure_processed_order()
+        if not hasattr(self, "processed_table") or not self.processed_table.isVisible():
+            self.active_processed_index = -1
+            if hasattr(self, "processed_table"):
+                previous_blocked = self.processed_table.signalsBlocked()
+                self.processed_table.blockSignals(True)
+                try:
+                    self.processed_table.clearSelection()
+                    self.processed_table.setRowCount(0)
+                finally:
+                    self.processed_table.blockSignals(previous_blocked)
+            return
         selected_rows = self._selected_processed_rows() if hasattr(self, "processed_table") else []
         selected_paths = {str(self.processed_database[row].get("path", "")) for row in selected_rows}
         self.processed_table.blockSignals(True)
@@ -24150,6 +20797,14 @@ class MainWindow(QMainWindow):
 
     def _database_selection_changed(self) -> None:
         rows = self._selected_database_rows()
+        self.active_processed_index = -1
+        if hasattr(self, "processed_table"):
+            previous_blocked = self.processed_table.signalsBlocked()
+            self.processed_table.blockSignals(True)
+            try:
+                self.processed_table.clearSelection()
+            finally:
+                self.processed_table.blockSignals(previous_blocked)
         if not rows:
             self._sync_active_file_controls()
             return
@@ -25083,5 +21738,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

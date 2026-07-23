@@ -4563,10 +4563,10 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert not hasattr(dialog, "preview_block_name")
     assert dialog.protocol_fields["amplitude_mv"].maximumWidth() >= 220
     assert dialog.protocol_box.layout().horizontalSpacing() <= 4
-    dialog.protocol_type.setCurrentText("sequence_with_poisson_burst")
+    dialog._set_protocol_type("sequence_with_poisson_burst")
     assert dialog.protocol_fields["name"].text() == "sequence_with_poisson_burst"
     dialog.protocol_fields["name"].setText("settings_added")
-    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._set_protocol_type("single_pulse")
     dialog._save_protocol()
     assert any(protocol.name == "settings_added" for protocol in dialog.protocols)
     dialog.preview_group_name.setText("settings_site")
@@ -4611,7 +4611,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert any(item["times_ms"] for item in preview_series)
     assert max((max(item["times_ms"]) for item in preview_series if item["times_ms"]), default=0.0) > 5000.0
     dialog.protocol_fields["name"].setText("poisson_from_settings")
-    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog._set_protocol_type("poisson_random_electrodes")
     dialog.preview_group_name.setText("poisson_manual")
     dialog.preview_group_electrodes.setText("1, 2")
     dialog.protocol_fields["region_count"].setText("1")
@@ -4620,7 +4620,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog._save_protocol()
     auto_group = next(group for group in dialog.groups if group.name == "poisson_manual_poisson_from_settings_auto")
     assert set(auto_group.electrodes) == {1, 2}
-    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._set_protocol_type("single_pulse")
     dialog.protocol_fields["name"].setText("workflow_single")
     dialog.preview_group_name.setText("workflow_group")
     dialog.preview_group_electrodes.setText("1, 2")
@@ -4642,7 +4642,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     before_groups = len(dialog.groups)
     before_blocks = len(dialog.blocks)
     dialog.protocol_fields["name"].setText("preview_only_single")
-    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._set_protocol_type("single_pulse")
     dialog.preview_group_name.setText("preview_only_group")
     dialog.preview_group_electrodes.setText("1, 2")
     dialog._preview_settings_workflow()
@@ -4770,12 +4770,70 @@ def test_stimulus_generation_individual_burst_preview_is_single_burst():
         pulses_per_burst=3,
         interpulse_interval_ms=50.0,
         burst_count=3,
-        burst_interval_ms=1000.0,
+        burst_frequency_hz=1.0,
     )
 
     series = stimulus_builder.preview_raster_series(protocol, preview_limit_ms=3000.0)
 
     assert series[0]["times_ms"] == [0.0, 50.0, 100.0]
+
+
+def test_stimulus_generation_individual_burst_can_randomize_pulse_intervals():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "uniform_burst_ipi",
+        "individual_burst",
+        start_ms=0.0,
+        pulses_per_burst=4,
+        interpulse_interval_ms=50.0,
+        randomize_burst_pulse_intervals=True,
+        burst_pulse_interval_min_ms=10.0,
+        burst_pulse_interval_max_ms=20.0,
+        burst_count=2,
+        burst_frequency_hz=1.0,
+        random_seed=7,
+    )
+
+    times = [time_ms for time_ms, _amp in stimulus_builder.pulse_starts_ms(protocol)]
+    repeat_times = [time_ms for time_ms, _amp in stimulus_builder.pulse_starts_ms(protocol)]
+
+    assert len(times) == 8
+    assert times == repeat_times
+    assert times[0] == pytest.approx(0.0)
+    assert times[4] == pytest.approx(1000.0)
+    for burst_offset in (0, 4):
+        intervals = np.diff(times[burst_offset: burst_offset + 4])
+        assert np.all(intervals >= 10.0)
+        assert np.all(intervals <= 20.0)
+
+
+def test_stimulus_generation_sequence_burst_can_randomize_pulse_intervals():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "sequence_uniform_ipi",
+        "sequence_with_burst",
+        start_ms=100.0,
+        pulses_per_burst=3,
+        randomize_burst_pulse_intervals=True,
+        burst_pulse_interval_min_ms=5.0,
+        burst_pulse_interval_max_ms=15.0,
+        burst_count=3,
+        burst_frequency_hz=2.0,
+        random_seed=11,
+    )
+
+    times = [time_ms for time_ms, _amp in stimulus_builder.pulse_starts_ms(protocol)]
+
+    assert len(times) == 9
+    assert times[0] == pytest.approx(100.0)
+    assert times[3] == pytest.approx(600.0)
+    assert times[6] == pytest.approx(1100.0)
+    for burst_offset in (0, 3, 6):
+        intervals = np.diff(times[burst_offset: burst_offset + 3])
+        assert np.all(intervals >= 5.0)
+        assert np.all(intervals <= 15.0)
 
 
 def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_path):
@@ -4785,9 +4843,9 @@ def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_
         "delayed_bursts",
         "sequence_with_burst",
         pulses_per_burst=2,
-        interpulse_interval_ms=25.0,
+        pulse_frequency_hz=40.0,
         burst_count=2,
-        burst_interval_ms=1000.0,
+        burst_frequency_hz=1.0,
     )
     group = stimulus_builder.ElectrodeGroup("group_A", [1234])
     block = stimulus_builder.ExperimentBlock("block_A", "group_A", protocol.name)
@@ -4816,9 +4874,9 @@ def test_stimulus_generation_poisson_burst_sequence_uses_random_bursts():
         "sequence_with_poisson_burst",
         start_ms=0.0,
         pulses_per_burst=2,
-        interpulse_interval_ms=25.0,
+        pulse_frequency_hz=40.0,
         burst_count=3,
-        burst_interval_ms=1000.0,
+        burst_frequency_hz=1.0,
         random_seed=7,
     )
 
@@ -5044,7 +5102,7 @@ def test_stimulus_generation_save_protocol_creates_poisson_group_without_block(t
     dialog._refresh_all()
 
     dialog.protocol_fields["name"].setText("poisson_saved")
-    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog._set_protocol_type("poisson_random_electrodes")
     dialog.protocol_fields["region_count"].setText("2")
     dialog.protocol_fields["max_candidate_electrodes"].setText("4")
     dialog._set_combo_data(dialog.source_combo, str(source_path))
@@ -5083,7 +5141,7 @@ def test_stimulus_generation_poisson_group_uses_normalized_source_path(tmp_path)
     dialog._refresh_all()
 
     dialog.protocol_fields["name"].setText("poisson_path")
-    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog._set_protocol_type("poisson_random_electrodes")
     dialog.protocol_fields["region_count"].setText("1")
     dialog.protocol_fields["max_candidate_electrodes"].setText("2")
     dialog._set_combo_data(dialog.source_combo, str(source_path).replace("\\", "/"))
@@ -5110,7 +5168,7 @@ def test_stimulus_generation_rejects_duplicate_library_names(monkeypatch):
     monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
 
     dialog.protocol_fields["name"].setText("duplicate_protocol")
-    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._set_protocol_type("single_pulse")
     dialog._save_protocol()
     assert len(dialog.protocols) == 1
     dialog._save_protocol()
@@ -5152,7 +5210,7 @@ def test_stimulus_generation_save_block_phase_can_reference_existing_protocol_an
     monkeypatch.setattr(gui_app, "_show_warning_message", lambda *args, **kwargs: warnings_seen.append(args))
 
     dialog.protocol_fields["name"].setText("existing_protocol")
-    dialog.protocol_type.setCurrentText("single_pulse")
+    dialog._set_protocol_type("single_pulse")
     dialog._save_protocol()
     dialog.preview_group_name.setText("existing_site")
     dialog.preview_group_electrodes.setText("1, 2")
@@ -5190,31 +5248,37 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     app = QApplication.instance() or QApplication([])
     dialog = StimulusGenerationDialog([], channel_map=None)
 
-    dialog.protocol_type.setCurrentText("individual_burst")
+    dialog._set_protocol_type("individual_burst")
     dialog._update_protocol_type_fields()
     assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
-    assert dialog.protocol_fields["burst_count"].isHidden()
-    assert dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert not dialog.protocol_fields["randomize_burst_pulse_intervals"].isHidden()
+    assert not dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
+    assert not dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
+    assert not dialog.protocol_fields["burst_count"].isHidden()
+    assert not dialog.protocol_fields["burst_frequency_hz"].isHidden()
     assert dialog.custom_points.isHidden()
     assert dialog.source_box.isHidden()
 
-    dialog.protocol_type.setCurrentText("sequence_with_burst")
+    dialog._set_protocol_type("sequence_with_burst")
     dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["randomize_burst_pulse_intervals"].isHidden()
+    assert not dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
+    assert not dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
     assert not dialog.protocol_fields["burst_count"].isHidden()
-    assert not dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert not dialog.protocol_fields["burst_frequency_hz"].isHidden()
 
-    dialog.protocol_type.setCurrentText("custom_sequence")
+    dialog._set_protocol_type("custom_sequence")
     dialog._update_protocol_type_fields()
     assert not dialog.custom_points.isHidden()
     assert dialog.protocol_fields["amplitude_mv"].isHidden()
     assert dialog.protocol_fields["burst_count"].isHidden()
 
-    dialog.protocol_type.setCurrentText("poisson_random_electrodes")
+    dialog._set_protocol_type("poisson_random_electrodes")
     dialog._update_protocol_type_fields()
     assert not dialog.source_box.isHidden()
     assert not dialog.lambda_mode.isHidden()
     assert not dialog.protocol_fields["poisson_duration_s"].isHidden()
-    assert dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert dialog.protocol_fields["burst_frequency_hz"].isHidden()
     assert dialog.protocol_fields["pulses_per_burst"].isHidden()
     dialog.advanced_toggle.setChecked(True)
     dialog.lambda_mode.setCurrentText("scale")
@@ -5227,10 +5291,10 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     assert dialog.protocol_fields["lambda_scale"].isHidden()
     assert not dialog.protocol_fields["lambda_mean_hz"].isHidden()
     assert not dialog.protocol_fields["lambda_std_hz"].isHidden()
-    dialog.protocol_type.setCurrentText("sequence_with_poisson_burst")
+    dialog._set_protocol_type("sequence_with_poisson_burst")
     dialog._update_protocol_type_fields()
     assert not dialog.protocol_fields["burst_count"].isHidden()
-    assert not dialog.protocol_fields["burst_interval_ms"].isHidden()
+    assert not dialog.protocol_fields["burst_frequency_hz"].isHidden()
     assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
     dialog.close()
     app.processEvents()

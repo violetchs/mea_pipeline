@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import sys
 import time
+import hashlib
+import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -169,12 +172,9 @@ def resolve_experiment_array(
     array = mx.Array("stimulation")
     array.reset()
     array.clear_selected_electrodes()
-    if cfg_path.exists():
-        array.load_config(str(cfg_path))
-    else:
-        array.select_electrodes(electrodes)
-        array.select_stimulation_electrodes(electrodes)
-        array.route()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
+    array.load_config(str(cfg_path))
     stim_units = []
     stim_unit_sources: dict[int, int] = {}
     stim_unit_by_electrode: dict[int, int] = {}
@@ -301,11 +301,23 @@ def _scheduled_stim_times_ms(protocol: dict[str, Any]) -> list[float]:
     if ptype == "single_pulse":
         times_ms.append(start_ms)
     elif ptype == "individual_burst":
-        interval = _pulse_interval_ms(protocol)
-        times_ms.extend(start_ms + i * interval for i in range(int(protocol.get("pulses_per_burst", 5))))
+        if _randomize_burst_pulse_intervals(protocol):
+            rng = random.Random(_burst_pulse_interval_seed(protocol))
+            for burst_start in _burst_starts_ms(protocol, poisson=False):
+                for offset_ms in _burst_pulse_offsets_ms(protocol, rng):
+                    times_ms.append(burst_start + offset_ms)
+        else:
+            interval = _pulse_interval_ms(protocol)
+            times_ms.extend(start_ms + i * interval for i in range(int(protocol.get("pulses_per_burst", 5))))
     elif ptype in {"sequence_with_burst", "sequence_with_poisson_burst"}:
         interval = _pulse_interval_ms(protocol)
         burst_starts = _burst_starts_ms(protocol, poisson=(ptype == "sequence_with_poisson_burst"))
+        if ptype == "sequence_with_burst" and _randomize_burst_pulse_intervals(protocol):
+            rng = random.Random(_burst_pulse_interval_seed(protocol))
+            for burst_start in burst_starts:
+                for offset_ms in _burst_pulse_offsets_ms(protocol, rng):
+                    times_ms.append(burst_start + offset_ms)
+            return sorted(ms for ms in times_ms if ms >= 0.0)
         for burst_start in burst_starts:
             for pulse_index in range(int(protocol.get("pulses_per_burst", 5))):
                 times_ms.append(burst_start + pulse_index * interval)
@@ -317,10 +329,57 @@ def _scheduled_stim_times_ms(protocol: dict[str, Any]) -> list[float]:
 
 
 def _pulse_interval_ms(protocol: dict[str, Any]) -> float:
-    interval = float(protocol.get("interpulse_interval_ms", 0.0) or 0.0)
-    if interval > 0:
-        return interval
     return 1000.0 / max(float(protocol.get("pulse_frequency_hz", 20.0)), 0.001)
+
+
+def _randomize_burst_pulse_intervals(protocol: dict[str, Any]) -> bool:
+    value = protocol.get("randomize_burst_pulse_intervals", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _burst_pulse_interval_seed(protocol: dict[str, Any]) -> int:
+    seed_payload = json.dumps(
+        {
+            "name": protocol.get("name", ""),
+            "type": protocol.get("type", ""),
+            "start_ms": protocol.get("start_ms", 0.0),
+            "burst_count": protocol.get("burst_count", 3),
+            "burst_frequency_hz": protocol.get("burst_frequency_hz", 5.0),
+            "pulses_per_burst": protocol.get("pulses_per_burst", 5),
+            "pulse_frequency_hz": protocol.get("pulse_frequency_hz", 20.0),
+            "randomize_burst_pulse_intervals": protocol.get("randomize_burst_pulse_intervals", False),
+            "burst_pulse_interval_min_ms": protocol.get("burst_pulse_interval_min_ms", 10.0),
+            "burst_pulse_interval_max_ms": protocol.get("burst_pulse_interval_max_ms", 100.0),
+            "random_seed": protocol.get("random_seed", 42),
+            "amplitude_mv": protocol.get("amplitude_mv", 150.0),
+            "pulse_width_us": protocol.get("pulse_width_us", 300.0),
+        },
+        sort_keys=True,
+    )
+    return int(hashlib.sha256(seed_payload.encode("utf-8")).hexdigest()[:16], 16)
+
+
+def _burst_pulse_offsets_ms(protocol: dict[str, Any], rng=None) -> list[float]:
+    count = max(1, int(protocol.get("pulses_per_burst", 5)))
+    if not _randomize_burst_pulse_intervals(protocol):
+        interval = _pulse_interval_ms(protocol)
+        return [index * interval for index in range(count)]
+    min_ms = max(0.0, float(protocol.get("burst_pulse_interval_min_ms", 10.0)))
+    max_ms = max(min_ms, float(protocol.get("burst_pulse_interval_max_ms", 100.0)))
+    if rng is None:
+        rng = random.Random(_burst_pulse_interval_seed(protocol))
+    offsets = [0.0]
+    current_ms = 0.0
+    for _index in range(1, count):
+        current_ms += rng.uniform(min_ms, max_ms)
+        offsets.append(current_ms)
+    return offsets
+
+
+def _burst_interval_ms(protocol: dict[str, Any]) -> float:
+    return 1000.0 / max(float(protocol.get("burst_frequency_hz", 5.0)), 0.001)
 
 
 def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
@@ -338,10 +397,9 @@ def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
                 "type": protocol.get("type", ""),
                 "start_ms": start_ms,
                 "burst_count": burst_count,
-                "burst_interval_ms": float(protocol.get("burst_interval_ms", 200.0)),
+                "burst_frequency_hz": float(protocol.get("burst_frequency_hz", 5.0)),
                 "pulses_per_burst": int(protocol.get("pulses_per_burst", 5)),
                 "pulse_frequency_hz": float(protocol.get("pulse_frequency_hz", 20.0)),
-                "interpulse_interval_ms": float(protocol.get("interpulse_interval_ms", 0.0) or 0.0),
                 "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
                 "pulse_width_us": float(protocol.get("pulse_width_us", 300.0)),
             },
@@ -349,11 +407,11 @@ def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
         )
         seed = int(hashlib.sha256(seed_payload.encode("utf-8")).hexdigest()[:16], 16)
         rng = random.Random(seed)
-        mean_s = max(float(protocol.get("burst_interval_ms", 200.0)), 0.001) / 1000.0
+        mean_s = _burst_interval_ms(protocol) / 1000.0
         current_ms = start_ms
         for _index in range(1, burst_count):
             current_ms += rng.expovariate(1.0 / mean_s) * 1000.0
             starts.append(current_ms)
         return starts
-    burst_interval = max(float(protocol.get("burst_interval_ms", 200.0)), 0.0)
+    burst_interval = _burst_interval_ms(protocol)
     return [start_ms + burst_index * burst_interval for burst_index in range(burst_count)]

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import ast
 from pathlib import Path
 from typing import Callable
 
@@ -38,6 +39,7 @@ try:
     from PySide6.QtGui import QColor, QFont
     from PySide6.QtWidgets import (
         QComboBox,
+        QApplication,
         QDialog,
         QFileDialog,
         QFrame,
@@ -47,6 +49,7 @@ try:
         QLabel,
         QLineEdit,
         QMessageBox,
+        QProgressBar,
         QPushButton,
         QTableWidget,
         QTableWidgetItem,
@@ -188,16 +191,87 @@ def _agent_process_command(
     return executable, args, module_dir
 
 
+def _looks_like_code_detail_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if stripped.startswith(("{", "}", "[", "]", "(", ")")):
+        return True
+    if stripped.startswith(("@", "#!")):
+        return True
+    if stripped in {");", "];", "};"}:
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_\.]*\s*=\s*.+", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_\.]*\(.+\)$", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_\.]*\[[^\]]+\]\s*=", stripped):
+        return True
+    if re.match(r"^[\"'][^\"']+[\"']\s*:\s*", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*:\s*(dict|list|str|int|float|bool|Path|np\.)", stripped):
+        return True
+    code_markers = (
+        "np.",
+        "pd.",
+        "plt.",
+        "json.",
+        "Path(",
+        "Path.",
+        "os.",
+        "sys.",
+        "shutil.",
+        "subprocess.",
+        "QProcess",
+        "QTimer",
+        "Figure(",
+        "npz",
+    )
+    if any(marker.lower() in lower for marker in code_markers):
+        return True
+    shell_code_markers = (
+        "apply_patch",
+        "<<'patch'",
+        "<<\"patch\"",
+        "cat >",
+        "python - <<",
+        "python -c ",
+    )
+    if any(marker in lower for marker in shell_code_markers):
+        return True
+    return False
+
+
 def _agent_log_lines(text: str, *, stream: str = "") -> list[str]:
     lines: list[str] = []
+    skip_user_task_body = False
+    skip_fenced_block = False
+    skip_patch_block = False
     for raw_line in str(text or "").splitlines():
+        raw_line = _repair_mojibake_text(raw_line)
         line = raw_line.strip()
+        lower = line.lower()
+        if skip_fenced_block:
+            if line.startswith("```"):
+                skip_fenced_block = False
+            continue
+        if skip_patch_block:
+            if lower.startswith("*** end patch"):
+                skip_patch_block = False
+            continue
+        if skip_user_task_body:
+            if not line:
+                skip_user_task_body = False
+            continue
         if not line:
             continue
         if line.startswith(("stderr:", "stdout:")):
             line = line.split(":", 1)[1].strip()
         lower = line.lower()
         if not line:
+            continue
+        if _looks_like_unfixed_mojibake(line):
             continue
         if lower in {"codex", "user", "mcp startup: no servers"}:
             continue
@@ -224,20 +298,29 @@ def _agent_log_lines(text: str, *, stream: str = "") -> list[str]:
         )
         if lower.startswith(metadata_prefixes):
             continue
+        if lower.startswith("## user task"):
+            skip_user_task_body = True
+            continue
+        if line.startswith("```"):
+            skip_fenced_block = True
+            continue
+        if lower.startswith("*** begin patch"):
+            skip_patch_block = True
+            continue
         patch_prefixes = (
             "diff --git ",
             "index ",
             "@@",
             "+++ ",
             "--- ",
-            "*** begin patch",
             "*** update file:",
             "*** add file:",
             "*** delete file:",
             "*** end patch",
-            "```",
         )
         if lower.startswith(patch_prefixes):
+            continue
+        if _looks_like_code_detail_line(line):
             continue
         if line.startswith(("+", "-")) and not line.startswith(("+ ", "- ")):
             continue
@@ -262,7 +345,24 @@ def _agent_log_lines(text: str, *, stream: str = "") -> list[str]:
         )
         if lower.startswith(code_prefixes):
             continue
-        if lower.startswith(("task - ", "you are generating ", "you already have ", "# mandatory agent instructions")):
+        prompt_prefixes = (
+            "task - ",
+            "you are generating ",
+            "you already have ",
+            "# mandatory agent instructions",
+            "## user task",
+            "context: you are generating ",
+            "input data paths are provided ",
+            "raw spike input package ",
+            "processed input package ",
+            "when multiple raw ",
+            "for cross-file channel ",
+            "if the task asks ",
+            "return {'processed_records'",
+            "each processed record ",
+            "required final state:",
+        )
+        if lower.startswith(prompt_prefixes):
             continue
         if stream == "stderr" and lower.startswith(("traceback", "error:", "failed", "runtimeerror")):
             lines.append(f"Error: {line[:320]}")
@@ -271,6 +371,55 @@ def _agent_log_lines(text: str, *, stream: str = "") -> list[str]:
             line = line[:317] + "..."
         lines.append(line)
     return lines
+
+
+def _decode_process_output(data) -> str:
+    raw = bytes(data)
+    if not raw:
+        return ""
+    for encoding in ("utf-8", "gb18030", "cp936"):
+        try:
+            return _repair_mojibake_text(raw.decode(encoding))
+        except UnicodeError:
+            continue
+    return _repair_mojibake_text(raw.decode("utf-8", errors="replace"))
+
+
+def _repair_mojibake_text(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return value
+    suspect_markers = ("瀵", "鎹", "鍔", "瀛", "骞", "绾", "缁", "撴", "鍥", "紝", "愶")
+    if not any(marker in value for marker in suspect_markers):
+        return value
+    for encoding in ("gb18030", "gbk", "cp936"):
+        try:
+            fixed = value.encode(encoding).decode("utf-8")
+        except UnicodeError:
+            continue
+        if _looks_more_readable_chinese(fixed, value):
+            return fixed
+    return value
+
+
+def _looks_like_unfixed_mojibake(text: str) -> bool:
+    value = str(text or "")
+    if not value:
+        return False
+    bad_tokens = ("瀵", "鎹", "鍔", "瀛", "骞", "缁", "撴", "愶", "紝")
+    bad_count = sum(value.count(token) for token in bad_tokens)
+    if bad_count < 2:
+        return False
+    useful_tokens = ("数据", "分析", "结果", "通道", "发放", "刺激")
+    return not any(token in value for token in useful_tokens)
+
+
+def _looks_more_readable_chinese(candidate: str, original: str) -> bool:
+    useful_tokens = ("数据", "分析", "动力学", "结果", "图", "通道", "发放", "刺激", "文件")
+    if any(token in candidate for token in useful_tokens):
+        return True
+    bad_tokens = ("瀵", "鎹", "鍔", "瀛", "骞", "缁", "撴", "愶")
+    return sum(candidate.count(token) for token in bad_tokens) < sum(original.count(token) for token in bad_tokens)
 
 
 def _command_for_log(program: str, args: list[str]) -> str:
@@ -310,6 +459,81 @@ def _changed_files(root: Path, before: dict[str, tuple[int, int]]) -> list[str]:
     after = _file_snapshot(root)
     changed = [name for name, state in after.items() if before.get(name) != state]
     return sorted(changed)
+
+
+def _read_python_text_without_bom(path: Path) -> tuple[str, bool]:
+    raw = path.read_bytes()
+    had_bom = raw.startswith(b"\xef\xbb\xbf")
+    text = raw.decode("utf-8-sig")
+    if had_bom:
+        path.write_text(text, encoding="utf-8")
+    return text, had_bom
+
+
+def _compact_module_summary(text: str, *, max_len: int = 360) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = re.sub(r"^(summary|module summary|功能摘要)\s*[:：]\s*", "", value, flags=re.IGNORECASE).strip()
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3].rstrip() + "..."
+
+
+def _summary_from_python_code(code: str) -> str:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    analyze_doc = ""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "analyze":
+            analyze_doc = ast.get_docstring(node) or ""
+            break
+    module_doc = ast.get_docstring(tree) or ""
+    for candidate in (analyze_doc, module_doc):
+        summary = _compact_module_summary(candidate)
+        if summary and "Agent analysis code has not been generated yet" not in summary:
+            return summary
+    for line in str(code or "").splitlines()[:120]:
+        match = re.match(r"\s*#\s*(?:summary|module summary|功能摘要)\s*[:：]\s*(.+)$", line, flags=re.IGNORECASE)
+        if match:
+            return _compact_module_summary(match.group(1))
+    return ""
+
+
+def _summary_from_readme(readme_path: Path) -> str:
+    if not readme_path.exists():
+        return ""
+    try:
+        lines = readme_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return ""
+    capture = False
+    captured: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^#+\s*(summary|module summary|功能摘要)\b", stripped, flags=re.IGNORECASE):
+            capture = True
+            inline = re.sub(r"^#+\s*(summary|module summary|功能摘要)\s*[:：]?\s*", "", stripped, flags=re.IGNORECASE)
+            if inline:
+                captured.append(inline)
+            continue
+        if capture:
+            if stripped.startswith("#") and captured:
+                break
+            if stripped:
+                captured.append(stripped)
+            elif captured:
+                break
+    if captured:
+        return _compact_module_summary(" ".join(captured))
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.lower().startswith(("task:", "see agent_task", "see agents.md")):
+            continue
+        return _compact_module_summary(stripped)
+    return ""
 
 
 def _json_safe(value):
@@ -845,14 +1069,14 @@ class AgentEnvironmentCheckDialog(QDialog):
     def _read_probe_stdout(self) -> None:
         if self.current_process is None:
             return
-        text = bytes(self.current_process.readAllStandardOutput()).decode(errors="replace")
+        text = _decode_process_output(self.current_process.readAllStandardOutput())
         for line in _agent_log_lines(text, stream="stdout"):
             self.log.append(line)
 
     def _read_probe_stderr(self) -> None:
         if self.current_process is None:
             return
-        text = bytes(self.current_process.readAllStandardError()).decode(errors="replace")
+        text = _decode_process_output(self.current_process.readAllStandardError())
         for line in _agent_log_lines(text, stream="stderr"):
             self.log.append(line)
 
@@ -933,13 +1157,26 @@ class AgentCustomCodeDialog(QDialog):
         self.current_process: QProcess | None = None
         self.current_mode = ""
         self.current_run_dir: Path | None = None
+        self.current_output_dir: Path | None = None
+        self.current_result_folder_name = ""
+        self.current_result_folder_id = ""
+        self.current_input_signature = ""
+        self.current_input_label = ""
         self.current_module_dir: Path | None = None
         self._process_snapshot_root: Path | None = None
         self._process_file_snapshot: dict[str, tuple[int, int]] = {}
         self._preview_drag_state: dict | None = None
         self.last_result: dict | None = None
         self._result_items: list[dict] = []
+        self._result_folders: dict[str, dict] = {
+            "root": {"id": "root", "name": "Results", "parent_id": "", "path": "", "created_at": ""}
+        }
+        self._result_current_folder_id = "root"
+        self._result_next_folder_id = 1
         self._result_next_id = 1
+        self._visible_result_entries: list[dict] = []
+        self._temporary_run_dirs: set[Path] = set()
+        self._active_timing: dict[str, float] = {}
         self._raw_records_cache: list[dict] = []
         self._processed_records_cache: list[dict] = []
         self._build_ui()
@@ -987,6 +1224,11 @@ class AgentCustomCodeDialog(QDialog):
         self.module_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.module_table.setMaximumHeight(210)
         self.module_table.itemSelectionChanged.connect(self._module_selection_changed)
+        self.module_summary_label = QLabel("Select a module to view the full summary.")
+        self.module_summary_label.setObjectName("MutedText")
+        self.module_summary_label.setWordWrap(True)
+        self.module_summary_label.setMinimumHeight(42)
+        self.module_summary_label.setMaximumHeight(86)
         self.rename_button = QPushButton("Rename")
         self.rename_button.clicked.connect(self._rename_selected_module)
         self.delete_button = QPushButton("Delete")
@@ -997,16 +1239,33 @@ class AgentCustomCodeDialog(QDialog):
         self.log.setFont(QFont("Consolas", 8))
         self.log.setMinimumHeight(150)
         self.log.document().setMaximumBlockCount(2000)
+        self.run_progress = QProgressBar()
+        self.run_progress.setRange(0, 100)
+        self.run_progress.setValue(0)
+        self.run_progress.setFormat("Idle")
+        self.run_progress.setMaximumHeight(18)
         self.output_table = QTableWidget(0, 5)
-        self.output_table.setHorizontalHeaderLabels(["Name", "Type", "Samples", "Features", "Description"])
+        self.output_table.setHorizontalHeaderLabels(["Name", "Kind", "Samples", "Features", "Description"])
         self.output_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.output_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.output_table.setMinimumHeight(150)
         self.output_table.itemSelectionChanged.connect(self._result_selection_changed)
+        self.output_table.itemDoubleClicked.connect(self._open_selected_result_folder)
+        self.result_path_label = QLabel("Results")
+        self.result_path_label.setObjectName("MutedText")
+        self.result_path_label.setWordWrap(True)
+        self.up_folder_button = QPushButton("Up")
+        self.up_folder_button.clicked.connect(self._go_result_folder_up)
+        self.new_folder_button = QPushButton("New Folder")
+        self.new_folder_button.clicked.connect(self._new_result_folder_action)
+        self.move_results_button = QPushButton("Move To")
+        self.move_results_button.clicked.connect(self._move_selected_results)
+        self.rename_result_button = QPushButton("Rename")
+        self.rename_result_button.clicked.connect(self._rename_selected_result_entry)
         self.save_results_button = QPushButton("Save Results")
         self.save_results_button.clicked.connect(self._save_last_results)
         self.save_results_button.setEnabled(False)
-        self.delete_results_button = QPushButton("Delete Result")
+        self.delete_results_button = QPushButton("Delete")
         self.delete_results_button.clicked.connect(self._delete_selected_results)
         self.preview_canvas = FigureCanvas(Figure(figsize=(8.8, 6.2), tight_layout=True))
         self.preview_canvas.setMinimumSize(640, 420)
@@ -1032,6 +1291,7 @@ class AgentCustomCodeDialog(QDialog):
         left_layout.addWidget(self.task_text)
         left_layout.addWidget(QLabel("Generated modules"))
         left_layout.addWidget(self.module_table, 2)
+        left_layout.addWidget(self.module_summary_label)
         module_buttons = QGridLayout()
         for index, button in enumerate(
             [
@@ -1054,6 +1314,7 @@ class AgentCustomCodeDialog(QDialog):
         log_layout.setSpacing(4)
         log_layout.addWidget(QLabel("Run log"))
         log_layout.addWidget(self.log, 1)
+        log_layout.addWidget(self.run_progress)
 
         result_panel = QFrame()
         result_panel.setObjectName("Panel")
@@ -1061,11 +1322,19 @@ class AgentCustomCodeDialog(QDialog):
         result_layout = QVBoxLayout(result_panel)
         result_layout.setContentsMargins(8, 8, 8, 8)
         result_layout.setSpacing(4)
-        result_layout.addWidget(QLabel("Result library"))
+        result_header = QHBoxLayout()
+        result_header.addWidget(QLabel("Result list"))
+        result_header.addStretch(1)
+        result_header.addWidget(self.up_folder_button)
+        result_layout.addLayout(result_header)
+        result_layout.addWidget(self.result_path_label)
         result_layout.addWidget(self.output_table, 1)
         result_buttons = QHBoxLayout()
         result_buttons.setContentsMargins(0, 0, 0, 0)
         result_buttons.setSpacing(6)
+        result_buttons.addWidget(self.new_folder_button)
+        result_buttons.addWidget(self.move_results_button)
+        result_buttons.addWidget(self.rename_result_button)
         result_buttons.addWidget(self.save_results_button)
         result_buttons.addWidget(self.delete_results_button)
         result_layout.addLayout(result_buttons)
@@ -1095,6 +1364,16 @@ class AgentCustomCodeDialog(QDialog):
     def refresh_context(self) -> None:
         self._refresh_database_tables()
         self._refresh_modules()
+
+    def closeEvent(self, event) -> None:
+        if self.current_process is not None and self.current_process.state() != QProcess.ProcessState.NotRunning:
+            self.current_process.terminate()
+            if not self.current_process.waitForFinished(1500):
+                self.current_process.kill()
+                self.current_process.waitForFinished(500)
+        self.current_process = None
+        self._cleanup_unsaved_results()
+        super().closeEvent(event)
 
     def _refresh_database_tables(self) -> None:
         raw_selection = self._selected_record_keys(self._raw_records_cache, self.raw_table, key="path")
@@ -1201,6 +1480,42 @@ class AgentCustomCodeDialog(QDialog):
         rows = sorted({index.row() for index in self.processed_table.selectedIndexes()})
         return [self._processed_records_cache[row] for row in rows if 0 <= row < len(self._processed_records_cache)]
 
+    def _record_signature_key(self, record: dict, *, fallback: str) -> str:
+        for key in ("path", "source_path", "name"):
+            value = str(record.get(key, "") or "").strip()
+            if value:
+                return value
+        return fallback
+
+    def _input_signature_for_records(self, raw_records: list[dict], processed_records: list[dict]) -> tuple[str, str]:
+        raw_keys = [
+            self._record_signature_key(record, fallback=f"raw_{index}")
+            for index, record in enumerate(raw_records)
+        ]
+        processed_keys = [
+            self._record_signature_key(record, fallback=f"processed_{index}")
+            for index, record in enumerate(processed_records)
+        ]
+        payload = {
+            "raw": sorted(raw_keys),
+            "processed": sorted(processed_keys),
+        }
+        signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        label_parts = []
+        if raw_keys:
+            label_parts.append(f"{len(raw_keys)} raw")
+        if processed_keys:
+            label_parts.append(f"{len(processed_keys)} processed")
+        if not label_parts:
+            label_parts.append("no selected input")
+        preview_names = [Path(item).name for item in [*raw_keys, *processed_keys][:3]]
+        label = ", ".join(label_parts)
+        if preview_names:
+            label = f"{label}: {', '.join(preview_names)}"
+            if len(raw_keys) + len(processed_keys) > 3:
+                label += "..."
+        return signature, label
+
     def _default_module_name(self) -> str:
         first_line = ""
         for line in self.task_text.toPlainText().splitlines():
@@ -1239,10 +1554,13 @@ class AgentCustomCodeDialog(QDialog):
         for row, module_dir in enumerate(module_dirs):
             manifest = self._manifest_for(module_dir)
             updated = manifest.get("updated_at") or manifest.get("created_at") or ""
-            summary = str(manifest.get("summary", "") or "")[:120]
+            full_summary = str(manifest.get("summary", "") or manifest.get("task", "") or "")
+            summary = full_summary[:120] + ("..." if len(full_summary) > 120 else "")
             values = [str(manifest.get("name") or module_dir.name), module_dir.name, str(updated), summary]
             for column, value in enumerate(values):
-                self.module_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setToolTip(full_summary if column == 3 and full_summary else value)
+                self.module_table.setItem(row, column, item)
             if module_dir.name == current_id:
                 self.module_table.selectRow(row)
         self.module_table.resizeColumnsToContents()
@@ -1254,6 +1572,9 @@ class AgentCustomCodeDialog(QDialog):
         if module_dir is None:
             return
         manifest = self._manifest_for(module_dir)
+        summary = str(manifest.get("summary", "") or manifest.get("task", "") or "No summary.")
+        self.module_summary_label.setText(summary)
+        self.module_summary_label.setToolTip(summary)
         self.log.append(f"Selected module: {manifest.get('name') or module_dir.name}")
 
     def _new_module_dir(self, name: str) -> Path:
@@ -1365,9 +1686,10 @@ class AgentCustomCodeDialog(QDialog):
         self.current_module_dir = module_dir
         self._process_snapshot_root = module_dir
         self._process_file_snapshot = _file_snapshot(module_dir)
+        self._active_timing = {"started_at": time.perf_counter()}
         self._set_busy(True)
-        self.log.append(f"Agent task written: {task_path}")
-        self.log.append(f"Agent instructions written: {agents_path}")
+        self._set_run_progress_busy("Generating module...")
+        self.log.append("Agent task prepared.")
         self.log.append(f"$ {_command_for_log(program, arguments)}")
         process.start()
 
@@ -1378,7 +1700,6 @@ class AgentCustomCodeDialog(QDialog):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if task.strip():
             manifest["task"] = task.strip()
-            manifest["summary"] = task.strip()[:200]
         manifest["updated_at"] = now
         (module_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         readme = f"# {manifest.get('name') or module_dir.name}\n\nTask:\n\n{manifest.get('task') or 'Agent custom analysis module.'}\n\nSee AGENT_TASK.md for the full generation contract.\n"
@@ -1388,10 +1709,17 @@ class AgentCustomCodeDialog(QDialog):
         selected_raw = self._selected_raw_records_for_scope()
         selected_processed = self._selected_processed_records_for_scope()
         input_summary = self._agent_input_summary(selected_raw, selected_processed)
+        manifest = self._manifest_for(module_dir)
+        existing_summary = str(manifest.get("summary", "") or manifest.get("task", "") or "").strip()
         mode_text = (
-            "Modify the existing module.py in place according to the user task."
+            "Modify the existing module.py in place according to the user task. Preserve existing functionality by default."
             if modify_existing
             else "Generate module.py according to the user task. The initial file is only an interface shell; replace the placeholder analyze(context) implementation."
+        )
+        implementation_text = (
+            "The current module.py is the baseline implementation. Extend it carefully and keep old behavior compatible unless explicit removal is requested."
+            if modify_existing
+            else "The initial module.py shell is not an analysis template. Treat the user task as the source of truth and write the analysis code yourself."
         )
         task_text = task.strip() or "Generate a custom analysis module from the selected input data."
         return (
@@ -1408,14 +1736,27 @@ class AgentCustomCodeDialog(QDialog):
             "Do not edit repository source files, do not use git, do not control hardware.\n"
             "Do not open GUI windows, do not call plt.show(), and do not require interactive input.\n"
             "The module must define analyze(context: dict) -> dict in module.py.\n"
-            "The initial module.py shell is not an analysis template. Treat the user task as the source of truth and write the analysis code yourself.\n\n"
+            f"{implementation_text}\n\n"
+            f"Existing module summary: {existing_summary or 'No existing implementation summary.'}\n"
+            "Modification semantics: if this is a modification, treat requests such as add, also support, extend, include, or 增加/添加 as additive changes.\n"
+            "Do not delete, replace, or simplify existing analyses, outputs, helper functions, parameters, result formats, or figures unless the user explicitly asks to remove or replace them.\n"
+            "Read the current module.py before editing it, keep compatible behavior for old tasks, and add the new behavior alongside the existing behavior.\n\n"
+            "After implementing, update the module description so it accurately describes the current module behavior, not just the user request.\n"
+            "Write a concise implementation summary in manifest.json['summary']; preserve manifest id/name/created_at/generated_by/entrypoint when editing it.\n"
+            "Also add or update a module-level or analyze() docstring in module.py with the same current-functionality summary, and add a README.md Summary section.\n\n"
             "Input data paths are provided in context['selected_raw_records'] and context['selected_processed_records'].\n"
+            "Write every generated output file or subfolder under context['output_dir']; the GUI treats that directory as one result-history folder for this module run.\n"
+            "Do not write generated result files outside context['output_dir'].\n"
             "Raw spike input package (.npz) keys: channels, spike_times, stim_times, sampling_rate, metadata_json. spike_times is an object array aligned to channels.\n"
             "Processed input package (.npz) keys: matrix, sample_labels, feature_labels, metadata_json.\n"
             "When multiple raw or processed records are selected, iterate over every selected record. Do not use only the first record unless the user explicitly asks for that.\n"
             "For cross-file channel comparisons, align rows by channel/electrode label, use sample_labels for channels/electrodes, and use feature_labels for file/condition names.\n"
             "If the task asks to compare files, preserve per-file values as separate columns or separate processed_records; do not collapse them into one global summary.\n"
             "If the task asks for one plot/result per channel/electrode, return one processed_record per channel/electrode. Each such record should have a 1 x N matrix, feature_labels as file/condition names, sample_labels containing the channel/electrode label, and value_label for the measured value.\n"
+            "Performance requirements: load each input .npz file at most once, cache arrays in local variables, prefer numpy vectorized operations over Python loops where practical, avoid repeated per-channel file I/O, and avoid generating many high-resolution figures unless the user explicitly asks for them.\n"
+            "For large channel/file comparisons, return numeric processed_records as the primary output and create only lightweight preview figures needed by the task. Use matplotlib Agg/non-interactive saving if figures are required.\n"
+            "Keep runtime memory bounded: do not duplicate large matrices unnecessarily, convert labels to compact Python lists only for output metadata, and close matplotlib figures after saving them.\n"
+            "Do not return NaN or infinite values in output matrices. If a statistic is undefined, replace it with 0.0 and mention the replacement in summary.\n"
             "Return {'processed_records': [...], 'figures': [], 'summary': '...'}.\n"
             "Each processed record must include name, dataset_type, matrix or matrix_path, sample_labels, feature_labels, description. Optional value_label and x_axis_label improve GUI plotting.\n\n"
             f"{mode_text}\n"
@@ -1458,14 +1799,35 @@ class AgentCustomCodeDialog(QDialog):
             self.refresh_data_button,
             self.delete_results_button,
             self.save_results_button,
+            self.up_folder_button,
+            self.new_folder_button,
+            self.move_results_button,
+            self.rename_result_button,
         ]:
             button.setEnabled(not busy)
         self.stop_button.setEnabled(busy)
+        if not busy:
+            self._sync_result_buttons()
+
+    def _set_run_progress_idle(self) -> None:
+        self.run_progress.setRange(0, 100)
+        self.run_progress.setValue(0)
+        self.run_progress.setFormat("Idle")
+
+    def _set_run_progress_busy(self, label: str) -> None:
+        self.run_progress.setRange(0, 0)
+        self.run_progress.setFormat(label)
+
+    def _set_run_progress_done(self, label: str, *, ok: bool = True) -> None:
+        self.run_progress.setRange(0, 100)
+        self.run_progress.setValue(100 if ok else 0)
+        self.run_progress.setFormat(label)
 
     def _stop_process(self) -> None:
         if self.current_process is None:
             return
         self.log.append("Stopping process...")
+        self._set_run_progress_busy("Stopping...")
         self.current_process.terminate()
         QTimer.singleShot(2000, self._kill_process_if_needed)
 
@@ -1476,14 +1838,14 @@ class AgentCustomCodeDialog(QDialog):
     def _read_process_stdout(self) -> None:
         if self.current_process is None:
             return
-        text = bytes(self.current_process.readAllStandardOutput()).decode(errors="replace")
+        text = _decode_process_output(self.current_process.readAllStandardOutput())
         for line in _agent_log_lines(text, stream="stdout"):
             self.log.append(line)
 
     def _read_process_stderr(self) -> None:
         if self.current_process is None:
             return
-        text = bytes(self.current_process.readAllStandardError()).decode(errors="replace")
+        text = _decode_process_output(self.current_process.readAllStandardError())
         for line in _agent_log_lines(text, stream="stderr"):
             self.log.append(line)
 
@@ -1492,14 +1854,10 @@ class AgentCustomCodeDialog(QDialog):
         module_dir = self.current_module_dir
         snapshot_root = self._process_snapshot_root
         snapshot = dict(self._process_file_snapshot)
+        finished_at = time.perf_counter()
+        timing = dict(self._active_timing)
         self.log.append(f"Process finished: code={exit_code}, status={exit_status.name}")
         self.current_process = None
-        self.current_mode = ""
-        self.current_module_dir = None
-        self._process_snapshot_root = None
-        self._process_file_snapshot = {}
-        self._set_busy(False)
-        self._sync_result_buttons()
         if snapshot_root is not None:
             changed = _changed_files(snapshot_root, snapshot)
             if changed:
@@ -1512,15 +1870,59 @@ class AgentCustomCodeDialog(QDialog):
             self._module_selection_changed()
             self._check_generated_module(module_dir, exit_code)
         elif mode == "run":
+            result_load_started_at = time.perf_counter()
             self._load_run_result(exit_code, module_dir)
+            result_load_s = time.perf_counter() - result_load_started_at
+            input_s = float(timing.get("input_export_s", 0.0) or 0.0)
+            process_started_at = float(timing.get("process_started_at", 0.0) or 0.0)
+            module_s = max(0.0, finished_at - process_started_at) if process_started_at else 0.0
+            total_started_at = float(timing.get("started_at", 0.0) or 0.0)
+            total_s = max(0.0, time.perf_counter() - total_started_at) if total_started_at else input_s + module_s + result_load_s
+            self.log.append(
+                f"Timing: input export {input_s:.2f}s, module run {module_s:.2f}s, result load {result_load_s:.2f}s, total {total_s:.2f}s."
+            )
+        if mode == "run":
+            self._set_run_progress_done("Run completed" if exit_code == 0 else "Run failed", ok=(exit_code == 0))
+        elif mode == "generate":
+            started_at = float(timing.get("started_at", 0.0) or 0.0)
+            if started_at:
+                self.log.append(f"Timing: generation {max(0.0, finished_at - started_at):.2f}s.")
+            self._set_run_progress_done("Generation completed" if exit_code == 0 else "Generation failed", ok=(exit_code == 0))
+        self.current_mode = ""
+        self.current_module_dir = None
+        self.current_run_dir = None
+        self.current_output_dir = None
+        self.current_result_folder_name = ""
+        self.current_result_folder_id = ""
+        self.current_input_signature = ""
+        self.current_input_label = ""
+        self._process_snapshot_root = None
+        self._process_file_snapshot = {}
+        self._active_timing = {}
+        self._set_busy(False)
+        self._sync_result_buttons()
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
         self.log.append(f"Process error: {error.name}")
+        if self.current_result_folder_id in self._result_folders:
+            folder = self._result_folders[self.current_result_folder_id]
+            folder["status"] = "failed"
+            folder["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._refresh_result_table()
+            self._select_result_folder_id(self.current_result_folder_id)
         self.current_process = None
         self.current_mode = ""
         self.current_module_dir = None
+        self.current_run_dir = None
+        self.current_output_dir = None
+        self.current_result_folder_name = ""
+        self.current_result_folder_id = ""
+        self.current_input_signature = ""
+        self.current_input_label = ""
         self._process_snapshot_root = None
         self._process_file_snapshot = {}
+        self._active_timing = {}
+        self._set_run_progress_done("Process error", ok=False)
         self._set_busy(False)
         self._sync_result_buttons()
 
@@ -1538,10 +1940,12 @@ class AgentCustomCodeDialog(QDialog):
             self.log.append("Agent generation failed: module.py is missing.")
             return
         try:
-            code = code_path.read_text(encoding="utf-8")
+            code, removed_bom = _read_python_text_without_bom(code_path)
         except Exception as exc:
             self.log.append(f"Could not inspect generated module.py: {exc}")
             return
+        if removed_bom:
+            self.log.append("Removed UTF-8 BOM from generated module.py.")
         placeholder = "Agent analysis code has not been generated yet" in code
         has_analyze = "def analyze(" in code
         if exit_code != 0:
@@ -1556,7 +1960,39 @@ class AgentCustomCodeDialog(QDialog):
             except SyntaxError as exc:
                 self.log.append(f"Agent generated module.py but it has a syntax error: line {exc.lineno}: {exc.msg}")
                 return
+            summary = self._refresh_module_summary_from_generated_files(module_dir, code)
+            if summary:
+                self.log.append(f"Module summary updated: {summary}")
             self.log.append("Agent generated module.py successfully.")
+            self.task_text.clear()
+
+    def _refresh_module_summary_from_generated_files(self, module_dir: Path, code: str) -> str:
+        manifest = self._manifest_for(module_dir)
+        if not manifest:
+            return ""
+        task = _compact_module_summary(str(manifest.get("task", "") or ""))
+        current_summary = _compact_module_summary(str(manifest.get("summary", "") or ""))
+        code_summary = _summary_from_python_code(code)
+        readme_summary = _summary_from_readme(module_dir / "README.md")
+        summary = code_summary or readme_summary or current_summary or task
+        summary = _compact_module_summary(summary)
+        if not summary:
+            return ""
+        manifest["summary"] = summary
+        manifest["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        (module_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        readme_path = module_dir / "README.md"
+        existing = readme_path.read_text(encoding="utf-8-sig", errors="replace") if readme_path.exists() else ""
+        if not re.search(r"^#+\s*(summary|module summary|功能摘要)\b", existing, flags=re.IGNORECASE | re.MULTILINE):
+            title = manifest.get("name") or module_dir.name
+            readme_path.write_text(
+                f"# {title}\n\n## Summary\n\n{summary}\n\n## Task\n\n{manifest.get('task') or 'Agent custom analysis module.'}\n",
+                encoding="utf-8",
+            )
+        self._refresh_modules()
+        self._select_module_id(module_dir.name)
+        self._module_selection_changed()
+        return summary
 
     def _run_selected_module(self) -> None:
         if self.current_process is not None:
@@ -1572,10 +2008,41 @@ class AgentCustomCodeDialog(QDialog):
             run_dir = self.runs_root / f"{time.strftime('%Y%m%d_%H%M%S')}_{suffix}"
             suffix += 1
         input_dir = run_dir / "input"
-        output_dir = run_dir / "output"
+        selected_raw = self._selected_raw_records_for_scope()
+        selected_processed = self._selected_processed_records_for_scope()
+        input_signature, input_label = self._input_signature_for_records(selected_raw, selected_processed)
+        result_parent_id = self._result_current_folder_id if self._result_current_folder_id in self._result_folders else "root"
+        existing_folder_id = self._find_result_folder_for_run(module_dir, input_signature)
+        if existing_folder_id:
+            existing_folder = self._result_folders.get(existing_folder_id, {})
+            result_parent_id = str(existing_folder.get("parent_id", "") or "root")
+            result_folder_name = str(existing_folder.get("name", "") or self._module_result_folder_name(module_dir))
+        else:
+            result_folder_name = self._unique_result_child_name(
+                result_parent_id,
+                self._module_result_folder_name(module_dir),
+            )
+        output_dir = run_dir / "output" / _slugify(result_folder_name, "result")
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        result_folder_id = self._prepare_result_folder_for_run(
+            module_dir,
+            parent_id=result_parent_id,
+            output_dir=output_dir,
+            run_id=run_dir.name,
+            input_signature=input_signature,
+            input_label=input_label,
+        )
+        self._result_current_folder_id = result_parent_id
+        self._refresh_result_table()
+        self._select_result_folder_id(result_folder_id)
+        self._draw_empty_preview(self.preview_canvas, f"Folder: {result_folder_name}\nRunning...\n{input_label}")
+        run_started_at = time.perf_counter()
+        self._set_run_progress_busy("Preparing input...")
+        QApplication.processEvents()
+        input_started_at = time.perf_counter()
         manifest_path = self._export_input_manifest(input_dir)
+        input_export_s = time.perf_counter() - input_started_at
         process = QProcess(self)
         process.setProgram(sys.executable)
         runtime_args = [
@@ -1598,11 +2065,23 @@ class AgentCustomCodeDialog(QDialog):
         self.current_mode = "run"
         self.current_module_dir = module_dir
         self.current_run_dir = run_dir
+        self.current_output_dir = output_dir
+        self.current_result_folder_name = result_folder_name
+        self.current_result_folder_id = result_folder_id
+        self.current_input_signature = input_signature
+        self.current_input_label = input_label
+        self._temporary_run_dirs.add(run_dir)
         self._process_snapshot_root = run_dir
         self._process_file_snapshot = _file_snapshot(run_dir)
+        self._active_timing = {
+            "started_at": run_started_at,
+            "input_export_s": input_export_s,
+            "process_started_at": time.perf_counter(),
+        }
         self.last_result = None
         self._sync_result_buttons()
         self._set_busy(True)
+        self._set_run_progress_busy("Running module...")
         timeout_s = max(1, self._timeout_seconds())
         QTimer.singleShot(timeout_s * 1000, lambda process=process: self._timeout_process(process))
         self.log.append(f"$ {_command_for_log(sys.executable, runtime_args)}")
@@ -1695,14 +2174,518 @@ class AgentCustomCodeDialog(QDialog):
             "feature_labels": feature_labels,
         }
 
+    def _module_result_folder_name(self, module_dir: Path) -> str:
+        manifest = self._manifest_for(module_dir)
+        name = str(manifest.get("name") or module_dir.name or "agent result").strip()
+        return name or "agent result"
+
+    def _result_folder_path_parts(self, folder_id: str | None = None) -> list[str]:
+        folder_id = str(folder_id or self._result_current_folder_id or "root")
+        parts = []
+        seen = set()
+        while folder_id and folder_id != "root" and folder_id not in seen:
+            seen.add(folder_id)
+            folder = self._result_folders.get(folder_id)
+            if not folder:
+                break
+            parts.append(str(folder.get("name") or folder_id))
+            folder_id = str(folder.get("parent_id") or "root")
+        return ["Results", *reversed(parts)]
+
+    def _result_folder_path_text(self, folder_id: str | None = None) -> str:
+        return " / ".join(self._result_folder_path_parts(folder_id))
+
+    def _result_child_names(self, parent_id: str, *, exclude_id: str = "") -> set[str]:
+        names = set()
+        for folder_id, folder in self._result_folders.items():
+            if folder_id == exclude_id:
+                continue
+            if str(folder.get("parent_id", "")) == parent_id:
+                names.add(str(folder.get("name", "")).strip().lower())
+        for item in self._result_items:
+            if str(item.get("id", "")) == exclude_id:
+                continue
+            if str(item.get("folder_id", "root")) == parent_id:
+                names.add(self._result_item_display_name(item).strip().lower())
+        return names
+
+    def _unique_result_child_name(self, parent_id: str, base_name: str) -> str:
+        base = str(base_name or "result").strip() or "result"
+        existing = self._result_child_names(parent_id)
+        if base.lower() not in existing:
+            return base
+        suffix = 2
+        while f"{base} {suffix}".lower() in existing:
+            suffix += 1
+        return f"{base} {suffix}"
+
+    def _create_result_folder(
+        self,
+        name: str,
+        *,
+        parent_id: str | None = None,
+        path: Path | None = None,
+        run_id: str = "",
+        module_manifest: dict | None = None,
+        module_id: str = "",
+        input_signature: str = "",
+        input_label: str = "",
+        status: str = "",
+    ) -> str:
+        parent = str(parent_id or self._result_current_folder_id or "root")
+        folder_id = f"folder_{self._result_next_folder_id}"
+        self._result_next_folder_id += 1
+        self._result_folders[folder_id] = {
+            "id": folder_id,
+            "name": str(name or folder_id),
+            "parent_id": parent,
+            "path": str(path or ""),
+            "run_id": str(run_id or ""),
+            "module_manifest": dict(module_manifest or {}),
+            "module_id": str(module_id or ""),
+            "input_signature": str(input_signature or ""),
+            "input_label": str(input_label or ""),
+            "status": str(status or ""),
+            "saved": False,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return folder_id
+
+    def _find_result_folder_for_run(self, module_dir: Path, input_signature: str) -> str:
+        module_id = module_dir.name
+        for folder_id, folder in self._result_folders.items():
+            if folder_id == "root":
+                continue
+            if str(folder.get("module_id", "")) == module_id and str(folder.get("input_signature", "")) == input_signature:
+                return folder_id
+        return ""
+
+    def _prepare_result_folder_for_run(
+        self,
+        module_dir: Path,
+        *,
+        parent_id: str,
+        output_dir: Path,
+        run_id: str,
+        input_signature: str,
+        input_label: str,
+    ) -> str:
+        module_manifest = self._manifest_for(module_dir)
+        folder_id = self._find_result_folder_for_run(module_dir, input_signature)
+        if folder_id:
+            folder = self._result_folders[folder_id]
+            old_path = Path(str(folder.get("path", "")))
+            if old_path.exists() and self._is_within_runs_root(old_path):
+                old_run_dir = self._run_dir_for_output_path(old_path)
+                if old_run_dir is not None and old_run_dir.exists() and self._is_within_runs_root(old_run_dir):
+                    shutil.rmtree(old_run_dir, ignore_errors=True)
+                    self._temporary_run_dirs.discard(old_run_dir)
+            self._result_items = [item for item in self._result_items if str(item.get("folder_id", "root")) != folder_id]
+            folder.update(
+                {
+                    "path": str(output_dir),
+                    "run_id": str(run_id),
+                    "module_manifest": dict(module_manifest or {}),
+                    "input_label": input_label,
+                    "status": "running",
+                    "saved": False,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        else:
+            base_name = self._module_result_folder_name(module_dir)
+            folder_name = self._unique_result_child_name(parent_id, base_name)
+            folder_id = self._create_result_folder(
+                folder_name,
+                parent_id=parent_id,
+                path=output_dir,
+                run_id=run_id,
+                module_manifest=module_manifest,
+                module_id=module_dir.name,
+                input_signature=input_signature,
+                input_label=input_label,
+                status="running",
+            )
+        return folder_id
+
+    def _select_result_folder_id(self, folder_id: str) -> None:
+        target = str(folder_id or "")
+        for row, entry in enumerate(self._visible_result_entries):
+            if entry.get("entry_type") == "folder" and str(entry.get("folder_id", "")) == target:
+                self.output_table.clearSelection()
+                self.output_table.selectRow(row)
+                return
+
+    def _visible_result_entries_for_current_folder(self) -> list[dict]:
+        current = str(self._result_current_folder_id or "root")
+        entries = []
+        folders = [
+            folder
+            for folder_id, folder in self._result_folders.items()
+            if folder_id != "root" and str(folder.get("parent_id", "")) == current
+        ]
+        folders.sort(key=lambda item: str(item.get("name", "")).lower())
+        for folder in folders:
+            entries.append({"entry_type": "folder", "folder_id": str(folder.get("id", "")), "folder": folder})
+        items = [item for item in self._result_items if str(item.get("folder_id", "root")) == current]
+        items.sort(key=lambda item: (str(item.get("run_id", "")), self._result_item_display_name(item).lower()))
+        for item in items:
+            entries.append({"entry_type": "item", "item_id": str(item.get("id", "")), "item": item})
+        return entries
+
+    def _result_item_index(self, item_id: str) -> int:
+        for index, item in enumerate(self._result_items):
+            if str(item.get("id", "")) == str(item_id):
+                return index
+        return -1
+
+    def _selected_result_entries(self) -> list[dict]:
+        rows = sorted({index.row() for index in self.output_table.selectedIndexes()})
+        return [self._visible_result_entries[row] for row in rows if 0 <= row < len(self._visible_result_entries)]
+
+    def _selected_result_item_indexes(self) -> list[tuple[int, dict]]:
+        selected = []
+        for entry in self._selected_result_entries():
+            if entry.get("entry_type") != "item":
+                continue
+            index = self._result_item_index(str(entry.get("item_id", "")))
+            if 0 <= index < len(self._result_items):
+                selected.append((index, self._result_items[index]))
+        return selected
+
+    def _result_folder_descendant_ids(self, folder_id: str) -> set[str]:
+        root_id = str(folder_id or "")
+        ids = {root_id} if root_id else set()
+        changed = True
+        while changed:
+            changed = False
+            for child_id, folder in self._result_folders.items():
+                if child_id in ids:
+                    continue
+                if str(folder.get("parent_id", "")) in ids:
+                    ids.add(child_id)
+                    changed = True
+        return ids
+
+    def _selected_folder_result_item_indexes(self) -> list[tuple[int, dict]]:
+        selected_folder_ids = {
+            str(entry.get("folder_id", ""))
+            for entry in self._selected_result_entries()
+            if entry.get("entry_type") == "folder"
+        }
+        if not selected_folder_ids:
+            return []
+        folder_ids: set[str] = set()
+        for folder_id in selected_folder_ids:
+            folder_ids.update(self._result_folder_descendant_ids(folder_id))
+        return [
+            (index, item)
+            for index, item in enumerate(self._result_items)
+            if str(item.get("folder_id", "root")) in folder_ids
+        ]
+
+    def _open_selected_result_folder(self) -> None:
+        entries = self._selected_result_entries()
+        if len(entries) != 1 or entries[0].get("entry_type") != "folder":
+            return
+        folder_id = str(entries[0].get("folder_id", ""))
+        if folder_id in self._result_folders:
+            self._result_current_folder_id = folder_id
+            self._refresh_result_table()
+            self._result_selection_changed()
+
+    def _go_result_folder_up(self) -> None:
+        current = self._result_folders.get(str(self._result_current_folder_id), {})
+        parent_id = str(current.get("parent_id") or "root")
+        self._result_current_folder_id = parent_id if parent_id in self._result_folders else "root"
+        self._refresh_result_table()
+        self._result_selection_changed()
+
+    def _new_result_folder_action(self) -> None:
+        name, accepted = QInputDialog.getText(self, "New result folder", "Folder name:", text="New folder")
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name.lower() in self._result_child_names(self._result_current_folder_id):
+            QMessageBox.warning(self, "Duplicate name", f'"{name}" already exists in this result folder.')
+            return
+        self._create_result_folder(name, parent_id=self._result_current_folder_id)
+        self._refresh_result_table()
+
+    def _all_result_folder_choices(self) -> list[tuple[str, str]]:
+        choices = [("Results", "root")]
+        folder_ids = [folder_id for folder_id in self._result_folders if folder_id != "root"]
+        folder_ids.sort(key=lambda value: self._result_folder_path_text(value).lower())
+        for folder_id in folder_ids:
+            choices.append((self._result_folder_path_text(folder_id), folder_id))
+        return choices
+
+    def _move_selected_results(self) -> None:
+        selected = self._selected_result_item_indexes()
+        if not selected:
+            QMessageBox.information(self, "Agent Custom Code", "Select result files to move.")
+            return
+        choices = self._all_result_folder_choices()
+        labels = [label for label, _folder_id in choices]
+        current_label = self._result_folder_path_text(self._result_current_folder_id)
+        index = max(0, labels.index(current_label) if current_label in labels else 0)
+        label, accepted = QInputDialog.getItem(self, "Move results", "Destination folder:", labels, index, False)
+        if not accepted:
+            return
+        destination = dict(choices).get(label, "root")
+        selected_ids = {str(item.get("id", "")) for _index, item in selected}
+        existing = set()
+        for folder_id, folder in self._result_folders.items():
+            if str(folder.get("parent_id", "")) == destination:
+                existing.add(str(folder.get("name", "")).strip().lower())
+        for item in self._result_items:
+            if str(item.get("id", "")) in selected_ids:
+                continue
+            if str(item.get("folder_id", "root")) == destination:
+                existing.add(self._result_item_display_name(item).strip().lower())
+        moving_names = []
+        for _index, item in selected:
+            name = self._result_item_display_name(item).strip()
+            key = name.lower()
+            if key in existing or key in moving_names:
+                QMessageBox.warning(self, "Duplicate name", f'"{name}" already exists in the destination result folder.')
+                return
+            moving_names.append(key)
+        for _index, item in selected:
+            item["folder_id"] = destination
+        self._refresh_result_table()
+        self._result_selection_changed()
+
+    def _rename_selected_result_entry(self) -> None:
+        entries = self._selected_result_entries()
+        if len(entries) != 1:
+            QMessageBox.information(self, "Agent Custom Code", "Select one result or folder to rename.")
+            return
+        entry = entries[0]
+        if entry.get("entry_type") == "folder":
+            folder = entry.get("folder", {})
+            entry_id = str(folder.get("id", ""))
+            parent_id = str(folder.get("parent_id", "root"))
+            current = str(folder.get("name", "") or entry_id)
+        else:
+            item = entry.get("item", {})
+            entry_id = str(item.get("id", ""))
+            parent_id = str(item.get("folder_id", "root"))
+            current = self._result_item_display_name(item)
+        name, accepted = QInputDialog.getText(self, "Rename result entry", "Name:", text=current)
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name.lower() in self._result_child_names(parent_id, exclude_id=entry_id):
+            QMessageBox.warning(self, "Duplicate name", f'"{name}" already exists in this result folder.')
+            return
+        if entry.get("entry_type") == "folder":
+            self._result_folders[entry_id]["name"] = name
+        else:
+            self._rename_result_item(entry.get("item", {}), name)
+        self._refresh_result_table()
+
+    def _rename_result_item(self, item: dict, name: str) -> None:
+        if item.get("kind") == "figure":
+            figure = item.get("figure")
+            if isinstance(figure, dict):
+                figure["name"] = name
+            else:
+                item["figure"] = {"name": name, "path": str(figure)}
+            return
+        record = item.get("record")
+        if isinstance(record, dict):
+            record["name"] = name
+
+    def _is_within_runs_root(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+            runs_root = self.runs_root.resolve()
+        except OSError:
+            return False
+        return resolved == runs_root or runs_root in resolved.parents
+
+    def _run_dir_for_output_path(self, path: Path) -> Path | None:
+        try:
+            resolved = path.resolve()
+            runs_root = self.runs_root.resolve()
+        except OSError:
+            return None
+        for candidate in [resolved, *resolved.parents]:
+            if candidate.parent == runs_root:
+                return candidate
+        return None
+
+    def _delete_result_folder_recursive(self, folder_id: str) -> None:
+        folder = self._result_folders.get(folder_id)
+        if not folder or folder_id == "root":
+            return
+        for child_id, child in list(self._result_folders.items()):
+            if str(child.get("parent_id", "")) == folder_id:
+                self._delete_result_folder_recursive(child_id)
+        self._result_items = [item for item in self._result_items if str(item.get("folder_id", "root")) != folder_id]
+        folder_path = Path(str(folder.get("path", "")))
+        if folder_path.exists() and self._is_within_runs_root(folder_path):
+            shutil.rmtree(folder_path, ignore_errors=True)
+        self._result_folders.pop(folder_id, None)
+
+    def _delete_result_folder_output(self, folder_id: str) -> None:
+        folder = self._result_folders.get(folder_id)
+        if not folder or folder_id == "root":
+            return
+        folder_path = Path(str(folder.get("path", "")))
+        if folder_path.exists() and self._is_within_runs_root(folder_path):
+            run_dir = self._run_dir_for_output_path(folder_path)
+            if run_dir is not None and run_dir.exists() and self._is_within_runs_root(run_dir):
+                shutil.rmtree(run_dir, ignore_errors=True)
+                self._temporary_run_dirs.discard(run_dir)
+            else:
+                shutil.rmtree(folder_path, ignore_errors=True)
+
+    def _mark_result_folder_saved(self, folder_id: str) -> None:
+        folder = self._result_folders.get(str(folder_id or ""))
+        if folder:
+            folder["saved"] = True
+            folder_path_text = str(folder.get("path", "")).strip()
+            if folder_path_text:
+                folder_path = Path(folder_path_text)
+                run_dir = self._run_dir_for_output_path(folder_path)
+                if run_dir is not None:
+                    self._temporary_run_dirs.discard(run_dir)
+
+    def _cleanup_unsaved_results(self) -> None:
+        unsaved_folders = [
+            folder_id
+            for folder_id, folder in list(self._result_folders.items())
+            if folder_id != "root" and str(folder.get("path", "")).strip() and not bool(folder.get("saved"))
+        ]
+        for folder_id in unsaved_folders:
+            self._delete_result_folder_output(folder_id)
+            self._delete_result_folder_recursive(folder_id)
+        for run_dir in list(self._temporary_run_dirs):
+            if run_dir.exists() and self._is_within_runs_root(run_dir):
+                shutil.rmtree(run_dir, ignore_errors=True)
+            self._temporary_run_dirs.discard(run_dir)
+        self._result_items = [item for item in self._result_items if bool(item.get("saved"))]
+        if self._result_current_folder_id not in self._result_folders:
+            self._result_current_folder_id = "root"
+        self._refresh_result_table()
+
+    def _find_run_result_path(self, output_dir: Path) -> Path | None:
+        candidates = [output_dir / "result.json"]
+        if self.current_run_dir is not None:
+            candidates.append(self.current_run_dir / "output" / "result.json")
+            try:
+                candidates.extend(sorted((self.current_run_dir / "output").rglob("result.json")))
+            except OSError:
+                pass
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _is_path_recorded(self, path: Path, output_dir: Path, records: list[dict], figures: list) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        for record in records:
+            matrix_path = str(record.get("matrix_path", "") or "")
+            if not matrix_path:
+                continue
+            candidate = Path(matrix_path)
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            try:
+                if candidate.resolve() == resolved:
+                    return True
+            except OSError:
+                if candidate == resolved:
+                    return True
+        for figure in figures:
+            if isinstance(figure, dict):
+                figure_path = str(figure.get("path", "") or "")
+            else:
+                figure_path = str(figure or "")
+            if not figure_path:
+                continue
+            candidate = Path(figure_path)
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            try:
+                if candidate.resolve() == resolved:
+                    return True
+            except OSError:
+                if candidate == resolved:
+                    return True
+        return False
+
+    def _discover_output_files(self, output_dir: Path, records: list[dict], figures: list) -> tuple[list[dict], list[dict], list[dict]]:
+        discovered_figures: list[dict] = []
+        discovered_records: list[dict] = []
+        discovered_files: list[dict] = []
+        image_suffixes = {".png", ".jpg", ".jpeg", ".pdf", ".svg"}
+        matrix_suffixes = {".npy"}
+        try:
+            files = sorted(path for path in output_dir.rglob("*") if path.is_file())
+        except OSError:
+            return discovered_records, discovered_figures, discovered_files
+        for path in files:
+            if path.name in {"result.json", "error.txt"}:
+                continue
+            if self._is_path_recorded(path, output_dir, records, figures):
+                continue
+            suffix = path.suffix.lower()
+            try:
+                relative = path.relative_to(output_dir).as_posix()
+            except ValueError:
+                relative = str(path)
+            if suffix in image_suffixes:
+                discovered_figures.append({"name": path.stem, "path": relative})
+            elif suffix in matrix_suffixes:
+                discovered_records.append(
+                    {
+                        "name": path.stem,
+                        "dataset_type": "agent_output_file",
+                        "matrix_path": str(path),
+                        "sample_labels": [],
+                        "feature_labels": [],
+                        "description": f"Discovered output matrix file: {relative}",
+                    }
+                )
+            else:
+                discovered_files.append({"name": path.name, "path": relative, "description": f"Output file: {relative}"})
+        return discovered_records, discovered_figures, discovered_files
+
     def _load_run_result(self, exit_code: int, module_dir: Path | None) -> None:
         if self.current_run_dir is None:
             return
-        result_path = self.current_run_dir / "output" / "result.json"
-        if exit_code != 0 or not result_path.exists():
-            error_path = self.current_run_dir / "output" / "error.txt"
+        output_dir = self.current_output_dir or (self.current_run_dir / "output")
+        result_path = self._find_run_result_path(output_dir)
+        if result_path is not None:
+            output_dir = result_path.parent
+            self.current_output_dir = output_dir
+        if exit_code != 0 or result_path is None:
+            if self.current_result_folder_id in self._result_folders:
+                folder = self._result_folders[self.current_result_folder_id]
+                folder["status"] = "failed"
+                folder["path"] = str(output_dir)
+                folder["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._refresh_result_table()
+                self._select_result_folder_id(self.current_result_folder_id)
+            error_path = output_dir / "error.txt"
             if error_path.exists():
-                self.log.append(error_path.read_text(encoding="utf-8")[-4000:])
+                error_text = error_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                emitted = False
+                for line in _agent_log_lines(error_text, stream="stderr"):
+                    self.log.append(line)
+                    emitted = True
+                if not emitted:
+                    self.log.append(f"Module run failed. Details saved in {error_path.name}.")
             self._sync_result_buttons()
             return
         try:
@@ -1713,8 +2696,47 @@ class AgentCustomCodeDialog(QDialog):
             return
         records = list(self.last_result.get("processed_records", []) or [])
         figures = list(self.last_result.get("figures", []) or [])
+        discovered_records, discovered_figures, discovered_files = self._discover_output_files(output_dir, records, figures)
+        if discovered_records or discovered_figures or discovered_files:
+            records.extend(discovered_records)
+            figures.extend(discovered_figures)
+            self.log.append(
+                f"Discovered {len(discovered_records)} matrix file(s), {len(discovered_figures)} figure file(s), and {len(discovered_files)} other file(s) in output folder."
+            )
         module_manifest = self._manifest_for(module_dir) if module_dir is not None else {}
         run_id = self.current_run_dir.name
+        run_folder_id = self.current_result_folder_id if self.current_result_folder_id in self._result_folders else ""
+        parent_id = "root"
+        if run_folder_id:
+            folder = self._result_folders[run_folder_id]
+            parent_id = str(folder.get("parent_id", "") or "root")
+            folder.update(
+                {
+                    "path": str(output_dir),
+                    "run_id": run_id,
+                    "module_manifest": dict(module_manifest or {}),
+                    "status": "complete",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            self._result_items = [item for item in self._result_items if str(item.get("folder_id", "root")) != run_folder_id]
+            folder_name = str(folder.get("name", "") or self.current_result_folder_name or run_id)
+        else:
+            parent_id = self._result_current_folder_id if self._result_current_folder_id in self._result_folders else "root"
+            default_folder_name = self._module_result_folder_name(module_dir) if module_dir is not None else run_id
+            requested_folder_name = self.current_result_folder_name or default_folder_name
+            folder_name = self._unique_result_child_name(parent_id, requested_folder_name)
+            run_folder_id = self._create_result_folder(
+                folder_name,
+                parent_id=parent_id,
+                path=output_dir,
+                run_id=run_id,
+                module_manifest=module_manifest,
+                module_id=module_dir.name if module_dir is not None else "",
+                input_signature=self.current_input_signature,
+                input_label=self.current_input_label,
+                status="complete",
+            )
         new_rows = []
         for record in records:
             new_rows.append(
@@ -1723,6 +2745,7 @@ class AgentCustomCodeDialog(QDialog):
                     record=record,
                     run_dir=self.current_run_dir,
                     run_id=run_id,
+                    folder_id=run_folder_id,
                     module_dir=module_dir,
                     module_manifest=module_manifest,
                 )
@@ -1734,21 +2757,33 @@ class AgentCustomCodeDialog(QDialog):
                     figure=figure,
                     run_dir=self.current_run_dir,
                     run_id=run_id,
+                    folder_id=run_folder_id,
                     module_dir=module_dir,
                     module_manifest=module_manifest,
                 )
             )
-        start_row = len(self._result_items)
+        for file_info in discovered_files:
+            new_rows.append(
+                self._new_result_item(
+                    "file",
+                    figure=file_info,
+                    run_dir=self.current_run_dir,
+                    run_id=run_id,
+                    folder_id=run_folder_id,
+                    module_dir=module_dir,
+                    module_manifest=module_manifest,
+                )
+            )
         self._result_items.extend(new_rows)
+        self._result_current_folder_id = parent_id
         self._refresh_result_table()
+        self._select_result_folder_id(run_folder_id)
         self.log.append(str(self.last_result.get("summary", "") or "Run completed."))
         self._sync_result_buttons()
         if new_rows:
-            self.output_table.clearSelection()
-            self.output_table.selectRow(start_row)
-            if len(new_rows) > 1:
-                self.output_table.selectRow(start_row + 1)
             self._result_selection_changed()
+        else:
+            self._draw_empty_preview(self.preview_canvas, f"Folder: {folder_name}\nNo processed records or figures were returned.")
 
     def _new_result_item(
         self,
@@ -1758,6 +2793,7 @@ class AgentCustomCodeDialog(QDialog):
         figure=None,
         run_dir: Path,
         run_id: str,
+        folder_id: str,
         module_dir: Path | None,
         module_manifest: dict,
     ) -> dict:
@@ -1765,7 +2801,9 @@ class AgentCustomCodeDialog(QDialog):
             "id": f"result_{self._result_next_id}",
             "kind": kind,
             "run_dir": run_dir,
+            "output_dir": self.current_output_dir or (Path(run_dir) / "output"),
             "run_id": run_id,
+            "folder_id": folder_id,
             "module_dir": module_dir,
             "module_manifest": dict(module_manifest or {}),
             "saved": False,
@@ -1773,19 +2811,67 @@ class AgentCustomCodeDialog(QDialog):
         self._result_next_id += 1
         if kind == "processed":
             item["record"] = dict(record or {})
-        else:
+        elif kind == "figure":
             item["figure"] = figure
+        else:
+            item["file"] = dict(figure or {})
         return item
 
     def _refresh_result_table(self) -> None:
-        self.output_table.setRowCount(len(self._result_items))
-        for row, item in enumerate(self._result_items):
-            values = self._result_item_table_values(item, row)
+        self._visible_result_entries = self._visible_result_entries_for_current_folder()
+        self.result_path_label.setText(self._result_folder_path_text(self._result_current_folder_id))
+        self.up_folder_button.setEnabled(self._result_current_folder_id != "root")
+        self.output_table.setRowCount(len(self._visible_result_entries))
+        for row, entry in enumerate(self._visible_result_entries):
+            values = self._result_entry_table_values(entry, row)
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
                 table_item.setToolTip(value)
                 self.output_table.setItem(row, column, table_item)
         self.output_table.resizeColumnsToContents()
+        self._sync_result_buttons()
+
+    def _result_entry_table_values(self, entry: dict, row: int) -> list[str]:
+        if entry.get("entry_type") == "folder":
+            folder = entry.get("folder", {})
+            path = str(folder.get("path", "") or "")
+            status = str(folder.get("status", "") or "")
+            input_label = str(folder.get("input_label", "") or "")
+            description_parts = []
+            if status:
+                description_parts.append(status)
+            if input_label:
+                description_parts.append(input_label)
+            if path:
+                description_parts.append(f"Run output: {path}")
+            description = " | ".join(description_parts) if description_parts else "Folder"
+            child_count = self._result_folder_child_count(str(folder.get("id", "")))
+            return [f"[folder] {folder.get('name', f'folder {row + 1}')}", "folder", status, str(child_count), description]
+        return self._result_item_table_values(entry.get("item", {}), row)
+
+    def _result_folder_child_count(self, folder_id: str) -> int:
+        folder_count = sum(
+            1
+            for child_id, folder in self._result_folders.items()
+            if child_id != "root" and str(folder.get("parent_id", "")) == folder_id
+        )
+        item_count = sum(1 for item in self._result_items if str(item.get("folder_id", "root")) == folder_id)
+        return folder_count + item_count
+
+    def _result_item_display_name(self, item: dict) -> str:
+        if item.get("kind") == "figure":
+            figure_info = item.get("figure")
+            if isinstance(figure_info, dict):
+                figure_path = str(figure_info.get("path", ""))
+                return str(figure_info.get("name") or Path(figure_path).name or "figure")
+            else:
+                return Path(str(figure_info)).name or "figure"
+        if item.get("kind") == "file":
+            file_info = item.get("file", {})
+            file_path = str(file_info.get("path", ""))
+            return str(file_info.get("name") or Path(file_path).name or "file")
+        record = item.get("record", {})
+        return str(record.get("name", "") or item.get("id", "result"))
 
     def _result_item_table_values(self, item: dict, row: int) -> list[str]:
         if item.get("kind") == "figure":
@@ -1799,6 +2885,12 @@ class AgentCustomCodeDialog(QDialog):
                 figure_name = Path(figure_path).name or f"figure {row + 1}"
                 description = figure_path
             return [figure_name, "figure", "", "", description]
+        if item.get("kind") == "file":
+            file_info = item.get("file", {})
+            file_path = str(file_info.get("path", ""))
+            file_name = str(file_info.get("name") or Path(file_path).name or f"file {row + 1}")
+            description = str(file_info.get("description", "") or file_path)
+            return [file_name, "file", "", "", description]
         record = item.get("record", {})
         shape = list(record.get("shape", []) or [])
         samples = str(shape[0]) if len(shape) >= 1 else ""
@@ -1813,16 +2905,17 @@ class AgentCustomCodeDialog(QDialog):
         ]
 
     def _result_selection_changed(self) -> None:
-        if not self._result_items:
+        if not self._visible_result_entries:
             self._draw_empty_preview(self.preview_canvas, "Result preview")
             return
         rows = sorted({index.row() for index in self.output_table.selectedIndexes()})
         if not rows and self.output_table.rowCount():
             rows = [0]
         if rows:
-            self._draw_record_preview(self.preview_canvas, rows[0])
+            self._draw_result_entry_preview(self.preview_canvas, rows[0])
         else:
             self._draw_empty_preview(self.preview_canvas, "Result preview")
+        self._sync_result_buttons()
 
     def _zoom_preview_event(self, event) -> None:
         ax = getattr(event, "inaxes", None)
@@ -1837,15 +2930,21 @@ class AgentCustomCodeDialog(QDialog):
         if ydata is None:
             ydata = (y_bottom + y_top) / 2.0
         button = str(getattr(event, "button", "")).lower()
-        scale = 0.8 if button == "up" else 1.25
-        new_x_left = xdata - (xdata - x_left) * scale
-        new_x_right = xdata + (x_right - xdata) * scale
-        new_y_bottom = ydata - (ydata - y_bottom) * scale
-        new_y_top = ydata + (y_top - ydata) * scale
-        if abs(new_x_right - new_x_left) > 1e-9:
-            ax.set_xlim(new_x_left, new_x_right)
-        if abs(new_y_top - new_y_bottom) > 1e-9:
-            ax.set_ylim(new_y_bottom, new_y_top)
+        if button not in {"up", "down"}:
+            return
+        scale = 0.88 if button == "up" else 1.14
+        x_span = float(x_right) - float(x_left)
+        y_span = float(y_top) - float(y_bottom)
+        if abs(x_span) <= 1e-12 or abs(y_span) <= 1e-12:
+            return
+        x_anchor = (float(xdata) - float(x_left)) / x_span
+        y_anchor = (float(ydata) - float(y_bottom)) / y_span
+        new_x_span = x_span * scale
+        new_y_span = y_span * scale
+        new_x_left = float(xdata) - x_anchor * new_x_span
+        new_y_bottom = float(ydata) - y_anchor * new_y_span
+        ax.set_xlim(new_x_left, new_x_left + new_x_span)
+        ax.set_ylim(new_y_bottom, new_y_bottom + new_y_span)
         self.preview_canvas.draw_idle()
 
     def _preview_press_event(self, event) -> None:
@@ -1853,15 +2952,14 @@ class AgentCustomCodeDialog(QDialog):
         if ax is None or getattr(event, "button", None) != 1:
             self._preview_drag_state = None
             return
-        if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
-            self._preview_drag_state = None
-            return
         self._preview_drag_state = {
             "ax": ax,
-            "x": float(event.xdata),
-            "y": float(event.ydata),
+            "x": float(getattr(event, "x", 0.0)),
+            "y": float(getattr(event, "y", 0.0)),
             "xlim": tuple(ax.get_xlim()),
             "ylim": tuple(ax.get_ylim()),
+            "width": max(1.0, float(ax.bbox.width)),
+            "height": max(1.0, float(ax.bbox.height)),
         }
 
     def _preview_motion_event(self, event) -> None:
@@ -1871,14 +2969,16 @@ class AgentCustomCodeDialog(QDialog):
         ax = state.get("ax")
         if ax is None:
             return
-        if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
-            return
-        dx = float(event.xdata) - float(state["x"])
-        dy = float(event.ydata) - float(state["y"])
+        dx_pixels = float(getattr(event, "x", state["x"])) - float(state["x"])
+        dy_pixels = float(getattr(event, "y", state["y"])) - float(state["y"])
         x_left, x_right = state["xlim"]
         y_bottom, y_top = state["ylim"]
-        ax.set_xlim(float(x_left) - dx, float(x_right) - dx)
-        ax.set_ylim(float(y_bottom) - dy, float(y_top) - dy)
+        x_span = float(x_right) - float(x_left)
+        y_span = float(y_top) - float(y_bottom)
+        dx_data = -dx_pixels / float(state["width"]) * x_span
+        dy_data = -dy_pixels / float(state["height"]) * y_span
+        ax.set_xlim(float(x_left) + dx_data, float(x_right) + dx_data)
+        ax.set_ylim(float(y_bottom) + dy_data, float(y_top) + dy_data)
         self.preview_canvas.draw_idle()
 
     def _preview_release_event(self, _event) -> None:
@@ -1894,14 +2994,22 @@ class AgentCustomCodeDialog(QDialog):
         ax.set_yticks([])
         canvas.draw_idle()
 
-    def _draw_record_preview(self, canvas: FigureCanvas, record_index: int) -> None:
+    def _draw_result_entry_preview(self, canvas: FigureCanvas, visible_row: int) -> None:
         self._preview_drag_state = None
-        if not (0 <= record_index < len(self._result_items)):
+        if not (0 <= visible_row < len(self._visible_result_entries)):
             self._draw_empty_preview(canvas, "No result")
             return
-        item = self._result_items[record_index]
+        entry = self._visible_result_entries[visible_row]
+        if entry.get("entry_type") == "folder":
+            folder = entry.get("folder", {})
+            self._draw_empty_preview(canvas, f"Folder: {folder.get('name', 'folder')}\nDouble-click to open")
+            return
+        item = entry.get("item", {})
         if item.get("kind") == "figure":
-            self._draw_figure_file_preview(canvas, item.get("figure"), item.get("run_dir"))
+            self._draw_figure_file_preview(canvas, item.get("figure"), item.get("output_dir") or item.get("run_dir"))
+            return
+        if item.get("kind") == "file":
+            self._draw_file_preview(canvas, item.get("file"), item.get("output_dir") or item.get("run_dir"))
             return
         record = item.get("record", {})
         matrix_path = Path(str(record.get("matrix_path", "")))
@@ -1924,7 +3032,7 @@ class AgentCustomCodeDialog(QDialog):
             return
         if matrix.ndim == 1:
             matrix = matrix.reshape(-1, 1)
-        title = str(record.get("name", f"result {record_index + 1}") or f"result {record_index + 1}")
+        title = str(record.get("name", f"result {visible_row + 1}") or f"result {visible_row + 1}")
         sample_labels = [str(item) for item in list(record.get("sample_labels", []) or [])]
         feature_labels = [str(item) for item in list(record.get("feature_labels", []) or [])]
         ax.set_title(title[:70], fontsize=9)
@@ -2028,7 +3136,7 @@ class AgentCustomCodeDialog(QDialog):
             return "Time"
         return default
 
-    def _draw_figure_file_preview(self, canvas: FigureCanvas, figure_info, run_dir: Path | None = None) -> None:
+    def _draw_figure_file_preview(self, canvas: FigureCanvas, figure_info, output_dir: Path | None = None) -> None:
         if isinstance(figure_info, dict):
             path_text = str(figure_info.get("path", ""))
             title = str(figure_info.get("name") or Path(path_text).name or "Figure")
@@ -2036,13 +3144,27 @@ class AgentCustomCodeDialog(QDialog):
             path_text = str(figure_info)
             title = Path(path_text).name or "Figure"
         figure_path = Path(path_text)
-        if not figure_path.is_absolute() and run_dir is not None:
-            figure_path = Path(run_dir) / "output" / figure_path
+        if not figure_path.is_absolute() and output_dir is not None:
+            figure_path = Path(output_dir) / figure_path
         figure = canvas.figure
         figure.clear()
         ax = figure.add_subplot(111)
         if not figure_path.exists():
             ax.text(0.5, 0.5, "Missing figure", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            canvas.draw_idle()
+            return
+        if figure_path.suffix.lower() in {".pdf", ".svg"}:
+            size_kb = figure_path.stat().st_size / 1024.0
+            ax.text(
+                0.5,
+                0.5,
+                f"{title}\n{figure_path.name}\n{size_kb:.1f} KB\nPreview opens for bitmap images only.",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.set_xticks([])
             ax.set_yticks([])
             canvas.draw_idle()
@@ -2059,11 +3181,49 @@ class AgentCustomCodeDialog(QDialog):
             ax.set_yticks([])
         canvas.draw_idle()
 
+    def _draw_file_preview(self, canvas: FigureCanvas, file_info, output_dir: Path | None = None) -> None:
+        if isinstance(file_info, dict):
+            path_text = str(file_info.get("path", ""))
+            title = str(file_info.get("name") or Path(path_text).name or "File")
+            description = str(file_info.get("description", "") or "")
+        else:
+            path_text = str(file_info)
+            title = Path(path_text).name or "File"
+            description = path_text
+        file_path = Path(path_text)
+        if not file_path.is_absolute() and output_dir is not None:
+            file_path = Path(output_dir) / file_path
+        figure = canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        if file_path.exists():
+            size_text = f"{file_path.stat().st_size / 1024.0:.1f} KB"
+            path_label = str(file_path)
+        else:
+            size_text = "missing"
+            path_label = path_text
+        ax.text(
+            0.5,
+            0.5,
+            f"{title}\n{size_text}\n{description}\n{path_label}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            wrap=True,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        canvas.draw_idle()
+
     def _save_last_results(self) -> None:
         if not self._result_items:
             return
-        rows = self._selected_result_rows()
-        if not rows:
+        selected_items = self._selected_result_item_indexes()
+        if not selected_items:
+            selected_items = self._selected_folder_result_item_indexes()
+        if selected_items:
+            rows = [index for index, _item in selected_items]
+        else:
             rows = [index for index, item in enumerate(self._result_items) if item.get("kind") == "processed" and not item.get("saved")]
         records = []
         saved_row_indexes = []
@@ -2116,6 +3276,7 @@ class AgentCustomCodeDialog(QDialog):
             for index in saved_row_indexes[:saved_count]:
                 if 0 <= index < len(self._result_items):
                     self._result_items[index]["saved"] = True
+                    self._mark_result_folder_saved(str(self._result_items[index].get("folder_id", "")))
             self._refresh_result_table()
             self._sync_result_buttons()
         elif saved_count:
@@ -2126,23 +3287,52 @@ class AgentCustomCodeDialog(QDialog):
 
     def _selected_result_rows(self) -> list[int]:
         rows = sorted({index.row() for index in self.output_table.selectedIndexes()})
-        return [row for row in rows if 0 <= row < len(self._result_items)]
+        indexes = []
+        for row in rows:
+            if not (0 <= row < len(self._visible_result_entries)):
+                continue
+            entry = self._visible_result_entries[row]
+            if entry.get("entry_type") != "item":
+                continue
+            index = self._result_item_index(str(entry.get("item_id", "")))
+            if 0 <= index < len(self._result_items):
+                indexes.append(index)
+        return indexes
 
     def _sync_result_buttons(self) -> None:
         has_unsaved_processed = any(
             item.get("kind") == "processed" and not item.get("saved") for item in self._result_items
         )
         self.save_results_button.setEnabled(self.current_process is None and has_unsaved_processed)
-        self.delete_results_button.setEnabled(self.current_process is None and bool(self._result_items))
+        has_visible_selection = bool(self._selected_result_entries()) if hasattr(self, "output_table") else False
+        self.delete_results_button.setEnabled(self.current_process is None and bool(self._visible_result_entries))
+        self.rename_result_button.setEnabled(self.current_process is None and has_visible_selection)
+        self.move_results_button.setEnabled(self.current_process is None and bool(self._selected_result_item_indexes()))
+        self.up_folder_button.setEnabled(self.current_process is None and self._result_current_folder_id != "root")
+        self.new_folder_button.setEnabled(self.current_process is None)
 
     def _delete_selected_results(self) -> None:
-        rows = self._selected_result_rows()
-        if not rows:
-            QMessageBox.information(self, "Agent Custom Code", "Select result rows to delete.")
+        entries = self._selected_result_entries()
+        if not entries:
+            QMessageBox.information(self, "Agent Custom Code", "Select result rows or folders to delete.")
             return
-        for row in sorted(rows, reverse=True):
-            if 0 <= row < len(self._result_items):
-                self._result_items.pop(row)
+        folder_count = sum(1 for entry in entries if entry.get("entry_type") == "folder")
+        item_count = sum(1 for entry in entries if entry.get("entry_type") == "item")
+        answer = QMessageBox.question(
+            self,
+            "Delete result history",
+            f"Delete {item_count} result file(s) and {folder_count} folder(s)?\nFolders are removed recursively.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        item_ids = {str(entry.get("item_id", "")) for entry in entries if entry.get("entry_type") == "item"}
+        if item_ids:
+            self._result_items = [item for item in self._result_items if str(item.get("id", "")) not in item_ids]
+        for entry in entries:
+            if entry.get("entry_type") == "folder":
+                self._delete_result_folder_recursive(str(entry.get("folder_id", "")))
         self._refresh_result_table()
         self._sync_result_buttons()
         self._result_selection_changed()

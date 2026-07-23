@@ -21,6 +21,7 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def _load_module(module_path: Path):
+    _strip_utf8_bom(module_path)
     spec = importlib.util.spec_from_file_location("mea_agent_generated_module", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load module: {module_path}")
@@ -30,6 +31,12 @@ def _load_module(module_path: Path):
     if not callable(analyze):
         raise RuntimeError("Generated module must define analyze(context: dict) -> dict")
     return module
+
+
+def _strip_utf8_bom(path: Path) -> None:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        path.write_text(raw.decode("utf-8-sig"), encoding="utf-8")
 
 
 def _matrix_to_file(record: dict, output_dir: Path, index: int) -> dict:
@@ -56,7 +63,26 @@ def _matrix_to_file(record: dict, output_dir: Path, index: int) -> dict:
     if values.ndim != 2:
         raise RuntimeError(f"processed_records[{index}] matrix must be 1D or 2D")
     if not np.isfinite(values).all():
-        raise RuntimeError(f"processed_records[{index}] matrix contains NaN or infinite values")
+        nan_count = int(np.isnan(values).sum())
+        posinf_count = int(np.isposinf(values).sum())
+        neginf_count = int(np.isneginf(values).sum())
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            finite_min = float(np.min(finite))
+            finite_max = float(np.max(finite))
+        else:
+            finite_min = 0.0
+            finite_max = 0.0
+        values = np.nan_to_num(values, nan=0.0, posinf=finite_max, neginf=finite_min)
+        warning = (
+            f"processed_records[{index}] contained non-finite values; "
+            f"replaced NaN={nan_count}, +inf={posinf_count}, -inf={neginf_count}."
+        )
+        payload.setdefault("warnings", [])
+        if isinstance(payload["warnings"], list):
+            payload["warnings"].append(warning)
+        description = str(payload.get("description", "") or "")
+        payload["description"] = f"{description} {warning}".strip()
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, values, allow_pickle=False)
@@ -75,10 +101,14 @@ def _normalize_result(result: object, output_dir: Path) -> dict:
     if not isinstance(records, list):
         raise RuntimeError("processed_records must be a list")
     normalized = []
+    warnings = []
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             raise RuntimeError(f"processed_records[{index}] must be a dict")
-        normalized.append(_matrix_to_file(record, output_dir, index))
+        normalized_record = _matrix_to_file(record, output_dir, index)
+        normalized.append(normalized_record)
+        for warning in list(normalized_record.get("warnings", []) or []):
+            warnings.append(str(warning))
     figures = result.get("figures", [])
     if figures is None:
         figures = []
@@ -86,10 +116,14 @@ def _normalize_result(result: object, output_dir: Path) -> dict:
         figures = [figures]
     elif not isinstance(figures, list):
         raise RuntimeError("figures must be a list, dict, string, or null")
+    summary = str(result.get("summary", "") or "")
+    if warnings:
+        warning_text = "Warnings: " + " ".join(warnings)
+        summary = f"{summary}\n{warning_text}".strip()
     return {
         "processed_records": normalized,
         "figures": figures,
-        "summary": str(result.get("summary", "") or ""),
+        "summary": summary,
     }
 
 
