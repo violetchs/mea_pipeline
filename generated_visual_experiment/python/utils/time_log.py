@@ -16,9 +16,19 @@ class SegmentStimLog:
     record_start_epoch: float
     record_end_epoch: float | None = None
     stim_times_sec: list[float] = field(default_factory=list)
+    stim_records: list[dict[str, Any]] = field(default_factory=list)
 
     def add_stim(self, epoch_sec: float, stim_index: int, extra: dict[str, Any] | None = None) -> None:
-        self.stim_times_sec.append(round(float(epoch_sec - self.record_start_epoch), 6))
+        stim_time_sec = round(float(epoch_sec - self.record_start_epoch), 6)
+        self.stim_times_sec.append(stim_time_sec)
+        record = {
+            "stim_index": int(stim_index),
+            "time_s": stim_time_sec,
+            "epoch_sec": float(epoch_sec),
+        }
+        if extra:
+            record.update(extra)
+        self.stim_records.append(record)
 
     def save_txt(self, path: Path) -> None:
         lines = [
@@ -30,7 +40,14 @@ class SegmentStimLog:
             f"# pulse_count: {len(self.stim_times_sec)}",
             f"# generated_utc: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
         ]
-        lines.extend(f"{value:.6f}" for value in sorted(self.stim_times_sec))
+        sorted_records = sorted(self.stim_records, key=lambda item: float(item.get("time_s", 0.0)))
+        if sorted_records:
+            for record in sorted_records:
+                electrodes = str(record.get("electrodes", "") or "")
+                plan_time = record.get("plan_time_sec", "")
+                lines.append(f"{float(record.get('time_s', 0.0)):.6f}\telectrodes={electrodes}\tplan_time_sec={plan_time}")
+        else:
+            lines.extend(f"{value:.6f}" for value in sorted(self.stim_times_sec))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def save_json(self, path: Path) -> None:
@@ -42,6 +59,7 @@ class SegmentStimLog:
             "record_start_epoch": self.record_start_epoch,
             "record_end_epoch": self.record_end_epoch,
             "stim_times_sec": sorted(self.stim_times_sec),
+            "stim_records": sorted(self.stim_records, key=lambda item: float(item.get("time_s", 0.0))),
             "pulse_count": len(self.stim_times_sec),
         }
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

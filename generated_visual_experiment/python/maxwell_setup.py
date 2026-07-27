@@ -114,7 +114,7 @@ def build_poisson_random_sequence(
     dac_channel = 0
     current_ms = 0.0
     event_id = 1
-    connected_stim_unit: int | None = None
+    connected_stim_unit: set[int] | None = None
 
     def pulse(amplitude_mv: float, event_index: int, duration_us: float) -> float:
         bits = _half_bits(amplitude_mv)
@@ -128,19 +128,23 @@ def build_poisson_random_sequence(
         seq.append(mx.DAC(dac_channel, 512))
         return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
 
-    for row in sorted(plan_rows, key=lambda item: (float(item["time_sec"]), int(item["electrode"]))):
-        electrode = int(row["electrode"])
-        if electrode not in stim_unit_by_electrode:
-            raise RuntimeError(f"No stimulation unit configured for poisson electrode {electrode}")
-        stim_unit = int(stim_unit_by_electrode[electrode])
+    for row in sorted(plan_rows, key=lambda item: (float(item["time_sec"]), int(item.get("electrode", 0)))):
+        row_electrodes = _row_electrodes(row)
+        if not row_electrodes:
+            continue
+        missing = [electrode for electrode in row_electrodes if electrode not in stim_unit_by_electrode]
+        if missing:
+            raise RuntimeError(f"No stimulation unit configured for stimulation electrode(s): {','.join(str(item) for item in missing)}")
+        target_stim_units = {int(stim_unit_by_electrode[electrode]) for electrode in row_electrodes}
         point_ms = float(row["time_sec"]) * 1000.0
         if point_ms > current_ms:
             seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-        if connected_stim_unit != stim_unit:
-            if connected_stim_unit is not None:
-                seq.append(mx.StimulationUnit(connected_stim_unit).connect(False))
+        current_units = set() if connected_stim_unit is None else set(connected_stim_unit)
+        for stim_unit in sorted(current_units - target_stim_units):
+            seq.append(mx.StimulationUnit(stim_unit).connect(False))
+        for stim_unit in sorted(target_stim_units - current_units):
             seq.append(mx.StimulationUnit(stim_unit).connect(True))
-            connected_stim_unit = stim_unit
+        connected_stim_unit = set(target_stim_units)
         duration_ms = pulse(
             float(row.get("amplitude_mv", protocol.get("amplitude_mv", 150.0))),
             event_id,
@@ -149,8 +153,21 @@ def build_poisson_random_sequence(
         event_id += 1
         current_ms = max(current_ms, point_ms) + duration_ms
     if connected_stim_unit is not None:
-        seq.append(mx.StimulationUnit(connected_stim_unit).connect(False))
+        for stim_unit in sorted(connected_stim_unit):
+            seq.append(mx.StimulationUnit(stim_unit).connect(False))
     return seq
+
+
+def _row_electrodes(row: dict[str, Any]) -> list[int]:
+    values = row.get("electrodes")
+    if isinstance(values, str):
+        parsed = [token for token in values.replace(";", ",").split(",") if token.strip()]
+        return [int(float(token)) for token in parsed]
+    if isinstance(values, (list, tuple)):
+        return [int(value) for value in values]
+    if "electrode" in row:
+        return [int(row["electrode"])]
+    return []
 
 
 def resolve_experiment_array(

@@ -10,7 +10,7 @@ import shutil
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple
 
@@ -66,16 +66,18 @@ except ImportError as exc:  # pragma: no cover - exercised by manual GUI startup
     ) from exc
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib import colormaps
 from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.path import Path as MplPath
-from matplotlib.colors import Normalize
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.widgets import LassoSelector, RectangleSelector
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import curve_fit
 from scipy.spatial.distance import squareform
+from scipy.stats import poisson
 from sklearn.cluster import KMeans as SkKMeans
 from sklearn.decomposition import FactorAnalysis as SkFactorAnalysis
 from sklearn.decomposition import PCA as SkPCA
@@ -1266,6 +1268,221 @@ def draw_maxwell_channel_map(
     for spine in ax.spines.values():
         spine.set_visible(False)
     return state
+
+
+def _stable_delay_default_parameters() -> dict:
+    return {
+        "arrow_alpha": 0.2,
+        "burst_bin_ms": 1.0,
+        "burst_z": 6.0,
+        "burst_min_spikes": 5,
+        "electrode_peak_ratio_threshold": 10.0,
+        "pair_bin_ms": 1.0,
+        "pair_peak_ratio_threshold": 20.0,
+        "pair_min_shared_bursts": 30,
+        "pair_min_abs_delay_ms": 5.0,
+        "color_percentile_low": 5.0,
+        "color_percentile_high": 95.0,
+    }
+
+
+def _stable_delay_first_activation_ms(times: np.ndarray, burst_intervals) -> np.ndarray:
+    bursts = [(float(start), float(stop)) for start, stop in (burst_intervals or []) if float(stop) > float(start)]
+    out = np.full((len(bursts),), np.nan, dtype=float)
+    values = np.sort(np.asarray(times, dtype=float))
+    values = values[np.isfinite(values)]
+    if values.size == 0 or not bursts:
+        return out
+    for index, (start_s, stop_s) in enumerate(bursts):
+        lo = int(np.searchsorted(values, start_s, side="left"))
+        hi = int(np.searchsorted(values, stop_s, side="right"))
+        if hi > lo:
+            out[index] = float((values[lo] - start_s) * 1000.0)
+    return out
+
+
+def _stable_delay_peak_ratio_and_peak(values: np.ndarray, bin_ms: float) -> tuple[float, float, int]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size < 3:
+        return 0.0, float("nan"), 0
+    bin_width = max(0.1, float(bin_ms))
+    vmax = max(10.0, float(np.nanmax(finite)) + bin_width)
+    edges = np.arange(0.0, vmax + bin_width * 1.1, bin_width)
+    counts, edges = np.histogram(finite, bins=edges)
+    if counts.size == 0:
+        return 0.0, float("nan"), 0
+    peak_index = int(np.argmax(counts))
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    nonzero = counts[counts > 0]
+    background = float(np.median(nonzero)) if nonzero.size else 1.0
+    return (
+        float(int(counts[peak_index]) / max(background, 1.0)),
+        float(centers[peak_index]) if centers.size else float("nan"),
+        int(counts[peak_index]),
+    )
+
+
+def _stable_delay_channel_to_electrode(channel_map: ChannelMap | None, labels) -> dict[str, str]:
+    lookup, positions = _channel_map_positions(channel_map)
+    resolved: dict[str, str] = {}
+    for label in labels:
+        text = str(label)
+        found = _position_for_channel(text, lookup)
+        if found is not None:
+            resolved[text] = str(found[2])
+            continue
+        base = _base_channel_from_raster_label(text)
+        found = _position_for_channel(base, lookup)
+        if found is not None:
+            resolved[text] = str(found[2])
+            continue
+        if text in positions:
+            resolved[text] = text
+        else:
+            resolved[text] = base or text
+    return resolved
+
+
+def _stable_delay_map_analysis(spike_series, channel_map: ChannelMap | None = None, parameters: dict | None = None) -> dict:
+    params = _stable_delay_default_parameters()
+    params.update(dict(parameters or {}))
+    series = []
+    for label, times in spike_series or []:
+        values = np.asarray(times, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size:
+            series.append((str(label), np.sort(values)))
+    labels = [label for label, _times in series]
+    channel_to_electrode = _stable_delay_channel_to_electrode(channel_map, labels)
+    electrode_to_channels: dict[str, list[str]] = {}
+    for label in labels:
+        electrode_to_channels.setdefault(str(channel_to_electrode.get(label, label)), []).append(label)
+
+    bursts = _detect_burst_intervals(
+        series,
+        bin_ms=max(1.0, float(params["burst_bin_ms"])),
+        threshold_z=max(0.1, float(params["burst_z"])),
+        min_spikes=max(2, int(params["burst_min_spikes"])),
+    )
+
+    pair_bin = max(0.1, float(params["pair_bin_ms"]))
+    electrode_threshold = max(0.1, float(params["electrode_peak_ratio_threshold"]))
+    pair_threshold = max(0.1, float(params["pair_peak_ratio_threshold"]))
+    min_shared = max(1, int(params["pair_min_shared_bursts"]))
+    min_abs_delay = max(0.0, float(params["pair_min_abs_delay_ms"]))
+
+    first_by_channel: dict[str, np.ndarray] = {}
+    channel_metrics: dict[str, dict] = {}
+    stable_channels: set[str] = set()
+    for label, times in series:
+        first = _stable_delay_first_activation_ms(times, bursts)
+        first_by_channel[label] = first
+        ratio, peak_ms, peak_count = _stable_delay_peak_ratio_and_peak(first, pair_bin)
+        finite_count = int(np.count_nonzero(np.isfinite(first)))
+        channel_metrics[label] = {
+            "activation_peak_ratio": float(ratio),
+            "activation_peak_ms": float(peak_ms),
+            "activation_peak_count": int(peak_count),
+            "burst_count": int(finite_count),
+        }
+        if ratio >= electrode_threshold:
+            stable_channels.add(label)
+
+    pair_arrows = []
+    eligible_labels = [
+        label
+        for label in labels
+        if int(channel_metrics.get(label, {}).get("burst_count", 0)) > min_shared
+    ]
+    for left_index, source_label in enumerate(eligible_labels):
+        source_first = first_by_channel[source_label]
+        for target_label in eligible_labels[left_index + 1:]:
+            target_first = first_by_channel[target_label]
+            both = np.isfinite(source_first) & np.isfinite(target_first)
+            shared = int(np.count_nonzero(both))
+            if shared <= min_shared:
+                continue
+            delay_values = target_first[both] - source_first[both]
+            if delay_values.size == 0:
+                continue
+            max_abs = max(10.0, float(np.nanmax(np.abs(delay_values))) + pair_bin)
+            edges = np.arange(-max_abs, max_abs + pair_bin * 1.01, pair_bin)
+            counts, hist_edges = np.histogram(delay_values, bins=edges)
+            if counts.size == 0:
+                continue
+            peak_index = int(np.argmax(counts))
+            centers = (hist_edges[:-1] + hist_edges[1:]) * 0.5
+            peak_delay = float(centers[peak_index]) if centers.size else float("nan")
+            nonzero = counts[counts > 0]
+            background = float(np.median(nonzero)) if nonzero.size else 1.0
+            ratio = float(int(counts[peak_index]) / max(background, 1.0))
+            if ratio < pair_threshold or not np.isfinite(peak_delay) or abs(peak_delay) <= min_abs_delay:
+                continue
+            if peak_delay > 0:
+                start_label, stop_label = source_label, target_label
+            else:
+                start_label, stop_label = target_label, source_label
+            pair_arrows.append(
+                {
+                    "source_channel": str(start_label),
+                    "target_channel": str(stop_label),
+                    "source_electrode": str(channel_to_electrode.get(start_label, start_label)),
+                    "target_electrode": str(channel_to_electrode.get(stop_label, stop_label)),
+                    "delay_ms": float(abs(peak_delay)),
+                    "signed_delay_ms": float(peak_delay),
+                    "peak_ratio": float(ratio),
+                    "peak_count": int(counts[peak_index]),
+                    "shared_bursts": int(shared),
+                }
+            )
+
+    stable_electrodes = {str(channel_to_electrode.get(label, label)) for label in stable_channels}
+    peak_by_electrode: dict[str, list[float]] = {}
+    stable_ratio_by_electrode: dict[str, list[float]] = {}
+    for label in stable_channels:
+        electrode = str(channel_to_electrode.get(label, label))
+        peak = float(channel_metrics.get(label, {}).get("activation_peak_ms", float("nan")))
+        ratio = float(channel_metrics.get(label, {}).get("activation_peak_ratio", 0.0))
+        if np.isfinite(peak):
+            peak_by_electrode.setdefault(electrode, []).append(peak)
+        if np.isfinite(ratio):
+            stable_ratio_by_electrode.setdefault(electrode, []).append(ratio)
+    peak_by_electrode_mean = {
+        electrode: float(np.mean(values))
+        for electrode, values in peak_by_electrode.items()
+        if values
+    }
+    ratio_by_electrode_mean = {
+        electrode: float(np.mean(values))
+        for electrode, values in stable_ratio_by_electrode.items()
+        if values
+    }
+    out_degree: dict[str, int] = {}
+    in_degree: dict[str, int] = {}
+    for arrow in pair_arrows:
+        source = str(arrow["source_electrode"])
+        target = str(arrow["target_electrode"])
+        out_degree[source] = out_degree.get(source, 0) + 1
+        in_degree[target] = in_degree.get(target, 0) + 1
+
+    return {
+        "parameters": params,
+        "bursts": bursts,
+        "labels": labels,
+        "recording_electrodes": sorted({str(channel_to_electrode.get(label, label)) for label in labels}),
+        "stable_channels": sorted(stable_channels),
+        "stable_electrodes": sorted(stable_electrodes),
+        "pair_arrows": pair_arrows,
+        "channel_metrics": channel_metrics,
+        "first_latency_by_channel": first_by_channel,
+        "channel_to_electrode": channel_to_electrode,
+        "electrode_to_channels": electrode_to_channels,
+        "peak_by_electrode": peak_by_electrode_mean,
+        "ratio_by_electrode": ratio_by_electrode_mean,
+        "out_degree": out_degree,
+        "in_degree": in_degree,
+    }
 
 
 def _burst_total_spike_vectors(spike_series, burst_intervals, bin_ms: float = 5.0, window_ms: float = 0.0):
@@ -2514,6 +2731,33 @@ def _temporal_coupling_pairs(
 
 DATA_FILE_EXTENSIONS = {".npy", ".npz", ".csv", ".txt", ".tsv", ".nev", ".spk", ".h5", ".hdf5"}
 STIMULUS_RESPONSE_EXTENSIONS = {".nev", ".spk", ".h5", ".hdf5", ".npz"}
+DATA_SIDECAR_FILENAMES = {
+    "external_time_table.csv",
+    "external_time_log.json",
+    "log.txt",
+    "segment_time_meta.json",
+    "stim_plan.csv",
+    "stim_plan.json",
+    "stim_times.txt",
+}
+DATA_SIDECAR_SUFFIXES = (
+    "_time_log.csv",
+    "_time_log.json",
+    "_time_table.csv",
+    "_stim_log.txt",
+)
+
+
+def _is_data_sidecar_file(path: str | Path) -> bool:
+    path = Path(path)
+    name = path.name.lower()
+    if name in DATA_SIDECAR_FILENAMES:
+        return True
+    if any(name.endswith(suffix) for suffix in DATA_SIDECAR_SUFFIXES):
+        return True
+    if name.startswith("stim_times") and path.suffix.lower() == ".txt":
+        return True
+    return False
 
 
 def _supported_files(paths, extensions: set[str]) -> list[Path]:
@@ -2525,9 +2769,9 @@ def _supported_files(paths, extensions: set[str]) -> list[Path]:
             candidates = [
                 child
                 for child in path.rglob("*")
-                if child.is_file() and child.suffix.lower() in extensions
+                if child.is_file() and child.suffix.lower() in extensions and not _is_data_sidecar_file(child)
             ]
-        elif path.is_file() and path.suffix.lower() in extensions:
+        elif path.is_file() and path.suffix.lower() in extensions and not _is_data_sidecar_file(path):
             candidates = [path]
         else:
             candidates = []
@@ -2622,6 +2866,65 @@ def _extract_stimulus_parameters(path: str | Path) -> dict[str, object]:
     return params
 
 
+def _apply_stimulus_metadata_parameters(parameters: dict[str, object], data) -> dict[str, object]:
+    params = dict(parameters or {})
+    meta = getattr(data, "meta", {}) if isinstance(data, UnifiedMEAData) else {}
+    if not isinstance(meta, dict):
+        return params
+    stim_electrodes = meta.get("stim_electrodes", [])
+    if not stim_electrodes:
+        stim_electrodes = []
+        for record in meta.get("stimulus_records", []) or meta.get("event_records", []) or []:
+            if not isinstance(record, dict):
+                continue
+            for key in ("electrodes", "electrode", "stim_electrodes", "stim_electrode", "stimulation_electrodes"):
+                value = record.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple, set, np.ndarray)):
+                    stim_electrodes.extend(str(item) for item in value)
+                else:
+                    stim_electrodes.extend(re.findall(r"\d+", str(value)))
+    if isinstance(stim_electrodes, str) or not isinstance(stim_electrodes, (list, tuple, set, np.ndarray)):
+        stim_electrodes = _stim_electrode_tokens_from_value(stim_electrodes)
+    cleaned = []
+    seen = set()
+    for value in stim_electrodes:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    if cleaned:
+        params["stim_electrodes"] = cleaned
+        params["stim_electrode_count"] = len(cleaned)
+        params.setdefault("stim_mode", "stimulus")
+    stimulus_records = meta.get("stimulus_records", [])
+    if isinstance(stimulus_records, list) and stimulus_records:
+        params["stimulus_record_count"] = len(stimulus_records)
+    sidecar_files = meta.get("stimulus_sidecar_files", [])
+    if isinstance(sidecar_files, list) and sidecar_files:
+        params["stimulus_sidecar_files"] = [Path(str(item)).name for item in sidecar_files]
+    sidecar_candidates = meta.get("stimulus_sidecar_candidates", [])
+    if isinstance(sidecar_candidates, list) and sidecar_candidates:
+        params["stimulus_sidecar_candidate_count"] = len(sidecar_candidates)
+    sidecar_summary = meta.get("stimulus_sidecar_summary", {})
+    if isinstance(sidecar_summary, dict) and sidecar_summary:
+        params["stimulus_sidecar_summary"] = sidecar_summary
+    return params
+
+
+def _stim_electrode_tokens_from_value(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        tokens = []
+        for item in value:
+            tokens.extend(_stim_electrode_tokens_from_value(item))
+        return tokens
+    return re.findall(r"\d+", str(value))
+
+
 def _stimulus_parameter_label(parameters: dict[str, object], path: str | Path) -> str:
     label_items = []
     for key in ("activity", "period", "stim_mode"):
@@ -2668,6 +2971,8 @@ def _stimulus_response_record_from_data(
     response_ms: float = 1000.0,
     bin_ms: float = 5.0,
     artifact_ms: float = 0.0,
+    zero_stimulus_index: int = 0,
+    strong_response_window_ms: float = 50.0,
 ) -> dict:
     stim_times = np.asarray(data.stim_times, dtype=float)
     stim_times = np.sort(stim_times[np.isfinite(stim_times)])
@@ -2695,17 +3000,33 @@ def _stimulus_response_record_from_data(
     pre_ms = max(0.0, float(pre_ms))
     response_ms = max(1.0, float(response_ms))
     artifact_ms = max(0.0, float(artifact_ms))
+    strong_response_window_ms = min(response_ms, max(1.0, float(strong_response_window_ms)))
+    strong_baseline_window_ms = min(pre_ms, strong_response_window_ms)
+    trial_plan = _stimulus_response_trial_plan(
+        stim_times,
+        pre_ms=pre_ms,
+        response_ms=response_ms,
+        zero_stimulus_index=int(zero_stimulus_index),
+    )
+    if not trial_plan:
+        raise ValueError(f"No stimulus trials remain after filtering: {path}")
     response_counts = []
     baseline_counts = []
     latencies_ms = []
     trial_spikes_ms = []
     trial_channel_spikes_ms = []
-    for stim_s in stim_times:
+    trial_stim_offsets_ms = []
+    strong_response_counts_by_channel = np.zeros(channel_count, dtype=int)
+    strong_response_trials_by_channel = np.zeros(channel_count, dtype=int)
+    strong_response_any_trial_count = 0
+    for trial in trial_plan:
+        stim_s = float(trial["anchor_s"])
         window_start = float(stim_s) - pre_ms / 1000.0
         window_stop = float(stim_s) + response_ms / 1000.0
         channel_trial = []
         relative_chunks = []
-        for _channel, values in channel_spikes:
+        trial_has_strong_response = False
+        for channel_index, (_channel, values) in enumerate(channel_spikes):
             lo = int(np.searchsorted(values, window_start, side="left"))
             hi = int(np.searchsorted(values, window_stop, side="right"))
             relative = (values[lo:hi] - float(stim_s)) * 1000.0
@@ -2713,8 +3034,26 @@ def _stimulus_response_record_from_data(
                 relative = relative[np.abs(relative) > artifact_ms]
             relative = relative.astype(float, copy=False)
             channel_trial.append(relative)
+            response_count_50 = int(np.count_nonzero((relative >= 0.0) & (relative <= strong_response_window_ms)))
+            if strong_baseline_window_ms > 0.0:
+                baseline_count_50 = int(
+                    np.count_nonzero((relative < 0.0) & (relative >= -strong_baseline_window_ms))
+                )
+            else:
+                baseline_count_50 = 0
+            strong_response_trials_by_channel[channel_index] += 1
+            if _is_strong_stimulus_response_trial(
+                response_count_50,
+                baseline_count_50,
+                response_window_ms=strong_response_window_ms,
+                baseline_window_ms=strong_baseline_window_ms,
+            ):
+                strong_response_counts_by_channel[channel_index] += 1
+                trial_has_strong_response = True
             if relative.size:
                 relative_chunks.append(relative)
+        if trial_has_strong_response:
+            strong_response_any_trial_count += 1
         relative_ms = np.sort(np.concatenate(relative_chunks)) if relative_chunks else np.array([], dtype=float)
         trial_spikes_ms.append(relative_ms.astype(float, copy=False))
         trial_channel_spikes_ms.append(channel_trial)
@@ -2724,26 +3063,192 @@ def _stimulus_response_record_from_data(
         baseline_counts.append(int(np.count_nonzero(baseline_mask)))
         if np.any(response_mask):
             latencies_ms.append(float(np.min(relative_ms[response_mask])))
+        trial_stim_offsets_ms.append(np.asarray(trial.get("stim_offsets_ms", []), dtype=float))
     response_s = response_ms / 1000.0
     baseline_s = max(pre_ms / 1000.0, 1e-9)
-    parameters = _extract_stimulus_parameters(path)
+    parameters = _apply_stimulus_metadata_parameters(_extract_stimulus_parameters(path), data)
+    stim_electrodes = []
+    seen_stim_electrodes = set()
+    for value in _stim_electrode_tokens_from_value(parameters.get("stim_electrodes", [])):
+        text = str(value).strip()
+        if text and text not in seen_stim_electrodes:
+            seen_stim_electrodes.add(text)
+            stim_electrodes.append(text)
+    strong_denominator = np.maximum(strong_response_trials_by_channel, 1)
+    strong_probability_by_channel = strong_response_counts_by_channel.astype(float) / strong_denominator.astype(float)
+    strong_probability_lookup = {
+        str(channel): float(strong_probability_by_channel[index])
+        for index, (channel, _values) in enumerate(channel_spikes)
+    }
+    strong_count_lookup = {
+        str(channel): int(strong_response_counts_by_channel[index])
+        for index, (channel, _values) in enumerate(channel_spikes)
+    }
+    strong_trial_probability = float(strong_response_any_trial_count / max(len(trial_plan), 1))
+    meta = data.meta if isinstance(data.meta, dict) else {}
+    sidecar_files = list(meta.get("stimulus_sidecar_files", []) or [])
+    sidecar_candidates = list(meta.get("stimulus_sidecar_candidates", []) or [])
+    stimulus_records = list(meta.get("stimulus_records", []) or [])
+    if stim_electrodes:
+        stim_metadata_status = "sites_found"
+    elif sidecar_files:
+        stim_metadata_status = "sidecar_without_sites"
+    elif sidecar_candidates:
+        stim_metadata_status = "no_site_sidecar_found"
+    else:
+        stim_metadata_status = "not_checked"
     return {
         "path": str(path),
         "file": Path(path).name,
         "condition": _stimulus_parameter_label(parameters, path),
         "parameters": parameters,
-        "stim_count": int(stim_times.size),
+        "stim_electrodes": stim_electrodes,
+        "stim_electrode_count": len(stim_electrodes),
+        "stim_metadata_status": stim_metadata_status,
+        "stim_metadata_sidecar_files": [str(item) for item in sidecar_files],
+        "stim_metadata_sidecar_candidates": [str(item) for item in sidecar_candidates],
+        "stimulus_record_count": len(stimulus_records),
+        "stim_count": int(len(trial_plan)),
+        "raw_stim_count": int(stim_times.size),
+        "trial_count": int(len(trial_plan)),
+        "zero_stimulus_index": int(zero_stimulus_index),
+        "multi_stim_trial_count": int(sum(1 for item in trial_plan if int(item.get("group_size", 1)) > 1)),
         "channel_count": int(channel_count),
         "spike_count": int(all_spikes.size),
         "artifact_ms": float(artifact_ms),
+        "strong_response_window_ms": float(strong_response_window_ms),
+        "strong_response_baseline_window_ms": float(strong_baseline_window_ms),
         "channels": [channel for channel, _values in channel_spikes],
         "response_spikes_per_stim": float(np.mean(response_counts)) if response_counts else 0.0,
-        "response_rate_hz_per_channel": float(np.sum(response_counts) / max(float(stim_times.size) * response_s * channel_count, 1e-9)),
-        "baseline_rate_hz_per_channel": float(np.sum(baseline_counts) / max(float(stim_times.size) * baseline_s * channel_count, 1e-9)),
+        "response_rate_hz_per_channel": float(np.sum(response_counts) / max(float(len(trial_plan)) * response_s * channel_count, 1e-9)),
+        "baseline_rate_hz_per_channel": float(np.sum(baseline_counts) / max(float(len(trial_plan)) * baseline_s * channel_count, 1e-9)),
         "mean_latency_ms": float(np.mean(latencies_ms)) if latencies_ms else np.nan,
+        "strong_response_probability": strong_trial_probability,
+        "strong_response_probability_mean_by_channel": float(np.mean(strong_probability_by_channel)) if strong_probability_by_channel.size else 0.0,
+        "strong_response_probability_max_by_channel": float(np.max(strong_probability_by_channel)) if strong_probability_by_channel.size else 0.0,
+        "strong_response_probability_by_channel": strong_probability_lookup,
+        "strong_response_count_by_channel": strong_count_lookup,
         "trial_spikes_ms": trial_spikes_ms,
         "trial_channel_spikes_ms": trial_channel_spikes_ms,
+        "trial_stim_offsets_ms": trial_stim_offsets_ms,
     }
+
+
+def _is_strong_stimulus_response_trial(
+    response_count: int,
+    baseline_count: int,
+    *,
+    response_window_ms: float,
+    baseline_window_ms: float,
+    alpha: float = 0.05,
+) -> bool:
+    response_count = max(0, int(response_count))
+    baseline_count = max(0, int(baseline_count))
+    response_window_ms = max(1e-9, float(response_window_ms))
+    baseline_window_ms = max(0.0, float(baseline_window_ms))
+    if response_count <= 0:
+        return False
+    if baseline_window_ms <= 0.0:
+        return True
+    expected = float(baseline_count) * response_window_ms / max(baseline_window_ms, 1e-9)
+    if float(response_count) <= expected:
+        return False
+    if expected <= 0.0:
+        return True
+    try:
+        return bool(float(poisson.sf(response_count - 1, expected)) <= float(alpha))
+    except Exception:
+        threshold = expected + 1.645 * np.sqrt(max(expected, 1e-9))
+        return bool(float(response_count) > float(threshold))
+
+
+def _stimulus_response_trial_groups(stim_times, *, pre_ms: float, response_ms: float) -> list[np.ndarray]:
+    values = np.asarray(stim_times, dtype=float)
+    values = np.sort(values[np.isfinite(values)])
+    if values.size == 0:
+        return []
+    if values.size == 1:
+        return [values.astype(float, copy=False)]
+    deltas = np.diff(values)
+    positive = np.sort(deltas[np.isfinite(deltas) & (deltas > 1e-9)])
+    within_trial_gap_s: float | None = None
+    if positive.size >= 2:
+        ratios = positive[1:] / np.maximum(positive[:-1], 1e-9)
+        split_index = int(np.argmax(ratios)) if ratios.size else -1
+        if split_index >= 0 and float(ratios[split_index]) >= 3.0:
+            low_gap = float(positive[split_index])
+            high_gap = float(positive[split_index + 1])
+            within_trial_gap_s = max(low_gap * 1.25, (low_gap + high_gap) * 0.5)
+    if within_trial_gap_s is None:
+        return [np.asarray([float(value)], dtype=float) for value in values]
+    groups: list[list[float]] = [[float(values[0])]]
+    for value in values[1:]:
+        if float(value) - float(groups[-1][-1]) <= within_trial_gap_s:
+            groups[-1].append(float(value))
+        else:
+            groups.append([float(value)])
+    return [np.asarray(group, dtype=float) for group in groups if group]
+
+
+def _stimulus_response_trial_plan(stim_times, *, pre_ms: float, response_ms: float, zero_stimulus_index: int = 0) -> list[dict]:
+    selected_index = max(0, int(zero_stimulus_index))
+    groups = _stimulus_response_trial_groups(stim_times, pre_ms=pre_ms, response_ms=response_ms)
+    trials = []
+    seen_windows = set()
+    pre_s = max(0.0, float(pre_ms)) / 1000.0
+    response_s = max(1.0, float(response_ms)) / 1000.0
+    for group in groups:
+        if group.size == 0:
+            continue
+        if group.size == 1:
+            anchor_index = 0
+        elif selected_index < group.size:
+            anchor_index = selected_index
+        else:
+            continue
+        anchor = float(group[int(anchor_index)])
+        key = (round(anchor - pre_s, 9), round(anchor + response_s, 9))
+        if key in seen_windows:
+            continue
+        seen_windows.add(key)
+        trials.append(
+            {
+                "anchor_s": anchor,
+                "stim_offsets_ms": (group - anchor) * 1000.0,
+                "group_size": int(group.size),
+                "selected_index": int(anchor_index),
+            }
+        )
+    return trials
+
+
+def _record_has_stimulus_timestamps(record: dict) -> bool:
+    if _record_is_spontaneous_segment(record):
+        return False
+    data = record.get("raw_data") if isinstance(record, dict) else None
+    if not isinstance(data, UnifiedMEAData):
+        return False
+    try:
+        stim_times = np.asarray(getattr(data, "stim_times", []), dtype=float)
+    except Exception:
+        return False
+    return bool(np.any(np.isfinite(stim_times)))
+
+
+def _record_is_spontaneous_segment(record: dict) -> bool:
+    if not isinstance(record, dict):
+        return False
+    path = Path(str(record.get("path", record.get("file", "")) or ""))
+    parts = [path.stem.lower(), path.parent.name.lower(), path.parent.parent.name.lower() if path.parent.parent else ""]
+    condition = str(record.get("condition", "") or "").lower()
+    params = record.get("parameters", {}) if isinstance(record.get("parameters", {}), dict) else {}
+    period = str(params.get("period", "") or "").lower()
+    activity = str(params.get("activity", "") or "").lower()
+    text = " ".join([*parts, condition, period, activity])
+    if re.search(r"(?:^|[_\-\s])(pre|post)(?:[_\-\s]|$)", text) or re.search(r"spon|spont", text):
+        segment_name = " ".join(parts[:2])
+        return not re.search(r"(?:^|[_\-\s])(?:02_)?stim(?:[_\-\s]|$)", segment_name)
+    return False
 
 
 def _stimulus_response_group_records(records: list[dict]) -> list[dict]:
@@ -4424,12 +4929,23 @@ class MaxwellWaveformLoadWorker(QRunnable):
 
 
 class StimulusResponseWorker(QRunnable):
-    def __init__(self, paths, *, pre_ms: float, response_ms: float, artifact_ms: float):
+    def __init__(
+        self,
+        paths,
+        *,
+        pre_ms: float,
+        response_ms: float,
+        artifact_ms: float,
+        zero_stimulus_index: int = 0,
+        strong_response_window_ms: float = 50.0,
+    ):
         super().__init__()
         self.paths = [str(path) for path in paths]
         self.pre_ms = float(pre_ms)
         self.response_ms = float(response_ms)
         self.artifact_ms = float(artifact_ms)
+        self.zero_stimulus_index = int(zero_stimulus_index)
+        self.strong_response_window_ms = float(strong_response_window_ms)
         self.signals = WorkerSignals()
         self._cancel_requested = False
 
@@ -4457,6 +4973,8 @@ class StimulusResponseWorker(QRunnable):
                         pre_ms=self.pre_ms,
                         response_ms=self.response_ms,
                         artifact_ms=self.artifact_ms,
+                        zero_stimulus_index=self.zero_stimulus_index,
+                        strong_response_window_ms=self.strong_response_window_ms,
                     )
                     records.append(record)
                 except Exception as exc:
@@ -4471,6 +4989,8 @@ class StimulusResponseWorker(QRunnable):
                     "pre_ms": self.pre_ms,
                     "response_ms": self.response_ms,
                     "artifact_ms": self.artifact_ms,
+                    "zero_stimulus_index": self.zero_stimulus_index,
+                    "strong_response_window_ms": self.strong_response_window_ms,
                     "paths": self.paths,
                 }
             )
@@ -4732,7 +5252,7 @@ class StimulusDatabaseAnalysisDialog(_DatabaseAnalysisDialogBase):
     def __init__(self, records, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Stimulus Response Database")
-        self.resize(900, 560)
+        self.resize(1120, 720)
         self.cached_payload: dict | None = None
 
         self.pre_ms = QDoubleSpinBox()
@@ -4751,19 +5271,34 @@ class StimulusDatabaseAnalysisDialog(_DatabaseAnalysisDialogBase):
         self.artifact_ms.setSingleStep(0.5)
         self.artifact_ms.setValue(1.0)
         self.artifact_ms.setSuffix(" ms")
+        self.strong_response_window_ms = QDoubleSpinBox()
+        self.strong_response_window_ms.setRange(1.0, 10000.0)
+        self.strong_response_window_ms.setDecimals(1)
+        self.strong_response_window_ms.setSingleStep(5.0)
+        self.strong_response_window_ms.setValue(50.0)
+        self.strong_response_window_ms.setSuffix(" ms")
+        self.strong_response_window_ms.setToolTip("A trial is counted as strong response when firing in this post-stimulus window is significantly higher than an equal-length baseline window.")
+        self.zero_stimulus_label = QLabel("Zero stimulus")
+        self.zero_stimulus_combo = NoWheelComboBox()
+        self.zero_stimulus_combo.addItem("Single stimulus only", 0)
+        self.zero_stimulus_combo.setEnabled(False)
+        self.zero_stimulus_combo.currentIndexChanged.connect(lambda *_: self._refresh_trial_preview())
+        self.trial_preview_index = QSpinBox()
+        self.trial_preview_index.setRange(1, 1)
+        self.trial_preview_index.valueChanged.connect(lambda *_: self._refresh_trial_preview(draw_only=True))
+        self.preview_canvas = FigureCanvas(Figure(figsize=(5.6, 3.5), tight_layout=True))
         self._setup_database_table()
         self._set_records(records)
         self.selected_count_label = QLabel()
         self.selected_count_label.setObjectName("MutedText")
         self.table.itemSelectionChanged.connect(self._update_selection_summary)
+        self.table.itemSelectionChanged.connect(self._refresh_trial_controls)
+        for field in (self.pre_ms, self.response_ms, self.artifact_ms):
+            field.valueChanged.connect(lambda *_: self._refresh_trial_controls())
 
         analyze = QPushButton("Analyze")
         analyze.setObjectName("PrimaryButton")
         analyze.clicked.connect(self.accept)
-        self.psth_button = QPushButton("PSTH")
-        self.psth_button.setEnabled(False)
-        self.activation_curve_button = QPushButton("Activation curve")
-        self.activation_curve_button.setEnabled(False)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
 
@@ -4778,51 +5313,188 @@ class StimulusDatabaseAnalysisDialog(_DatabaseAnalysisDialogBase):
         controls_grid.setVerticalSpacing(8)
         controls_grid.addWidget(QLabel("Pre"), 0, 0)
         controls_grid.addWidget(self.pre_ms, 0, 1)
-        controls_grid.addWidget(QLabel("Response"), 0, 2)
+        controls_grid.addWidget(QLabel("After"), 0, 2)
         controls_grid.addWidget(self.response_ms, 0, 3)
         controls_grid.addWidget(QLabel("Remove tail +/-"), 1, 0)
         controls_grid.addWidget(self.artifact_ms, 1, 1)
-        controls_grid.addWidget(QLabel("Pre is baseline before stimulus; Response is the post-stimulus analysis window."), 1, 2, 1, 2)
+        controls_grid.addWidget(self.zero_stimulus_label, 1, 2)
+        controls_grid.addWidget(self.zero_stimulus_combo, 1, 3)
+        controls_grid.addWidget(QLabel("Strong response window"), 2, 0)
+        controls_grid.addWidget(self.strong_response_window_ms, 2, 1)
+        controls_grid.addWidget(QLabel("Preview trial"), 2, 2)
+        controls_grid.addWidget(self.trial_preview_index, 2, 3)
+        controls_grid.addWidget(QLabel("Pre is baseline before the selected zero stimulus; Response is the after-stimulus analysis window."), 3, 0, 1, 4)
         controls_layout.addLayout(controls_grid)
 
         action_row = QHBoxLayout()
         action_row.addStretch(1)
-        action_row.addWidget(self.psth_button)
-        action_row.addWidget(self.activation_curve_button)
         action_row.addWidget(cancel)
         action_row.addWidget(analyze)
         controls_layout.addLayout(action_row)
 
         layout = QVBoxLayout(self)
-        intro = QLabel("Select loaded database files for stimulus-response analysis, then set the visible pre/post window.")
+        intro = QLabel("Select loaded stimulus files for stimulus-response analysis, then set the visible pre/after trial window.")
         intro.setObjectName("MutedText")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         layout.addWidget(self.selected_count_label)
-        layout.addWidget(self.table, 1)
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.addWidget(self.table)
+        preview_panel = QFrame()
+        preview_panel.setObjectName("Panel")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_label = QLabel("Selected trial preview")
+        preview_label.setObjectName("Header")
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(self.preview_canvas, 1)
+        body.addWidget(preview_panel)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        layout.addWidget(body, 1)
         layout.addWidget(controls_frame)
         self._update_selection_summary()
+        self._refresh_trial_controls()
         _fix_spinbox_hit_targets(self)
 
     def _set_records(self, records) -> None:
-        super()._set_records(records)
+        stim_records = [record for record in list(records or []) if _record_has_stimulus_timestamps(record)]
+        super()._set_records(stim_records)
         self._update_selection_summary()
+        if hasattr(self, "zero_stimulus_combo"):
+            self._refresh_trial_controls()
 
     def _update_selection_summary(self) -> None:
         if not hasattr(self, "selected_count_label"):
             return
         selected = len(self._selected_paths()) if hasattr(self, "table") else 0
         total = len(getattr(self, "records", []))
-        self.selected_count_label.setText(f"Selected files: {selected} / {total}")
+        self.selected_count_label.setText(f"Selected stimulus files: {selected} / {total}")
 
-    def values(self) -> tuple[list[str], float, float, float]:
-        return self._selected_paths(), float(self.pre_ms.value()), float(self.response_ms.value()), float(self.artifact_ms.value())
+    def values(self) -> tuple[list[str], float, float, float, int, float]:
+        return (
+            self._selected_paths(),
+            float(self.pre_ms.value()),
+            float(self.response_ms.value()),
+            float(self.artifact_ms.value()),
+            int(self.zero_stimulus_combo.currentData() or 0),
+            float(self.strong_response_window_ms.value()),
+        )
 
     def set_cached_payload(self, payload: dict | None) -> None:
         self.cached_payload = payload if isinstance(payload, dict) else None
-        has_records = bool(self.cached_payload and self.cached_payload.get("records"))
-        self.psth_button.setEnabled(has_records)
-        self.activation_curve_button.setEnabled(has_records)
+
+    def _max_trial_stimulus_count(self) -> int:
+        max_count = 1
+        for record in self._selected_records():
+            data = record.get("raw_data")
+            if not isinstance(data, UnifiedMEAData):
+                continue
+            groups = _stimulus_response_trial_groups(
+                getattr(data, "stim_times", []),
+                pre_ms=float(self.pre_ms.value()),
+                response_ms=float(self.response_ms.value()),
+            )
+            for group in groups:
+                max_count = max(max_count, int(np.asarray(group).size))
+        return max_count
+
+    def _refresh_trial_controls(self, *args) -> None:
+        previous = int(self.zero_stimulus_combo.currentData() or 0)
+        max_count = self._max_trial_stimulus_count()
+        self.zero_stimulus_combo.blockSignals(True)
+        self.zero_stimulus_combo.clear()
+        if max_count > 1:
+            for index in range(max_count):
+                self.zero_stimulus_combo.addItem(f"{index + 1} stimulus in trial", index)
+            self.zero_stimulus_combo.setEnabled(True)
+            self.zero_stimulus_combo.setCurrentIndex(min(previous, max_count - 1))
+        else:
+            self.zero_stimulus_combo.addItem("Single stimulus only", 0)
+            self.zero_stimulus_combo.setEnabled(False)
+        self.zero_stimulus_combo.blockSignals(False)
+        self._refresh_trial_preview()
+
+    def _preview_record(self) -> dict | None:
+        selected = self._selected_records()
+        return selected[0] if selected else (self.records[0] if self.records else None)
+
+    def _preview_plan(self, record: dict | None) -> list[dict]:
+        data = record.get("raw_data") if isinstance(record, dict) else None
+        if not isinstance(data, UnifiedMEAData):
+            return []
+        return _stimulus_response_trial_plan(
+            getattr(data, "stim_times", []),
+            pre_ms=float(self.pre_ms.value()),
+            response_ms=float(self.response_ms.value()),
+            zero_stimulus_index=int(self.zero_stimulus_combo.currentData() or 0),
+        )
+
+    def _refresh_trial_preview(self, *args, draw_only: bool = False) -> None:
+        record = self._preview_record()
+        plan = self._preview_plan(record)
+        if not draw_only:
+            blocked = self.trial_preview_index.signalsBlocked()
+            self.trial_preview_index.blockSignals(True)
+            self.trial_preview_index.setRange(1, max(1, len(plan)))
+            self.trial_preview_index.setValue(min(int(self.trial_preview_index.value()), max(1, len(plan))))
+            self.trial_preview_index.blockSignals(blocked)
+        self._draw_trial_preview(record, plan)
+
+    def _draw_trial_preview(self, record: dict | None, plan: list[dict]) -> None:
+        figure = self.preview_canvas.figure
+        figure.clear()
+        ax = figure.add_subplot(111)
+        pre_ms = max(0.0, float(self.pre_ms.value()))
+        response_ms = max(1.0, float(self.response_ms.value()))
+        ax.axvspan(-pre_ms, 0.0, color="#dbeafe", alpha=0.42, linewidth=0)
+        ax.axvspan(0.0, response_ms, color="#fee2e2", alpha=0.32, linewidth=0)
+        ax.axvline(0.0, color="#111827", linestyle="--", linewidth=1.0)
+        ax.set_xlim(-pre_ms, response_ms)
+        ax.set_xlabel("Time from selected zero stimulus (ms)")
+        ax.set_ylabel("Channel")
+        if record is None or not plan:
+            ax.text(0.5, 0.5, "No stimulus trial", transform=ax.transAxes, ha="center", va="center")
+            self.preview_canvas.draw_idle()
+            return
+        data = record.get("raw_data")
+        if not isinstance(data, UnifiedMEAData):
+            ax.text(0.5, 0.5, "No loaded spike data", transform=ax.transAxes, ha="center", va="center")
+            self.preview_canvas.draw_idle()
+            return
+        trial_index = int(np.clip(int(self.trial_preview_index.value()) - 1, 0, max(0, len(plan) - 1)))
+        trial = plan[trial_index]
+        anchor = float(trial.get("anchor_s", 0.0))
+        artifact_ms = max(0.0, float(self.artifact_ms.value()))
+        channels = sorted([str(ch) for ch in data.spikes.keys()], key=_channel_sort_key)
+        display_indices = _display_indices(len(channels), 80)
+        events = []
+        offsets = []
+        labels = []
+        for row, channel_index in enumerate(display_indices, start=1):
+            channel = channels[int(channel_index)]
+            values = np.asarray(data.spikes.get(channel, []), dtype=float)
+            values = np.sort(values[np.isfinite(values)])
+            lo = int(np.searchsorted(values, anchor - pre_ms / 1000.0, side="left"))
+            hi = int(np.searchsorted(values, anchor + response_ms / 1000.0, side="right"))
+            rel = (values[lo:hi] - anchor) * 1000.0
+            if artifact_ms > 0.0 and rel.size:
+                rel = rel[np.abs(rel) > artifact_ms]
+            events.append(rel)
+            offsets.append(row)
+            labels.append(channel)
+        if events:
+            ax.eventplot(events, lineoffsets=offsets, linelengths=0.72, linewidths=0.8, colors="#0f766e")
+            tick_indices = _display_indices(len(labels), 12)
+            ax.set_yticks([int(index) + 1 for index in tick_indices])
+            ax.set_yticklabels([labels[int(index)] for index in tick_indices], fontsize=7)
+            ax.set_ylim(0.2, len(events) + 0.8)
+        for offset in np.asarray(trial.get("stim_offsets_ms", []), dtype=float):
+            if np.isfinite(offset) and -pre_ms <= float(offset) <= response_ms and abs(float(offset)) > 1e-9:
+                ax.axvline(float(offset), color="#f59e0b", linestyle=":", linewidth=1.0, alpha=0.9)
+        raw_count = int(np.asarray(getattr(data, "stim_times", []), dtype=float).size)
+        ax.set_title(f"{Path(str(record.get('path', ''))).name} | trial {trial_index + 1}/{len(plan)} | raw stim {raw_count}, kept {len(plan)}")
+        self.preview_canvas.draw_idle()
 
 
 class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
@@ -5051,6 +5723,62 @@ class FactorAnalysisDatabaseDialog(_DatabaseAnalysisDialogBase):
         self.burst_threshold.setValue(float(burst_threshold.value()))
         self.artifact_ms.setValue(float(artifact_ms.value()))
         self._update_option_summary()
+
+
+class StableDelayDatabaseDialog(_DatabaseAnalysisDialogBase):
+    def __init__(self, records, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stable Delay Map")
+        self.resize(860, 540)
+        self._setup_database_table()
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._set_records(records)
+        if self.table.rowCount():
+            self.table.clearSelection()
+            self.table.selectRow(0)
+
+        analyze = QPushButton("Open Map")
+        analyze.setObjectName("PrimaryButton")
+        analyze.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(analyze)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Select one loaded spike file to detect stable-delay electrodes and stable directed delay connections."
+        )
+        intro.setObjectName("MutedText")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(buttons)
+        _fix_spinbox_hit_targets(self)
+
+    def _set_records(self, records) -> None:
+        previous = self._selected_paths()[:1] if hasattr(self, "table") else []
+        super()._set_records(records)
+        if not self.table.rowCount():
+            return
+        self.table.clearSelection()
+        selected = False
+        target = previous[0] if previous else ""
+        if target:
+            for row, record in enumerate(self.records):
+                if str(record.get("path", "")) == target:
+                    self.table.selectRow(row)
+                    selected = True
+                    break
+        if not selected:
+            self.table.selectRow(0)
+
+    def values(self) -> list[str]:
+        paths = self._selected_paths()
+        return paths[:1]
 
 
 class GenericAnalysisDialog(AppDialog):
@@ -6382,6 +7110,827 @@ class StimulusChannelMapWindow(AppDialog):
             self.selected_channels = set(channels)
             if self.selection_callback is not None:
                 self.selection_callback(channels)
+
+
+class StimulusTrialResponseWindow(AppDialog):
+    RASTER_MAX_POINTS = 35000
+
+    def __init__(self, payload: dict, parent=None, channel_map: ChannelMap | None = None):
+        super().__init__(parent)
+        self.payload = dict(payload or {})
+        self.records = list(self.payload.get("records", []))
+        self.errors = list(self.payload.get("errors", []))
+        self.channel_map = channel_map or _default_maxwell_channel_map()
+        self.position_lookup, self.electrode_positions = _channel_map_positions(self.channel_map)
+        self.latency_cache: dict[tuple, dict] = {}
+        self.selected_electrode: str | None = None
+        self.map_state: dict = {}
+        self._unmapped_stim_tokens: list[str] = []
+        self._stim_metadata_found = False
+        self._map_ax = None
+        self._latency_ax = None
+        self._map_limits = None
+        self._map_pan_start = None
+        self._map_is_panning = False
+        self._applied_raster_window_ms = min(200.0, max(1.0, float(self.payload.get("response_ms", 200.0))))
+        self._applied_latency_bin_ms = 0.5
+        self._applied_peak_ratio = float(_stable_delay_default_parameters().get("electrode_peak_ratio_threshold", 10.0))
+        self._applied_min_peak_count = 3
+        self.setWindowTitle("Stimulus Response Analysis")
+        self.resize(1360, 860)
+
+        self.status = QLabel()
+        self.status.setObjectName("MutedText")
+        self.status.setWordWrap(True)
+        self.detail_label = QLabel()
+        self.detail_label.setObjectName("MutedText")
+        self.detail_label.setWordWrap(True)
+        self.file_combo = NoWheelComboBox()
+        self.file_combo.currentIndexChanged.connect(self._record_changed)
+
+        self.raster_window_ms = QDoubleSpinBox()
+        self.raster_window_ms.setRange(1.0, 10000.0)
+        self.raster_window_ms.setDecimals(1)
+        self.raster_window_ms.setSingleStep(10.0)
+        self.raster_window_ms.setValue(float(self._applied_raster_window_ms))
+        self.raster_window_ms.setSuffix(" ms")
+
+        self.latency_bin_ms = QDoubleSpinBox()
+        self.latency_bin_ms.setRange(0.2, 100.0)
+        self.latency_bin_ms.setDecimals(1)
+        self.latency_bin_ms.setSingleStep(0.5)
+        self.latency_bin_ms.setValue(float(self._applied_latency_bin_ms))
+        self.latency_bin_ms.setSuffix(" ms")
+
+        self.peak_ratio = QDoubleSpinBox()
+        self.peak_ratio.setRange(1.0, 100.0)
+        self.peak_ratio.setDecimals(1)
+        self.peak_ratio.setSingleStep(0.5)
+        self.peak_ratio.setValue(float(self._applied_peak_ratio))
+
+        self.min_peak_count = QSpinBox()
+        self.min_peak_count.setRange(1, 100000)
+        self.min_peak_count.setValue(int(self._applied_min_peak_count))
+
+        self.reset_view_button = QPushButton("Reset / Apply")
+        self.reset_view_button.clicked.connect(self._reset_map_view)
+        self.canvas = FigureCanvas(Figure(figsize=(13.0, 7.5), constrained_layout=False))
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self.canvas.mpl_connect("scroll_event", self._on_map_scroll)
+        self.error_box = QTextEdit()
+        self.error_box.setReadOnly(True)
+        self.error_box.setMaximumHeight(70)
+
+        controls = QFrame()
+        controls.setObjectName("Panel")
+        controls_layout = QGridLayout(controls)
+        controls_layout.setContentsMargins(12, 10, 12, 10)
+        controls_layout.setHorizontalSpacing(10)
+        controls_layout.setVerticalSpacing(8)
+        controls_layout.addWidget(QLabel("Stimulus file"), 0, 0)
+        controls_layout.addWidget(self.file_combo, 0, 1)
+        controls_layout.addWidget(QLabel("Raster window"), 0, 2)
+        controls_layout.addWidget(self.raster_window_ms, 0, 3)
+        controls_layout.addWidget(QLabel("Latency bin"), 0, 4)
+        controls_layout.addWidget(self.latency_bin_ms, 0, 5)
+        controls_layout.addWidget(QLabel("Stable ratio"), 1, 0)
+        controls_layout.addWidget(self.peak_ratio, 1, 1)
+        controls_layout.addWidget(QLabel("Min responses"), 1, 2)
+        controls_layout.addWidget(self.min_peak_count, 1, 3)
+        controls_layout.addWidget(self.reset_view_button, 1, 4)
+        controls_layout.setColumnStretch(6, 1)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(controls)
+        layout.addWidget(self.detail_label)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(QLabel("Skipped files / warnings"))
+        layout.addWidget(self.error_box)
+
+        self._populate()
+        _fix_spinbox_hit_targets(self)
+        self.showMaximized()
+
+    def _populate(self) -> None:
+        self.status.setText(
+            f"{len(self.records)} stimulus file(s) analyzed | "
+            f"pre {float(self.payload.get('pre_ms', 0.0)):g} ms, "
+            f"after {float(self.payload.get('response_ms', 0.0)):g} ms, "
+            f"strong window {float(self.payload.get('strong_response_window_ms', 50.0)):g} ms, "
+            f"tail removed +/-{float(self.payload.get('artifact_ms', 0.0)):g} ms | "
+            f"zero stimulus #{int(self.payload.get('zero_stimulus_index', 0)) + 1}"
+        )
+        self.error_box.setPlainText("\n".join(self.errors) if self.errors else "No skipped files.")
+        self.file_combo.blockSignals(True)
+        self.file_combo.clear()
+        for index, record in enumerate(self.records):
+            raw_count = int(record.get("raw_stim_count", record.get("stim_count", 0)))
+            kept_count = int(record.get("trial_count", record.get("stim_count", 0)))
+            label = f"{Path(str(record.get('path', ''))).name} | trials {kept_count}"
+            if raw_count != kept_count:
+                label += f" | raw stim {raw_count}"
+            self.file_combo.addItem(label, index)
+        self.file_combo.blockSignals(False)
+        self._record_changed()
+
+    def _selected_record(self) -> dict | None:
+        try:
+            index = int(self.file_combo.currentData())
+        except (TypeError, ValueError):
+            index = int(self.file_combo.currentIndex())
+        if 0 <= index < len(self.records):
+            return self.records[index]
+        return None
+
+    def _record_changed(self, *args) -> None:
+        self.selected_electrode = None
+        self._map_limits = None
+        self._draw()
+
+    def _record_label(self, record: dict | None) -> str:
+        if not record:
+            return "No file"
+        return Path(str(record.get("path", record.get("file", "")))).name
+
+    def _channel_to_electrode(self, channel: str) -> str | None:
+        position = _position_for_channel(str(channel), self.position_lookup)
+        if position is not None:
+            return str(position[2])
+        text = str(channel).strip()
+        return text if text in self.electrode_positions else None
+
+    def _stim_electrodes(self, record: dict | None) -> list[str]:
+        params = record.get("parameters", {}) if isinstance(record, dict) else {}
+        if not isinstance(params, dict):
+            params = {}
+        raw_data = record.get("raw_data") if isinstance(record, dict) else None
+        params = _apply_stimulus_metadata_parameters(params, raw_data)
+        raw_values = []
+        if isinstance(record, dict):
+            for key in ("stim_electrodes", "stimulation_electrodes", "stim_electrode", "electrodes"):
+                value = record.get(key)
+                if value not in (None, ""):
+                    raw_values.append(value)
+        for key in ("stim_electrodes", "stimulation_electrodes", "stim_electrode", "electrodes", "site", "anchor"):
+            value = params.get(key)
+            if value not in (None, ""):
+                raw_values.append(value)
+        tokens = []
+        for value in raw_values:
+            if isinstance(value, (list, tuple, set, np.ndarray)):
+                tokens.extend(list(value))
+            else:
+                tokens.extend(re.split(r"[,;\s]+", str(value)))
+        path_text = " ".join(
+            [
+                str((record or {}).get("path", "")),
+                str((record or {}).get("file", "")),
+                str((record or {}).get("condition", "")),
+            ]
+        )
+        for pattern in (
+            r"(?:stim(?:ulus)?|stim[_\-\s]*electrode|electrode|site|anchor)[_\-\s:=]*(?:e|el)?(\d+)",
+            r"\b(e\d{2,})\b",
+            r"\bel(\d{2,})\b",
+        ):
+            for match in re.finditer(pattern, path_text, flags=re.IGNORECASE):
+                tokens.append(match.group(1))
+        resolved = []
+        unmapped = []
+        for token in tokens:
+            token_text = str(token or "").strip()
+            if not token_text or token_text.lower() in {"nan", "none"}:
+                continue
+            electrode = _resolve_channel_map_electrode(token, self.position_lookup, self.electrode_positions)
+            if electrode is not None and electrode not in resolved:
+                resolved.append(electrode)
+            elif token_text not in unmapped:
+                unmapped.append(token_text)
+        self._stim_metadata_found = bool(tokens)
+        self._unmapped_stim_tokens = unmapped
+        return resolved
+
+    def _is_left_button(self, button) -> bool:
+        if button in (1, "1", "left", "LEFT"):
+            return True
+        name = str(getattr(button, "name", "") or "")
+        if name.upper() == "LEFT":
+            return True
+        text = str(button or "").lower()
+        return text in {"mousebutton.left", "button.left"}
+
+    def _latency_colormap(self):
+        return LinearSegmentedColormap.from_list(
+            "stim_response_latency_blue_red",
+            ["#172554", "#1d4ed8", "#38bdf8", "#facc15", "#dc2626", "#7f1d1d"],
+            N=256,
+        )
+
+    def _latency_signature(self, record: dict | None) -> tuple:
+        return (
+            str(record.get("path", "")) if isinstance(record, dict) else "",
+            id(record),
+            float(self._applied_raster_window_ms),
+            float(self._applied_latency_bin_ms),
+            float(self._applied_peak_ratio),
+            int(self._applied_min_peak_count),
+        )
+
+    def _latency_analysis(self, record: dict | None) -> dict:
+        signature = self._latency_signature(record)
+        cached = self.latency_cache.get(signature)
+        if cached is not None:
+            return cached
+        channels = [str(channel) for channel in (record or {}).get("channels", [])]
+        trials = list((record or {}).get("trial_channel_spikes_ms", []))
+        strong_probability_by_channel = dict((record or {}).get("strong_response_probability_by_channel", {}) or {})
+        strong_count_by_channel = dict((record or {}).get("strong_response_count_by_channel", {}) or {})
+        window_ms = max(1.0, float(self._applied_raster_window_ms))
+        bin_ms = max(0.2, float(self._applied_latency_bin_ms))
+        peak_ratio_threshold = max(1.0, float(self._applied_peak_ratio))
+        min_peak_count = max(1, int(self._applied_min_peak_count))
+        edges = np.arange(0.0, window_ms + bin_ms * 1.1, bin_ms, dtype=float)
+        if edges.size < 2:
+            edges = np.array([0.0, window_ms], dtype=float)
+        centers = (edges[:-1] + edges[1:]) * 0.5
+
+        latency_by_channel: dict[str, np.ndarray] = {}
+        channel_metrics: dict[str, dict] = {}
+        electrode_metrics: dict[str, dict] = {}
+        stable_electrodes = []
+        electrode_to_channels: dict[str, list[str]] = {}
+        peak_by_electrode: dict[str, float] = {}
+        ratio_by_electrode: dict[str, float] = {}
+        values_by_electrode: dict[str, list[float]] = {}
+        strong_probability_values_by_electrode: dict[str, list[float]] = {}
+        strong_count_by_electrode: dict[str, int] = {}
+
+        for channel_index, channel in enumerate(channels):
+            first_values = []
+            for trial in trials:
+                values = np.asarray(trial[channel_index] if channel_index < len(trial) else [], dtype=float)
+                values = values[np.isfinite(values)]
+                response = values[(values >= 0.0) & (values <= window_ms)]
+                if response.size:
+                    first_values.append(float(np.min(response)))
+            latencies = np.asarray(first_values, dtype=float)
+            latency_by_channel[channel] = latencies
+            counts, _ = np.histogram(latencies, bins=edges)
+            ratio, peak_ms, peak_count = _stable_delay_peak_ratio_and_peak(latencies, bin_ms)
+            response_count = int(np.count_nonzero(np.isfinite(latencies)))
+            stable = bool(response_count >= min_peak_count and ratio >= peak_ratio_threshold)
+            electrode = self._channel_to_electrode(channel)
+            strong_probability = float(strong_probability_by_channel.get(str(channel), 0.0) or 0.0)
+            strong_count = int(strong_count_by_channel.get(str(channel), 0) or 0)
+            channel_metrics[channel] = {
+                "latencies": latencies,
+                "counts": counts,
+                "edges": edges,
+                "peak_ms": peak_ms,
+                "peak_count": peak_count,
+                "peak_ratio": ratio,
+                "response_count": response_count,
+                "stable": stable,
+                "electrode": electrode or "",
+                "strong_response_probability": strong_probability,
+                "strong_response_count": strong_count,
+            }
+            if electrode:
+                electrode_to_channels.setdefault(electrode, []).append(channel)
+                strong_probability_values_by_electrode.setdefault(electrode, []).append(strong_probability)
+                strong_count_by_electrode[electrode] = int(strong_count_by_electrode.get(electrode, 0)) + strong_count
+                if latencies.size:
+                    values_by_electrode.setdefault(electrode, []).extend(latencies.tolist())
+                if stable:
+                    stable_electrodes.append(electrode)
+                    peak_by_electrode.setdefault(electrode, peak_ms)
+                    ratio_by_electrode[electrode] = max(float(ratio_by_electrode.get(electrode, 0.0)), ratio)
+
+        for electrode, values in values_by_electrode.items():
+            values_array = np.asarray(values, dtype=float)
+            if values_array.size:
+                counts, _ = np.histogram(values_array, bins=edges)
+                ratio, peak_ms, peak_count = _stable_delay_peak_ratio_and_peak(values_array, bin_ms)
+                response_count = int(np.count_nonzero(np.isfinite(values_array)))
+                stable = electrode in set(stable_electrodes) or (
+                    response_count >= min_peak_count and ratio >= peak_ratio_threshold
+                )
+                electrode_metrics[electrode] = {
+                    "latencies": values_array,
+                    "counts": counts,
+                    "edges": edges,
+                    "peak_ms": peak_ms,
+                    "peak_count": peak_count,
+                    "peak_ratio": ratio,
+                    "response_count": response_count,
+                    "stable": stable,
+                    "strong_response_probability": float(
+                        np.mean(strong_probability_values_by_electrode.get(electrode, [0.0]))
+                    ),
+                    "strong_response_count": int(strong_count_by_electrode.get(electrode, 0)),
+                }
+                if stable and electrode not in stable_electrodes:
+                    stable_electrodes.append(electrode)
+                if stable:
+                    peak_by_electrode[electrode] = peak_ms
+                    ratio_by_electrode[electrode] = ratio
+
+        result = {
+            "channels": channels,
+            "trials": trials,
+            "window_ms": window_ms,
+            "bin_ms": bin_ms,
+            "edges": edges,
+            "centers": centers,
+            "latency_by_channel": latency_by_channel,
+            "channel_metrics": channel_metrics,
+            "electrode_metrics": electrode_metrics,
+            "electrode_to_channels": electrode_to_channels,
+            "stable_electrodes": sorted(set(stable_electrodes), key=_channel_sort_key),
+            "peak_by_electrode": peak_by_electrode,
+            "ratio_by_electrode": ratio_by_electrode,
+            "strong_probability_by_channel": strong_probability_by_channel,
+            "strong_count_by_channel": strong_count_by_channel,
+            "strong_probability_by_electrode": {
+                electrode: float(np.mean(values))
+                for electrode, values in strong_probability_values_by_electrode.items()
+                if values
+            },
+        }
+        self.latency_cache[signature] = result
+        return result
+
+    def _draw(self) -> None:
+        record = self._selected_record()
+        analysis = self._latency_analysis(record)
+        figure = self.canvas.figure
+        figure.set_constrained_layout(False)
+        figure.clear()
+        figure.subplots_adjust(left=0.025, right=0.985, top=0.94, bottom=0.06, wspace=0.18, hspace=0.28)
+        grid = figure.add_gridspec(2, 2, width_ratios=[2.55, 1.25], height_ratios=[1.15, 1.0])
+        self._map_ax = figure.add_subplot(grid[:, 0])
+        raster_ax = figure.add_subplot(grid[0, 1])
+        lower_grid = grid[1, 1].subgridspec(1, 2, width_ratios=[1.25, 0.75], wspace=0.28)
+        self._latency_ax = figure.add_subplot(lower_grid[0, 0])
+        reserved_ax = figure.add_subplot(lower_grid[0, 1])
+        self._draw_latency_map(self._map_ax, record, analysis)
+        self._draw_response_raster(raster_ax, record, analysis)
+        self._draw_selected_latency(self._latency_ax, analysis)
+        self._draw_strong_response_panel(reserved_ax, record, analysis)
+        self.detail_label.setText(self._detail_text(record, analysis))
+        self.canvas.draw_idle()
+
+    def _draw_response_raster(self, ax, record: dict | None, analysis: dict) -> None:
+        channels = list(analysis.get("channels", []))
+        trials = list(analysis.get("trials", []))
+        window_ms = max(1.0, float(analysis.get("window_ms", self._applied_raster_window_ms)))
+        ax.set_title("Stable-electrode response raster")
+        ax.set_xlabel("Time from selected zero stimulus (ms)")
+        ax.set_ylabel("Trial")
+        ax.set_xlim(0.0, window_ms)
+        ax.axvline(0.0, color="#111827", linestyle="--", linewidth=1.0)
+        if record is None or not channels or not trials:
+            ax.text(0.5, 0.5, "No trial raster data", transform=ax.transAxes, ha="center", va="center")
+            return
+        stable_electrodes = set(str(electrode) for electrode in analysis.get("stable_electrodes", []))
+        channel_metrics = analysis.get("channel_metrics", {}) or {}
+        display_pairs = []
+        for channel_index, channel in enumerate(channels):
+            electrode = str(channel_metrics.get(str(channel), {}).get("electrode") or self._channel_to_electrode(str(channel)) or "")
+            if electrode in stable_electrodes:
+                display_pairs.append((channel_index, str(channel), electrode))
+        if not display_pairs:
+            ax.text(
+                0.5,
+                0.5,
+                "No stable-latency electrodes under current parameters",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                wrap=True,
+            )
+            ax.set_yticks([])
+            return
+        channel_count = max(1, len(display_pairs))
+        row_gap = 2.0
+        discrete_palette = [
+            "#1d4ed8",
+            "#dc2626",
+            "#16a34a",
+            "#9333ea",
+            "#f97316",
+            "#0891b2",
+            "#be123c",
+            "#4f46e5",
+            "#65a30d",
+            "#c2410c",
+            "#0f766e",
+            "#a21caf",
+            "#2563eb",
+            "#e11d48",
+            "#15803d",
+            "#7c3aed",
+        ]
+        continuous_cmap = colormaps["turbo"].resampled(min(channel_count, 256))
+        xs = []
+        ys = []
+        colors = []
+        for trial_index, trial in enumerate(trials, start=1):
+            for display_index, (channel_index, channel, _electrode) in enumerate(display_pairs):
+                values = np.asarray(trial[channel_index] if channel_index < len(trial) else [], dtype=float)
+                values = values[np.isfinite(values)]
+                values = values[(values >= 0.0) & (values <= window_ms)]
+                if not values.size:
+                    continue
+                xs.extend(values.tolist())
+                ys.extend([float(trial_index) * row_gap] * int(values.size))
+                if channel_count <= len(discrete_palette):
+                    color = discrete_palette[display_index % len(discrete_palette)]
+                else:
+                    color = continuous_cmap((display_index % 256) / max(1, min(channel_count, 256) - 1))
+                colors.extend([color] * int(values.size))
+        if xs:
+            xs_array = np.asarray(xs, dtype=float)
+            ys_array = np.asarray(ys, dtype=float)
+            if xs_array.size > self.RASTER_MAX_POINTS:
+                indices = np.linspace(0, xs_array.size - 1, self.RASTER_MAX_POINTS, dtype=int)
+                xs_array = xs_array[indices]
+                ys_array = ys_array[indices]
+                colors = [colors[int(index)] for index in indices]
+                ax.set_title(f"Trial response raster | sampled {self.RASTER_MAX_POINTS}/{len(xs)} spikes")
+            ax.scatter(xs_array, ys_array, s=18, c=colors, marker="o", linewidths=0, alpha=0.9)
+        ax.set_ylim(0.35 * row_gap, (len(trials) + 0.65) * row_gap)
+        ax.invert_yaxis()
+        trial_ticks = _display_indices(len(trials), 12)
+        if trial_ticks.size:
+            ax.set_yticks((trial_ticks + 1) * row_gap)
+            ax.set_yticklabels([str(int(index) + 1) for index in trial_ticks])
+        ax.grid(True, axis="x", color="#e2e8f0", linewidth=0.75)
+
+    def _draw_latency_map(self, ax, record: dict | None, analysis: dict) -> None:
+        stable_electrodes = list(analysis.get("stable_electrodes", []))
+        stim_electrodes = self._stim_electrodes(record)
+        self.map_state = draw_maxwell_channel_map(
+            ax,
+            self.channel_map,
+            recording_electrodes=[],
+            stimulation_electrodes=stim_electrodes,
+            selected_electrode=self.selected_electrode,
+            title="Stable peak latency map",
+        )
+        positions = self.map_state.get("positions", {}) if isinstance(self.map_state, dict) else {}
+        region_bounds = self._map_region_bounds(positions)
+        self._replace_map_region_outline(ax, region_bounds)
+        peak_by_electrode = dict(analysis.get("peak_by_electrode", {}) or {})
+        stable_points = [
+            (electrode, float(positions[electrode][0]), float(positions[electrode][1]), float(peak_by_electrode.get(electrode, np.nan)))
+            for electrode in stable_electrodes
+            if electrode in positions and np.isfinite(float(peak_by_electrode.get(electrode, np.nan)))
+        ]
+        if stable_points:
+            latencies = np.asarray([item[3] for item in stable_points], dtype=float)
+            vmin = float(np.nanmin(latencies))
+            vmax = float(np.nanmax(latencies))
+            if abs(vmax - vmin) <= 1e-9:
+                vmax = vmin + 1.0
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            cmap = self._latency_colormap()
+            ax.scatter(
+                [item[1] for item in stable_points],
+                [item[2] for item in stable_points],
+                s=42,
+                c=[cmap(norm(item[3])) for item in stable_points],
+                marker="o",
+                edgecolors="#111827",
+                linewidths=0.45,
+                zorder=7,
+            )
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+            colorbar = ax.figure.colorbar(sm, ax=ax, fraction=0.046, pad=0.02)
+            colorbar.set_label("Peak latency (ms)")
+        for electrode in stim_electrodes:
+            if electrode in positions:
+                x, y, _payload = positions[electrode]
+                ax.scatter([x], [y], s=130, marker="*", color="#dc2626", edgecolors="#111827", linewidths=0.75, zorder=9)
+        if not stim_electrodes:
+            text = self._stim_metadata_diagnostic_text(record)
+            ax.text(
+                0.012,
+                0.988,
+                text,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                color="#991b1b",
+                bbox={"facecolor": "white", "edgecolor": "#fecaca", "alpha": 0.9, "pad": 0.25},
+                zorder=12,
+            )
+        if self._map_limits is not None:
+            try:
+                xlim, ylim = self._clamped_map_limits(self._map_limits[0], self._map_limits[1])
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+                self._map_limits = (xlim, ylim)
+            except Exception:
+                self._map_limits = None
+        if self._map_limits is None:
+            x0, x1, y0, y1 = region_bounds
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y1, y0)
+
+    def _stim_metadata_diagnostic_text(self, record: dict | None) -> str:
+        if self._stim_metadata_found and self._unmapped_stim_tokens:
+            return "Unmapped stimulation site: " + ", ".join(self._unmapped_stim_tokens[:8])
+        if not isinstance(record, dict):
+            return "No stimulation-site metadata found: no selected record"
+        status = str(record.get("stim_metadata_status", "") or "unknown")
+        raw_stim = int(record.get("raw_stim_count", record.get("stim_count", 0)) or 0)
+        sidecar_files = list(record.get("stim_metadata_sidecar_files", []) or [])
+        sidecar_candidates = list(record.get("stim_metadata_sidecar_candidates", []) or [])
+        stimulus_record_count = int(record.get("stimulus_record_count", 0) or 0)
+        lines = [
+            "No stimulation-site metadata found",
+            f"stim markers: {raw_stim}",
+            f"site records: {stimulus_record_count}",
+        ]
+        if sidecar_files:
+            lines.append("sidecar files: " + ", ".join(Path(str(item)).name for item in sidecar_files[:4]))
+            if status == "sidecar_without_sites":
+                lines.append("sidecar has times/logs but no electrode field")
+        elif sidecar_candidates:
+            lines.append(f"sidecar searched: {len(sidecar_candidates)} candidate files")
+            lines.append("no readable stim_plan/segment_meta with electrodes")
+        else:
+            lines.append("sidecar search was not available for this file")
+        return "\n".join(lines)
+
+    def _map_region_bounds(self, positions: dict) -> tuple[float, float, float, float]:
+        points = [
+            (float(x), float(y))
+            for x, y, _payload in (positions or {}).values()
+            if np.isfinite(float(x)) and np.isfinite(float(y))
+        ]
+        if not points:
+            return (-0.015, 1.015, -0.015, 1.015)
+        values = np.asarray(points, dtype=float)
+        x0 = float(np.nanmin(values[:, 0]))
+        x1 = float(np.nanmax(values[:, 0]))
+        y0 = float(np.nanmin(values[:, 1]))
+        y1 = float(np.nanmax(values[:, 1]))
+
+        def _spacing(column: np.ndarray) -> float:
+            unique = np.unique(np.round(column.astype(float), 8))
+            if unique.size < 2:
+                return 0.01
+            diffs = np.diff(np.sort(unique))
+            diffs = diffs[diffs > 1e-8]
+            return float(np.nanmedian(diffs)) if diffs.size else 0.01
+
+        pad_x = max(_spacing(values[:, 0]) * 1.4, (x1 - x0) * 0.012, 0.004)
+        pad_y = max(_spacing(values[:, 1]) * 1.4, (y1 - y0) * 0.018, 0.004)
+        return (x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y)
+
+    def _clamped_map_limits(self, xlim, ylim) -> tuple[tuple[float, float], tuple[float, float]]:
+        positions = self.map_state.get("positions", {}) if isinstance(self.map_state, dict) else {}
+        x0, x1, y0, y1 = self._map_region_bounds(positions)
+        region_w = max(abs(x1 - x0), 1e-6)
+        region_h = max(abs(y1 - y0), 1e-6)
+        min_w = max(region_w * 0.015, 0.002)
+        min_h = max(region_h * 0.015, 0.002)
+        max_w = region_w * 1.35
+        max_h = region_h * 1.35
+
+        xa, xb = float(xlim[0]), float(xlim[1])
+        ya, yb = float(ylim[0]), float(ylim[1])
+        x_dir = 1.0 if xb >= xa else -1.0
+        y_dir = 1.0 if yb >= ya else -1.0
+        width = min(max(abs(xb - xa), min_w), max_w)
+        height = min(max(abs(yb - ya), min_h), max_h)
+        if width >= region_w:
+            cx = (x0 + x1) * 0.5
+        else:
+            cx = float(np.clip((xa + xb) * 0.5, x0 + width * 0.5, x1 - width * 0.5))
+        if height >= region_h:
+            cy = (y0 + y1) * 0.5
+        else:
+            cy = float(np.clip((ya + yb) * 0.5, y0 + height * 0.5, y1 - height * 0.5))
+        new_xlim = (cx - x_dir * width * 0.5, cx + x_dir * width * 0.5)
+        new_ylim = (cy - y_dir * height * 0.5, cy + y_dir * height * 0.5)
+        return new_xlim, new_ylim
+
+    def _replace_map_region_outline(self, ax, bounds: tuple[float, float, float, float]) -> None:
+        for line in list(ax.lines):
+            try:
+                xdata = np.asarray(line.get_xdata(), dtype=float)
+                ydata = np.asarray(line.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            if xdata.size == 5 and ydata.size == 5 and np.allclose(xdata, [0, 1, 1, 0, 0]) and np.allclose(ydata, [0, 0, 1, 1, 0]):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+        x0, x1, y0, y1 = bounds
+        ax.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], color="#111827", linewidth=1.15, zorder=3)
+
+    def _draw_selected_latency(self, ax, analysis: dict) -> None:
+        ax.clear()
+        ax.set_title("Selected electrode latency distribution")
+        ax.set_xlabel("First spike latency (ms)")
+        ax.set_ylabel("Trials")
+        window_ms = max(1.0, float(analysis.get("window_ms", self._applied_raster_window_ms)))
+        ax.set_xlim(0.0, window_ms)
+        if not self.selected_electrode:
+            ax.text(0.5, 0.5, "Click an electrode on the map", transform=ax.transAxes, ha="center", va="center")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return
+        metrics = (analysis.get("electrode_metrics", {}) or {}).get(str(self.selected_electrode), {})
+        values = np.asarray(metrics.get("latencies", []), dtype=float)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            ax.text(0.5, 0.5, f"No latency values for {self.selected_electrode}", transform=ax.transAxes, ha="center", va="center")
+            return
+        edges = np.asarray(metrics.get("edges", analysis.get("edges", [])), dtype=float)
+        if edges.size < 2:
+            edges = np.arange(0.0, window_ms + float(self._applied_latency_bin_ms), float(self._applied_latency_bin_ms))
+        counts, edges = np.histogram(values[(values >= 0.0) & (values <= window_ms)], bins=edges)
+        ax.bar(edges[:-1], counts, width=np.diff(edges), align="edge", color="#2563eb", alpha=0.72, label="Latency count")
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        if counts.size:
+            smooth = gaussian_filter(counts.astype(float), sigma=1.0)
+            ax.plot(centers, smooth, color="#dc2626", linewidth=1.8, label="Smoothed fit")
+            peak = float(metrics.get("peak_ms", np.nan))
+            if np.isfinite(peak):
+                ax.axvline(peak, color="#111827", linestyle="--", linewidth=1.1, label=f"peak {peak:.1f} ms")
+        ax.legend(loc="best", fontsize=8, frameon=False)
+
+    def _draw_strong_response_panel(self, ax, record: dict | None, analysis: dict) -> None:
+        ax.clear()
+        window_ms = float((record or {}).get("strong_response_window_ms", self.payload.get("strong_response_window_ms", 50.0)))
+        ax.set_title(f"Strong response probability ({window_ms:g} ms)")
+        probabilities = dict(analysis.get("strong_probability_by_electrode", {}) or {})
+        if not probabilities:
+            ax.text(0.5, 0.5, "No strong-response probability data", transform=ax.transAxes, ha="center", va="center", color="#64748b", wrap=True)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return
+        ordered = sorted(probabilities.items(), key=lambda item: (-float(item[1]), _channel_sort_key(str(item[0]))))
+        top = ordered[:10]
+        labels = [str(item[0]) for item in top]
+        values = np.asarray([float(item[1]) for item in top], dtype=float)
+        y = np.arange(len(top), dtype=float)
+        colors = ["#dc2626" if str(label) == str(self.selected_electrode) else "#2563eb" for label in labels]
+        ax.barh(y, values, color=colors, alpha=0.86)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=7)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xlabel("Probability")
+        ax.invert_yaxis()
+        overall = float((record or {}).get("strong_response_probability", np.nan))
+        if np.isfinite(overall):
+            ax.axvline(overall, color="#111827", linestyle="--", linewidth=1.0, alpha=0.8)
+            ax.text(overall, -0.55, f"overall {overall:.2f}", ha="center", va="bottom", fontsize=7, color="#111827")
+
+    def _detail_text(self, record: dict | None, analysis: dict) -> str:
+        trial_count = len(analysis.get("trials", []))
+        channel_count = len(analysis.get("channels", []))
+        stable_count = len(analysis.get("stable_electrodes", []))
+        strong_overall = float((record or {}).get("strong_response_probability", np.nan))
+        strong_mean = float((record or {}).get("strong_response_probability_mean_by_channel", np.nan))
+        strong_text = ""
+        if np.isfinite(strong_overall):
+            strong_text = f" | strong response P(any): {strong_overall:.3f}"
+        if np.isfinite(strong_mean):
+            strong_text += f", mean channel P: {strong_mean:.3f}"
+        base = (
+            f"{self._record_label(record)} | trials: {trial_count} | channels: {channel_count} | "
+            f"stable-latency electrodes: {stable_count} | raster window {float(self._applied_raster_window_ms):g} ms | "
+            f"latency bin {float(self._applied_latency_bin_ms):g} ms{strong_text}"
+        )
+        stim_count = len(self._stim_electrodes(record))
+        status = str((record or {}).get("stim_metadata_status", "unknown"))
+        base += f" | stim sites: {stim_count} ({status})"
+        if not self.selected_electrode:
+            return base
+        metrics = (analysis.get("electrode_metrics", {}) or {}).get(str(self.selected_electrode), {})
+        peak = float(metrics.get("peak_ms", np.nan))
+        ratio = float(metrics.get("peak_ratio", np.nan))
+        count = int(metrics.get("peak_count", 0))
+        strong_probability = float(metrics.get("strong_response_probability", np.nan))
+        peak_text = f"{peak:.2f} ms" if np.isfinite(peak) else "n/a"
+        ratio_text = f"{ratio:.2f}" if np.isfinite(ratio) else "n/a"
+        strong_selected = f", strong P {strong_probability:.3f}" if np.isfinite(strong_probability) else ""
+        return f"{base} | selected electrode {self.selected_electrode}: peak {peak_text}, peak/background {ratio_text}, peak count {count}{strong_selected}"
+
+    def _nearest_map_electrode(self, event) -> str | None:
+        if event.inaxes is not self._map_ax or event.xdata is None or event.ydata is None:
+            return None
+        points = self.map_state.get("point_lookup", []) if isinstance(self.map_state, dict) else []
+        if not points:
+            return None
+        xs = np.asarray([float(point.get("x", 0.0)) for point in points], dtype=float)
+        ys = np.asarray([float(point.get("y", 0.0)) for point in points], dtype=float)
+        distances = (xs - float(event.xdata)) ** 2 + (ys - float(event.ydata)) ** 2
+        index = int(np.argmin(distances))
+        xlim = event.inaxes.get_xlim()
+        ylim = event.inaxes.get_ylim()
+        span = max(abs(float(xlim[1]) - float(xlim[0])), abs(float(ylim[1]) - float(ylim[0])), 1e-9)
+        threshold = max(0.01, span * 0.018)
+        if float(distances[index]) <= threshold * threshold:
+            return str(points[index].get("electrode"))
+        return None
+
+    def _is_map_event(self, event) -> bool:
+        return self._map_ax is not None and event is not None and event.inaxes is self._map_ax
+
+    def _on_canvas_press(self, event) -> None:
+        if not self._is_map_event(event) or not self._is_left_button(getattr(event, "button", None)):
+            self._map_pan_start = None
+            self._map_is_panning = False
+            return
+        ax = self._map_ax
+        if ax is None:
+            return
+        self._map_pan_start = {
+            "x": float(getattr(event, "x", 0.0)),
+            "y": float(getattr(event, "y", 0.0)),
+            "xlim": tuple(float(value) for value in ax.get_xlim()),
+            "ylim": tuple(float(value) for value in ax.get_ylim()),
+            "bbox_width": max(float(ax.bbox.width), 1.0),
+            "bbox_height": max(float(ax.bbox.height), 1.0),
+        }
+        self._map_is_panning = False
+
+    def _on_canvas_motion(self, event) -> None:
+        start = self._map_pan_start
+        ax = self._map_ax
+        button = getattr(event, "button", None)
+        if start is None or ax is None or (button is not None and not self._is_left_button(button)):
+            return
+        dx_px = float(getattr(event, "x", start["x"])) - float(start["x"])
+        dy_px = float(getattr(event, "y", start["y"])) - float(start["y"])
+        if not self._map_is_panning and float(np.hypot(dx_px, dy_px)) < 4.0:
+            return
+        self._map_is_panning = True
+        xlim = start["xlim"]
+        ylim = start["ylim"]
+        dx_data = dx_px * (float(xlim[1]) - float(xlim[0])) / float(start["bbox_width"])
+        dy_data = dy_px * (float(ylim[1]) - float(ylim[0])) / float(start["bbox_height"])
+        new_xlim = (float(xlim[0]) - dx_data, float(xlim[1]) - dx_data)
+        new_ylim = (float(ylim[0]) - dy_data, float(ylim[1]) - dy_data)
+        new_xlim, new_ylim = self._clamped_map_limits(new_xlim, new_ylim)
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self._map_limits = (new_xlim, new_ylim)
+        self.canvas.draw_idle()
+
+    def _on_canvas_release(self, event) -> None:
+        was_panning = bool(self._map_is_panning)
+        self._map_is_panning = False
+        self._map_pan_start = None
+        if was_panning or not self._is_map_event(event) or not self._is_left_button(getattr(event, "button", None)):
+            return
+        electrode = self._nearest_map_electrode(event)
+        if not electrode:
+            return
+        self._map_limits = (self._map_ax.get_xlim(), self._map_ax.get_ylim()) if self._map_ax is not None else None
+        self.selected_electrode = electrode
+        self._draw()
+
+    def _on_map_scroll(self, event) -> None:
+        if event.inaxes is not self._map_ax or event.xdata is None or event.ydata is None:
+            return
+        ax = event.inaxes
+        step = getattr(event, "step", None)
+        if step is None:
+            step = 1 if str(getattr(event, "button", "")).lower() == "up" else -1
+        factor = 0.82 if float(step) > 0 else 1.22
+        cx = float(event.xdata)
+        cy = float(event.ydata)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        new_xlim = (cx + (float(xlim[0]) - cx) * factor, cx + (float(xlim[1]) - cx) * factor)
+        new_ylim = (cy + (float(ylim[0]) - cy) * factor, cy + (float(ylim[1]) - cy) * factor)
+        new_xlim, new_ylim = self._clamped_map_limits(new_xlim, new_ylim)
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self._map_limits = (ax.get_xlim(), ax.get_ylim())
+        self.canvas.draw_idle()
+
+    def _reset_map_view(self) -> None:
+        self._applied_raster_window_ms = max(1.0, float(self.raster_window_ms.value()))
+        self._applied_latency_bin_ms = max(0.2, float(self.latency_bin_ms.value()))
+        self._applied_peak_ratio = max(1.0, float(self.peak_ratio.value()))
+        self._applied_min_peak_count = max(1, int(self.min_peak_count.value()))
+        self._map_limits = None
+        self.selected_electrode = None
+        self._draw()
 
 
 class StimulusResponseWindow(AppDialog):
@@ -9482,6 +11031,571 @@ class ElectrodeHeatmapCanvas(QWidget):
             rgb[mask] = left[1:] + (right[1:] - left[1:]) * fraction[:, None]
         return np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
 
+class StableDelayMapWindow(AppDialog):
+    def __init__(self, spike_series, channel_map: ChannelMap | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stable Delay Map")
+        self.resize(1380, 840)
+        self.spike_series = [(str(label), np.asarray(times, dtype=float)) for label, times in (spike_series or [])]
+        self.channel_map = channel_map
+        self.parameters = _stable_delay_default_parameters()
+        self.analysis = {}
+        self.selected_electrode: str | None = None
+        self.map_state = {}
+        self._saved_limits = None
+        self._map_ax = None
+        self._latency_ax = None
+        self._degree_ax = None
+        self._side_plot_cache: dict = {}
+        self._map_pan_start = None
+        self._map_is_panning = False
+
+        self.burst_bin_ms = self._make_double_parameter("burst_bin_ms", 1.0, 50.0, 1.0, " ms", 1)
+        self.burst_z = self._make_double_parameter("burst_z", 0.5, 20.0, 0.5, "", 1)
+        self.burst_min_spikes = self._make_int_parameter("burst_min_spikes", 2, 500, 1)
+        self.electrode_peak_ratio = self._make_double_parameter("electrode_peak_ratio_threshold", 0.1, 100.0, 0.5, "", 1)
+        self.pair_bin_ms = self._make_double_parameter("pair_bin_ms", 0.5, 20.0, 0.5, " ms", 1)
+        self.pair_peak_ratio = self._make_double_parameter("pair_peak_ratio_threshold", 0.1, 200.0, 1.0, "", 1)
+        self.pair_min_shared = self._make_int_parameter("pair_min_shared_bursts", 1, 10000, 1)
+        self.pair_min_abs_delay_ms = self._make_double_parameter("pair_min_abs_delay_ms", 0.0, 100.0, 0.5, " ms", 1)
+        self.arrow_alpha = self._make_double_parameter("arrow_alpha", 0.05, 1.0, 0.05, "", 2)
+
+        self.info_label = QLabel()
+        self.info_label.setObjectName("MutedText")
+        self.info_label.setWordWrap(True)
+
+        self.arrow_mode = NoWheelComboBox()
+        self.arrow_mode.addItem("Selected electrode", "selected")
+        self.arrow_mode.addItem("Hide connections", "none")
+        self.arrow_mode.currentIndexChanged.connect(self._draw_map_only)
+
+        self.select_input = QLineEdit()
+        self.select_input.setPlaceholderText("electrode or channel")
+        self.select_input.returnPressed.connect(self._select_from_input)
+        select_button = QPushButton("Locate")
+        select_button.clicked.connect(self._select_from_input)
+        refresh_button = QPushButton("Refresh")
+        refresh_button.setObjectName("PrimaryButton")
+        refresh_button.clicked.connect(self._refresh_analysis)
+        reset_button = QPushButton("Reset View")
+        reset_button.clicked.connect(self._reset_view)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+
+        controls = QFrame()
+        controls.setObjectName("Panel")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(10, 8, 10, 8)
+        controls_layout.setSpacing(7)
+
+        parameter_grid = QGridLayout()
+        parameter_grid.setHorizontalSpacing(8)
+        parameter_grid.setVerticalSpacing(6)
+        parameter_grid.addWidget(QLabel("Burst bin"), 0, 0)
+        parameter_grid.addWidget(self.burst_bin_ms, 0, 1)
+        parameter_grid.addWidget(QLabel("Burst z"), 0, 2)
+        parameter_grid.addWidget(self.burst_z, 0, 3)
+        parameter_grid.addWidget(QLabel("Min spikes"), 0, 4)
+        parameter_grid.addWidget(self.burst_min_spikes, 0, 5)
+        parameter_grid.addWidget(QLabel("Stable ratio"), 0, 6)
+        parameter_grid.addWidget(self.electrode_peak_ratio, 0, 7)
+        parameter_grid.addWidget(QLabel("Pair bin"), 1, 0)
+        parameter_grid.addWidget(self.pair_bin_ms, 1, 1)
+        parameter_grid.addWidget(QLabel("Pair ratio"), 1, 2)
+        parameter_grid.addWidget(self.pair_peak_ratio, 1, 3)
+        parameter_grid.addWidget(QLabel("Shared bursts"), 1, 4)
+        parameter_grid.addWidget(self.pair_min_shared, 1, 5)
+        parameter_grid.addWidget(QLabel("|Delay|"), 1, 6)
+        parameter_grid.addWidget(self.pair_min_abs_delay_ms, 1, 7)
+        parameter_grid.addWidget(QLabel("Arrow alpha"), 2, 0)
+        parameter_grid.addWidget(self.arrow_alpha, 2, 1)
+        parameter_grid.setColumnStretch(8, 1)
+        controls_layout.addLayout(parameter_grid)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(QLabel("Connections"))
+        action_row.addWidget(self.arrow_mode)
+        action_row.addWidget(QLabel("Select"))
+        action_row.addWidget(self.select_input)
+        action_row.addWidget(select_button)
+        action_row.addWidget(refresh_button)
+        action_row.addWidget(reset_button)
+        action_row.addStretch(1)
+        action_row.addWidget(close_button)
+        controls_layout.addLayout(action_row)
+
+        self.canvas = FigureCanvas(Figure(figsize=(13.2, 7.8), constrained_layout=False))
+        self.canvas.mpl_connect("button_press_event", self._on_map_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_map_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_map_release)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(controls)
+        layout.addWidget(self.info_label)
+        layout.addWidget(self.canvas, 1)
+        self._refresh_analysis(show_progress=False)
+        _fix_spinbox_hit_targets(self)
+
+    def _make_double_parameter(self, key: str, minimum: float, maximum: float, step: float, suffix: str, decimals: int) -> QDoubleSpinBox:
+        field = QDoubleSpinBox()
+        field.setRange(float(minimum), float(maximum))
+        field.setDecimals(int(decimals))
+        field.setSingleStep(float(step))
+        field.setValue(float(self.parameters.get(key, minimum)))
+        if suffix:
+            field.setSuffix(str(suffix))
+        return field
+
+    def _make_int_parameter(self, key: str, minimum: int, maximum: int, step: int) -> QSpinBox:
+        field = QSpinBox()
+        field.setRange(int(minimum), int(maximum))
+        field.setSingleStep(int(step))
+        field.setValue(int(self.parameters.get(key, minimum)))
+        return field
+
+    def _current_parameters(self) -> dict:
+        params = dict(self.parameters)
+        params.update(
+            {
+                "arrow_alpha": float(self.arrow_alpha.value()),
+                "burst_bin_ms": float(self.burst_bin_ms.value()),
+                "burst_z": float(self.burst_z.value()),
+                "burst_min_spikes": int(self.burst_min_spikes.value()),
+                "electrode_peak_ratio_threshold": float(self.electrode_peak_ratio.value()),
+                "pair_bin_ms": float(self.pair_bin_ms.value()),
+                "pair_peak_ratio_threshold": float(self.pair_peak_ratio.value()),
+                "pair_min_shared_bursts": int(self.pair_min_shared.value()),
+                "pair_min_abs_delay_ms": float(self.pair_min_abs_delay_ms.value()),
+            }
+        )
+        return params
+
+    def _refresh_analysis(self, *, show_progress: bool = True):
+        progress = _create_progress_dialog(self, "Stable delay map", "Recomputing stable-delay map...", 0) if show_progress and _progress_enabled_for_widget(self) else None
+        if progress is not None:
+            QApplication.processEvents()
+        try:
+            self.parameters = self._current_parameters()
+            self.analysis = _stable_delay_map_analysis(self.spike_series, self.channel_map, self.parameters)
+            self._side_plot_cache = self._build_side_plot_cache()
+        except Exception as exc:
+            _close_progress_dialog(progress)
+            _show_error_message(self, "Stable delay map", str(exc))
+            return
+        _close_progress_dialog(progress)
+        self._saved_limits = None
+        if self.selected_electrode and self.selected_electrode not in set(self.analysis.get("recording_electrodes", [])):
+            self.selected_electrode = None
+        self._draw()
+
+    def _build_side_plot_cache(self) -> dict:
+        degree_values = []
+        for electrode in set(self.analysis.get("out_degree", {})) | set(self.analysis.get("in_degree", {})):
+            degree_values.append(
+                (
+                    str(electrode),
+                    int(self.analysis.get("out_degree", {}).get(electrode, 0)),
+                    int(self.analysis.get("in_degree", {}).get(electrode, 0)),
+                )
+            )
+        degree_values.sort(key=lambda item: item[1] + item[2], reverse=True)
+        degree_values = degree_values[:12]
+        return {
+            "degree_labels": [item[0] for item in degree_values],
+            "degree_out": np.asarray([item[1] for item in degree_values], dtype=float),
+            "degree_in": np.asarray([item[2] for item in degree_values], dtype=float),
+        }
+
+    def _selected_first_latency_values(self) -> np.ndarray:
+        if not self.selected_electrode:
+            return np.zeros(0, dtype=float)
+        channels = self.analysis.get("electrode_to_channels", {}).get(str(self.selected_electrode), [])
+        first_by_channel = self.analysis.get("first_latency_by_channel", {}) or {}
+        chunks = []
+        for channel in channels:
+            values = np.asarray(first_by_channel.get(str(channel), []), dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                chunks.append(values)
+        if not chunks:
+            return np.zeros(0, dtype=float)
+        return np.concatenate(chunks)
+
+    def _summary_text(self) -> str:
+        params = self.parameters
+        burst_count = len(self.analysis.get("bursts", []))
+        stable_count = len(self.analysis.get("stable_electrodes", []))
+        connection_count = len(self.analysis.get("pair_arrows", []))
+        channel_count = len(self.analysis.get("labels", []))
+        return (
+            f"Stable delay map | channels: {channel_count} | bursts: {burst_count} | "
+            f"stable electrodes: {stable_count} | connections: {connection_count} | "
+            f"burst bin {params['burst_bin_ms']:g} ms, z {params['burst_z']:g}, min spikes {params['burst_min_spikes']} | "
+            f"electrode peak ratio >= {params['electrode_peak_ratio_threshold']:g} | "
+            f"pair bin {params['pair_bin_ms']:g} ms, pair peak ratio >= {params['pair_peak_ratio_threshold']:g}, "
+            f"shared bursts > {params['pair_min_shared_bursts']}, |delay| > {params['pair_min_abs_delay_ms']:g} ms"
+        )
+
+    def _selected_text(self) -> str:
+        if not self.selected_electrode:
+            return self._summary_text()
+        electrode = str(self.selected_electrode)
+        channels = self.analysis.get("electrode_to_channels", {}).get(electrode, [])
+        peak = self.analysis.get("peak_by_electrode", {}).get(electrode, float("nan"))
+        ratio = self.analysis.get("ratio_by_electrode", {}).get(electrode, float("nan"))
+        is_stable = electrode in set(self.analysis.get("stable_electrodes", []))
+        out_degree = int(self.analysis.get("out_degree", {}).get(electrode, 0))
+        in_degree = int(self.analysis.get("in_degree", {}).get(electrode, 0))
+        peak_text = f"{float(peak):.3f} ms" if np.isfinite(float(peak)) else "n/a"
+        ratio_text = f"{float(ratio):.3g}" if np.isfinite(float(ratio)) else "n/a"
+        return (
+            f"Electrode {electrode} | channels: {', '.join(map(str, channels[:8])) or 'n/a'}"
+            f"{'...' if len(channels) > 8 else ''} | stable: {'yes' if is_stable else 'no'} | "
+            f"activation peak: {peak_text} | peak/background: {ratio_text} | "
+            f"out degree: {out_degree} | in degree: {in_degree}"
+        )
+
+    def _arrows_for_display(self) -> list[dict]:
+        arrows = list(self.analysis.get("pair_arrows", []))
+        mode = str(self.arrow_mode.currentData() or "selected")
+        if mode == "none":
+            return []
+        if not self.selected_electrode:
+            return []
+        selected = str(self.selected_electrode)
+        return [
+            arrow
+            for arrow in arrows
+            if str(arrow.get("source_electrode")) == selected
+            or str(arrow.get("target_electrode")) == selected
+        ]
+
+    def _draw(self):
+        figure = self.canvas.figure
+        figure.set_constrained_layout(False)
+        figure.clear()
+        figure.subplots_adjust(left=0.004, right=0.995, top=0.955, bottom=0.05, wspace=0.075, hspace=0.28)
+        grid = figure.add_gridspec(2, 2, height_ratios=[3.2, 1.35], width_ratios=[4.9, 1.45])
+        self._map_ax = figure.add_subplot(grid[:, 0])
+        self._latency_ax = figure.add_subplot(grid[0, 1])
+        self._degree_ax = figure.add_subplot(grid[1, 1])
+        self._draw_map_only(draw=False)
+        self._draw_side_plots()
+        self.info_label.setText(self._selected_text())
+        self.canvas.draw_idle()
+
+    def _draw_map_only(self, *args, draw: bool = True):
+        if self._map_ax is None:
+            self._draw()
+            return
+        map_ax = self._map_ax
+        saved_limits = self._saved_limits
+        self.map_state = draw_maxwell_channel_map(
+            map_ax,
+            self.channel_map,
+            recording_electrodes=self.analysis.get("recording_electrodes", []),
+            stimulation_electrodes=self.analysis.get("stable_electrodes", []),
+            selected_electrode=self.selected_electrode,
+            title="Stable delay electrodes and directed connections",
+        )
+        positions = self.map_state.get("positions", {}) or {}
+        region_bounds = self._stable_map_region_bounds(positions)
+        self._replace_map_region_outline(map_ax, region_bounds)
+        stable = set(self.analysis.get("stable_electrodes", []))
+        arrows = self._arrows_for_display()
+        alpha = min(1.0, max(0.05, float(self.parameters.get("arrow_alpha", 0.2))))
+        arrow_x = []
+        arrow_y = []
+        arrow_u = []
+        arrow_v = []
+        arrow_colors = []
+        for arrow in arrows:
+            source = str(arrow.get("source_electrode"))
+            target = str(arrow.get("target_electrode"))
+            if source not in positions or target not in positions or source == target:
+                continue
+            sx, sy, _ = positions[source]
+            tx, ty, _ = positions[target]
+            sx = float(sx)
+            sy = float(sy)
+            tx = float(tx)
+            ty = float(ty)
+            dx = tx - sx
+            dy = ty - sy
+            distance = float(np.hypot(dx, dy))
+            if distance <= 1e-9:
+                continue
+            margin = min(0.018, distance * 0.22)
+            ux = dx / distance
+            uy = dy / distance
+            start_x = sx + ux * margin
+            start_y = sy + uy * margin
+            stop_x = tx - ux * margin
+            stop_y = ty - uy * margin
+            both_stable = source in stable and target in stable
+            color = "#7c3aed" if self.selected_electrode else ("#dc2626" if both_stable else "#16a34a")
+            arrow_x.append(start_x)
+            arrow_y.append(start_y)
+            arrow_u.append(stop_x - start_x)
+            arrow_v.append(stop_y - start_y)
+            arrow_colors.append(color)
+        if arrow_x:
+            map_ax.quiver(
+                np.asarray(arrow_x, dtype=float),
+                np.asarray(arrow_y, dtype=float),
+                np.asarray(arrow_u, dtype=float),
+                np.asarray(arrow_v, dtype=float),
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                color=arrow_colors,
+                alpha=alpha,
+                width=0.0022,
+                headwidth=4.2,
+                headlength=5.2,
+                headaxislength=4.6,
+                minlength=0.0,
+                zorder=7,
+            )
+        if saved_limits is not None:
+            try:
+                map_ax.set_xlim(saved_limits[0])
+                map_ax.set_ylim(saved_limits[1])
+            except Exception:
+                self._saved_limits = None
+        else:
+            x0, x1, y0, y1 = region_bounds
+            map_ax.set_xlim(x0, x1)
+            map_ax.set_ylim(y1, y0)
+        self.info_label.setText(self._selected_text())
+        if draw:
+            self.canvas.draw_idle()
+
+    def _stable_map_region_bounds(self, positions: dict) -> tuple[float, float, float, float]:
+        points = [
+            (float(x), float(y))
+            for x, y, _payload in (positions or {}).values()
+            if np.isfinite(float(x)) and np.isfinite(float(y))
+        ]
+        if not points:
+            return (-0.015, 1.015, -0.015, 1.015)
+        values = np.asarray(points, dtype=float)
+        x0 = float(np.nanmin(values[:, 0]))
+        x1 = float(np.nanmax(values[:, 0]))
+        y0 = float(np.nanmin(values[:, 1]))
+        y1 = float(np.nanmax(values[:, 1]))
+
+        def _spacing(column: np.ndarray) -> float:
+            unique = np.unique(np.round(column.astype(float), 8))
+            if unique.size < 2:
+                return 0.01
+            diffs = np.diff(np.sort(unique))
+            diffs = diffs[diffs > 1e-8]
+            return float(np.nanmedian(diffs)) if diffs.size else 0.01
+
+        pad_x = max(_spacing(values[:, 0]) * 1.4, (x1 - x0) * 0.012, 0.004)
+        pad_y = max(_spacing(values[:, 1]) * 1.4, (y1 - y0) * 0.018, 0.004)
+        return (x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y)
+
+    def _replace_map_region_outline(self, ax, bounds: tuple[float, float, float, float]) -> None:
+        for line in list(ax.lines):
+            try:
+                xdata = np.asarray(line.get_xdata(), dtype=float)
+                ydata = np.asarray(line.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            if xdata.size == 5 and ydata.size == 5 and np.allclose(xdata, [0, 1, 1, 0, 0]) and np.allclose(ydata, [0, 0, 1, 1, 0]):
+                try:
+                    line.remove()
+                except ValueError:
+                    pass
+        x0, x1, y0, y1 = bounds
+        ax.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], color="#111827", linewidth=1.15, zorder=3)
+
+    def _draw_side_plots(self):
+        self._draw_latency_plot()
+        self._draw_degree_plot()
+
+    def _draw_latency_plot(self):
+        latency_ax = self._latency_ax
+        if latency_ax is None:
+            return
+        latency_ax.clear()
+        values = self._selected_first_latency_values()
+        if values.size:
+            bin_ms = max(0.1, float(self.parameters.get("pair_bin_ms", 1.0)))
+            x_max_ms = 200.0
+            visible_values = values[(values >= 0.0) & (values <= x_max_ms)]
+            edges = np.arange(0.0, x_max_ms + bin_ms * 1.1, bin_ms)
+            counts, edges = np.histogram(visible_values, bins=edges)
+            latency_ax.bar(edges[:-1], counts, width=np.diff(edges), align="edge", color="#dc2626", alpha=0.82)
+            if visible_values.size:
+                median = float(np.median(visible_values))
+                latency_ax.axvline(median, color="#111827", linewidth=1.1, linestyle="--", label=f"median {median:.2f} ms")
+            peak = float(self.analysis.get("peak_by_electrode", {}).get(str(self.selected_electrode), float("nan")))
+            if np.isfinite(peak) and 0.0 <= peak <= x_max_ms:
+                latency_ax.axvline(peak, color="#7c3aed", linewidth=1.1, linestyle="-.", label=f"peak {peak:.2f} ms")
+            if visible_values.size or (np.isfinite(peak) and 0.0 <= peak <= x_max_ms):
+                latency_ax.legend(loc="best", fontsize=7, frameon=False)
+            latency_ax.set_xlim(0.0, x_max_ms)
+        else:
+            text = "Select an electrode" if not self.selected_electrode else "No first-time latency for selected electrode"
+            latency_ax.text(0.5, 0.5, text, ha="center", va="center", fontsize=9, wrap=True)
+            latency_ax.set_xticks([])
+            latency_ax.set_yticks([])
+        latency_ax.set_title("Selected first-time latency")
+        latency_ax.set_xlabel("First spike latency in burst (ms)")
+        latency_ax.set_ylabel("Bursts")
+
+    def _draw_degree_plot(self):
+        degree_ax = self._degree_ax
+        if degree_ax is None:
+            return
+        cache = self._side_plot_cache if isinstance(self._side_plot_cache, dict) else {}
+        degree_ax.clear()
+        labels = list(cache.get("degree_labels", []))
+        out_values = np.asarray(cache.get("degree_out", []), dtype=float)
+        in_values = np.asarray(cache.get("degree_in", []), dtype=float)
+        if labels and out_values.size == len(labels) and in_values.size == len(labels):
+            xs = np.arange(len(labels), dtype=float)
+            degree_ax.bar(xs - 0.18, out_values, width=0.34, color="#16a34a", label="out")
+            degree_ax.bar(xs + 0.18, in_values, width=0.34, color="#2563eb", label="in")
+            degree_ax.set_xticks(xs)
+            degree_ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+            degree_ax.legend(loc="best", fontsize=7, frameon=False)
+        else:
+            degree_ax.text(0.5, 0.5, "No directed connections", ha="center", va="center", fontsize=9)
+            degree_ax.set_xticks([])
+            degree_ax.set_yticks([])
+        degree_ax.set_title("Top connection degrees")
+        degree_ax.set_ylabel("Degree")
+
+    def _nearest_electrode(self, event) -> str | None:
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return None
+        points = self.map_state.get("point_lookup", []) if isinstance(self.map_state, dict) else []
+        if not points:
+            return None
+        xs = np.asarray([float(point.get("x", 0.0)) for point in points], dtype=float)
+        ys = np.asarray([float(point.get("y", 0.0)) for point in points], dtype=float)
+        dx = xs - float(event.xdata)
+        dy = ys - float(event.ydata)
+        distances = dx * dx + dy * dy
+        index = int(np.argmin(distances))
+        xlim = event.inaxes.get_xlim()
+        ylim = event.inaxes.get_ylim()
+        span = max(abs(float(xlim[1]) - float(xlim[0])), abs(float(ylim[1]) - float(ylim[0])), 1e-9)
+        threshold = max(0.012, span * 0.018)
+        if float(distances[index]) <= threshold * threshold:
+            return str(points[index].get("electrode"))
+        return None
+
+    def _is_map_event(self, event) -> bool:
+        return self._map_ax is not None and event is not None and event.inaxes is self._map_ax
+
+    def _on_map_press(self, event):
+        if not self._is_map_event(event) or getattr(event, "button", None) != 1:
+            self._map_pan_start = None
+            self._map_is_panning = False
+            return
+        ax = self._map_ax
+        if ax is None:
+            return
+        self._map_pan_start = {
+            "x": float(getattr(event, "x", 0.0)),
+            "y": float(getattr(event, "y", 0.0)),
+            "xlim": tuple(float(value) for value in ax.get_xlim()),
+            "ylim": tuple(float(value) for value in ax.get_ylim()),
+            "bbox_width": max(float(ax.bbox.width), 1.0),
+            "bbox_height": max(float(ax.bbox.height), 1.0),
+        }
+        self._map_is_panning = False
+
+    def _on_map_motion(self, event):
+        start = self._map_pan_start
+        ax = self._map_ax
+        if start is None or ax is None or getattr(event, "button", None) not in {1, None}:
+            return
+        dx_px = float(getattr(event, "x", start["x"])) - float(start["x"])
+        dy_px = float(getattr(event, "y", start["y"])) - float(start["y"])
+        if not self._map_is_panning and float(np.hypot(dx_px, dy_px)) < 4.0:
+            return
+        self._map_is_panning = True
+        xlim = start["xlim"]
+        ylim = start["ylim"]
+        dx_data = dx_px * (float(xlim[1]) - float(xlim[0])) / float(start["bbox_width"])
+        dy_data = dy_px * (float(ylim[1]) - float(ylim[0])) / float(start["bbox_height"])
+        new_xlim = (float(xlim[0]) - dx_data, float(xlim[1]) - dx_data)
+        new_ylim = (float(ylim[0]) - dy_data, float(ylim[1]) - dy_data)
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self._saved_limits = (new_xlim, new_ylim)
+        self.canvas.draw_idle()
+
+    def _on_map_release(self, event):
+        was_panning = bool(self._map_is_panning)
+        self._map_is_panning = False
+        self._map_pan_start = None
+        if was_panning or not self._is_map_event(event) or getattr(event, "button", None) != 1:
+            return
+        electrode = self._nearest_electrode(event)
+        if electrode is None:
+            return
+        self.selected_electrode = str(electrode)
+        if str(self.arrow_mode.currentData() or "all") == "selected":
+            self._saved_limits = (event.inaxes.get_xlim(), event.inaxes.get_ylim())
+        self._draw_map_only(draw=False)
+        self._draw_latency_plot()
+        self.canvas.draw_idle()
+
+    def _on_scroll(self, event):
+        if not self._is_map_event(event) or event.xdata is None or event.ydata is None:
+            return
+        ax = event.inaxes
+        scale = 0.82 if getattr(event, "button", "") == "up" else 1.22
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        cx = float(event.xdata)
+        cy = float(event.ydata)
+        new_xlim = (cx + (xlim[0] - cx) * scale, cx + (xlim[1] - cx) * scale)
+        new_ylim = (cy + (ylim[0] - cy) * scale, cy + (ylim[1] - cy) * scale)
+        self._saved_limits = (new_xlim, new_ylim)
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def _reset_view(self):
+        self._saved_limits = None
+        self._draw()
+
+    def _select_from_input(self):
+        text = str(self.select_input.text() or "").strip()
+        if not text:
+            return
+        positions = self.map_state.get("positions", {}) if isinstance(self.map_state, dict) else {}
+        lookup = self.map_state.get("lookup", {}) if isinstance(self.map_state, dict) else {}
+        resolved = _resolve_channel_map_electrode(text, lookup, positions)
+        if resolved is None:
+            channel_to_electrode = self.analysis.get("channel_to_electrode", {}) or {}
+            resolved = channel_to_electrode.get(text)
+            if resolved is None:
+                normalized = normalize_channel_name(text)
+                for channel, electrode in channel_to_electrode.items():
+                    if normalize_channel_name(channel) == normalized:
+                        resolved = electrode
+                        break
+        if resolved is None:
+            _show_info_message(self, "Stable delay map", f"Could not find electrode or channel: {text}")
+            return
+        self.selected_electrode = str(resolved)
+        self.arrow_mode.setCurrentIndex(max(0, self.arrow_mode.findData("selected")))
+        self._draw_map_only(draw=False)
+        self._draw_latency_plot()
+        self.canvas.draw_idle()
+
+
 class BurstTrajectoryWindow(AppDialog):
     def __init__(
         self,
@@ -9628,6 +11742,8 @@ class BurstTrajectoryWindow(AppDialog):
         self.normalized_time_button.clicked.connect(self._show_normalized_time_analysis)
         self.spatial_temporal_button = QPushButton("Spatial-temporal")
         self.spatial_temporal_button.clicked.connect(self._show_spatial_temporal_analysis)
+        self.stable_delay_map_button = QPushButton("Stable Delay Map")
+        self.stable_delay_map_button.clicked.connect(self._show_stable_delay_map)
         self.summary = QLabel("Ready")
         self.summary.setObjectName("MutedText")
         self.raster_canvas = FigureCanvas(Figure(figsize=(9, 5.8), tight_layout=True))
@@ -9669,6 +11785,7 @@ class BurstTrajectoryWindow(AppDialog):
         action_row.addWidget(self.trajectory_analysis_button)
         action_row.addWidget(self.normalized_time_button)
         action_row.addWidget(self.spatial_temporal_button)
+        action_row.addWidget(self.stable_delay_map_button)
         action_row.addItem(QSpacerItem(20, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
         controls_layout.addLayout(action_row)
 
@@ -11262,6 +13379,29 @@ class BurstTrajectoryWindow(AppDialog):
         self._spatial_temporal_cache_signature = signature
         self._spatial_temporal_cache = result
         return result
+
+    def _show_stable_delay_map(self):
+        if not self.spike_series:
+            _show_info_message(self, "Stable delay map", "No spike data is available.")
+            return
+        progress = _create_progress_dialog(self, "Stable delay map", "Detecting stable activation delays...", 0) if _progress_enabled_for_widget(self) else None
+        if progress is not None:
+            QApplication.processEvents()
+        try:
+            window = StableDelayMapWindow(self.spike_series, self.channel_map, self)
+        except Exception as exc:
+            _close_progress_dialog(progress)
+            _show_error_message(self, "Stable delay map", str(exc))
+            return
+        _close_progress_dialog(progress)
+        self.metric_windows.append(window)
+
+        def _forget_window(_obj=None, dialog=window):
+            if dialog in self.metric_windows:
+                self.metric_windows.remove(dialog)
+
+        window.destroyed.connect(_forget_window)
+        window.show()
 
     def _show_spatial_temporal_analysis(self):
         progress = _create_progress_dialog(self, "Spatial-temporal analysis", "Detecting regions and propagation delays...", 0) if _progress_enabled_for_widget(self) else None
@@ -16521,6 +18661,18 @@ class StimulusBlockPhase:
     name: str
     electrode_group: str
     protocol: str
+    event_group: str = ""
+
+
+@dataclass
+class StimulusEventGroup:
+    name: str
+    electrode_group: str
+    electrode_groups: list[str] = field(default_factory=list)
+    switch_enabled: bool = False
+    selection_mode: str = "balanced_random_groups"
+    event_groups: list[list[int]] = field(default_factory=list)
+    event_group_centers: list[int | None] = field(default_factory=list)
 
 
 class StimulusGenerationDialog(AppDialog):
@@ -16534,6 +18686,9 @@ class StimulusGenerationDialog(AppDialog):
         self.channel_map = channel_map
         self.info = stimulus_builder.ExperimentInfo()
         self.groups: list[stimulus_builder.ElectrodeGroup] = []
+        self.event_groups: list[StimulusEventGroup] = []
+        self._event_subgroup_order: list[str] = []
+        self._syncing_group_checks = False
         self.protocols: list[stimulus_builder.StimulusProtocol] = []
         self.protocol_source_paths: dict[str, str] = {}
         self.block_phases: list[StimulusBlockPhase] = []
@@ -16682,6 +18837,7 @@ class StimulusGenerationDialog(AppDialog):
         self.group_table.setHorizontalHeaderLabels(["Group", "Electrodes"])
         self.group_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.group_table.itemSelectionChanged.connect(self._load_selected_group)
+        self.group_table.itemChanged.connect(self._group_check_item_changed)
         left.addWidget(self.group_table, 1)
         layout.addLayout(left, 1)
 
@@ -16692,9 +18848,36 @@ class StimulusGenerationDialog(AppDialog):
         edit_layout.setSpacing(8)
         self.group_name = QLineEdit()
         self.group_electrodes = QLineEdit()
+        self.group_center_electrode = QLineEdit()
+        self.group_center_electrode.setPlaceholderText("Optional center electrode")
+        self.group_center_build = QPushButton("Auto 4 from center")
+        self.group_center_build.clicked.connect(lambda: self._build_centered_site_group("group"))
+        self.group_site_switch = NoWheelComboBox()
+        self.group_site_switch.addItems(["Off", "On"])
+        self.group_site_switch.currentIndexChanged.connect(lambda *_: self._update_group_switch_fields())
+        self.group_event_count = QLineEdit("10")
+        self.group_event_interval_ms = QLineEdit("1000")
+        self.group_event_electrodes = QLineEdit("1")
+        self.group_event_selection = NoWheelComboBox()
+        self.group_event_selection.addItem("Balanced random groups", "balanced_random_groups")
+        self.group_event_selection.addItem("Sequential groups", "sequence_groups")
+        self.group_event_selection.addItem("Use listed groups once", "explicit")
+        self.group_event_selection.addItem("Random electrodes", "random")
+        self.group_event_selection.addItem("Cycle electrodes", "cycle")
+        self.group_event_selection.addItem("All pool electrodes", "all")
+        self.group_event_groups = QTextEdit()
+        self.group_event_groups.setMaximumHeight(72)
+        self.group_event_groups.setPlaceholderText("Optional base event groups, one per line or separated by |")
         form = QFormLayout()
         form.addRow("Group name", self.group_name)
         form.addRow("Electrodes", self.group_electrodes)
+        center_row = QWidget()
+        center_layout = QHBoxLayout(center_row)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+        center_layout.addWidget(self.group_center_electrode, 1)
+        center_layout.addWidget(self.group_center_build)
+        form.addRow("Center", center_row)
         edit_layout.addLayout(form)
         buttons = QHBoxLayout()
         save = QPushButton("Add")
@@ -16706,6 +18889,8 @@ class StimulusGenerationDialog(AppDialog):
         edit_layout.addLayout(buttons)
         edit_layout.addStretch(1)
         layout.addWidget(editor)
+        self.group_site_switch.setCurrentText("Off")
+        self._update_group_switch_fields()
 
     def _build_protocols_tab(self) -> None:
         layout = QHBoxLayout(self.protocols_tab)
@@ -16785,10 +18970,6 @@ class StimulusGenerationDialog(AppDialog):
             "start_ms",
             "channel",
             "poisson_duration_s",
-            "pool_event_count",
-            "pool_event_interval_ms",
-            "pool_electrodes_per_event",
-            "pool_selection_mode",
         }
         compact_rows = [
             ("Amplitude mV", "amplitude_mv"),
@@ -16803,14 +18984,9 @@ class StimulusGenerationDialog(AppDialog):
             ("Start ms", "start_ms"),
             ("DAC channel", "channel"),
             ("Poisson duration s", "poisson_duration_s"),
-            ("Pool events", "pool_event_count"),
-            ("Pool interval ms", "pool_event_interval_ms"),
-            ("Electrodes/stim", "pool_electrodes_per_event"),
-            ("Pool select", "pool_selection_mode"),
         ]
         option_rows = {
             "randomize_burst_pulse_intervals": [("Off", "false"), ("On", "true")],
-            "pool_selection_mode": [("Random", "random"), ("Cycle", "cycle"), ("All", "all")],
         }
         for index, (label, key) in enumerate(compact_rows):
             if key in option_rows:
@@ -16882,8 +19058,8 @@ class StimulusGenerationDialog(AppDialog):
         edit_layout.addWidget(self.custom_points)
         self.pool_event_groups = QTextEdit()
         self.pool_event_groups.setMaximumHeight(64)
-        self.pool_event_groups.setPlaceholderText("Optional: one event per line or separated by |, e.g. 7317,7318 | 7420,7421")
-        self.pool_event_groups_label = QLabel("Per-stim electrodes")
+        self.pool_event_groups.setPlaceholderText("Optional base groups: one group per line or separated by |. Counts are balanced from the protocol pulse/burst count.")
+        self.pool_event_groups_label = QLabel("Base event groups")
         edit_layout.addWidget(self.pool_event_groups_label)
         edit_layout.addWidget(self.pool_event_groups)
         buttons = QHBoxLayout()
@@ -16910,7 +19086,7 @@ class StimulusGenerationDialog(AppDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
         left = QVBoxLayout()
-        hint = QLabel("Blocks combine one electrode group, one protocol, and the fixed pre/stim/post phases written into the generated run package.")
+        hint = QLabel("Blocks combine one event group, one protocol, and the fixed pre/stim/post phases written into the generated run package.")
         hint.setObjectName("MutedText")
         hint.setWordWrap(True)
         left.addWidget(hint)
@@ -16918,8 +19094,8 @@ class StimulusGenerationDialog(AppDialog):
         self.block_table.setHorizontalHeaderLabels(["Block", "Mode", "Group", "Protocol"])
         self.block_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.block_table.itemSelectionChanged.connect(self._load_selected_block)
-        self.block_phase_table = QTableWidget(0, 3)
-        self.block_phase_table.setHorizontalHeaderLabels(["Phase", "Group", "Protocol"])
+        self.block_phase_table = QTableWidget(0, 4)
+        self.block_phase_table.setHorizontalHeaderLabels(["Phase", "Event group", "Electrode group", "Protocol"])
         self.block_phase_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.block_phase_table.itemSelectionChanged.connect(self._load_selected_block_phase)
         left.addWidget(QLabel("Block phases"))
@@ -17061,15 +19237,29 @@ class StimulusGenerationDialog(AppDialog):
         site_layout = QGridLayout(site_box)
         site_layout.setContentsMargins(8, 8, 8, 8)
         self.preview_group_name = QLineEdit()
-        self.preview_group_name.setPlaceholderText("electrode group name")
+        self.preview_group_name.setPlaceholderText("site_group")
         self.preview_group_electrodes = QLineEdit()
         self.preview_group_electrodes.setPlaceholderText("e.g. 7317, 7318, 7319")
+        self.preview_group_center_electrode = QLineEdit()
+        self.preview_group_center_electrode.setPlaceholderText("Optional center electrode")
+        self.preview_group_center_build = QPushButton("Auto 4")
+        self.preview_group_center_build.setToolTip("Use the center electrode plus the 3 nearest recording electrodes in the CFG/channel map.")
+        self.preview_group_center_build.clicked.connect(lambda: self._build_centered_site_group("preview"))
         self.preview_group_name.textChanged.connect(self._preview_site_fields_changed)
         self.preview_group_electrodes.textChanged.connect(self._preview_site_fields_changed)
+        self.preview_group_center_electrode.textChanged.connect(self._preview_site_fields_changed)
         site_layout.addWidget(self._required_label("Group"), 0, 0)
         site_layout.addWidget(self.preview_group_name, 0, 1)
         site_layout.addWidget(self._required_label("Electrodes"), 1, 0)
         site_layout.addWidget(self.preview_group_electrodes, 1, 1)
+        center_row = QWidget()
+        center_layout = QHBoxLayout(center_row)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+        center_layout.addWidget(self.preview_group_center_electrode, 1)
+        center_layout.addWidget(self.preview_group_center_build)
+        site_layout.addWidget(QLabel("Center"), 2, 0)
+        site_layout.addWidget(center_row, 2, 1)
         workflow.addWidget(site_box)
         site_library = QFrame()
         site_library.setObjectName("Panel")
@@ -17091,6 +19281,87 @@ class StimulusGenerationDialog(AppDialog):
         site_buttons.addWidget(remove_site)
         site_buttons.addStretch(1)
         workflow.addLayout(site_buttons)
+
+        event_step = QLabel("3. Event group")
+        event_step.setObjectName("SectionTitle")
+        workflow.addWidget(event_step)
+        event_box = QFrame()
+        event_box.setObjectName("Panel")
+        event_layout = QGridLayout(event_box)
+        event_layout.setContentsMargins(8, 8, 8, 8)
+        event_layout.setHorizontalSpacing(6)
+        event_layout.setVerticalSpacing(5)
+        self.event_group_name = QLineEdit()
+        self.event_group_name.setPlaceholderText("event_group")
+        self.event_base_group_hint = QLabel("Check one or more groups in Site library.")
+        self.event_base_group_hint.setObjectName("MutedText")
+        self.event_base_group_hint.setWordWrap(True)
+        self.event_switch_combo = NoWheelComboBox()
+        self.event_switch_combo.addItem("Off: all events use selected electrode group", "off")
+        self.event_switch_combo.addItem("On: switch electrode groups per event", "on")
+        self.event_switch_combo.currentIndexChanged.connect(lambda *_: self._update_event_group_switch_fields())
+        self.event_selection = NoWheelComboBox()
+        self.event_selection.addItem("Balanced random groups", "balanced_random_groups")
+        self.event_selection.addItem("Sequential groups", "sequence_groups")
+        self.event_selection_label = QLabel("Selection")
+        self.event_subgroup_label = QLabel("Event subgroups")
+        self.event_subgroup_hint = QLabel("Checked site groups are added here automatically. Use Up/Down to control sequence order.")
+        self.event_subgroup_hint.setObjectName("MutedText")
+        self.event_subgroup_hint.setWordWrap(True)
+        self.event_subgroup_table = QTableWidget(0, 3)
+        self.event_subgroup_table.setHorizontalHeaderLabels(["#", "Subgroup", "Electrodes"])
+        self.event_subgroup_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.event_subgroup_table.setMinimumHeight(86)
+        self.event_subgroup_table.setMaximumHeight(124)
+        self.event_subgroup_up = QPushButton("Up")
+        self.event_subgroup_down = QPushButton("Down")
+        self.event_subgroup_up.clicked.connect(lambda *_: self._move_event_subgroup(-1))
+        self.event_subgroup_down.clicked.connect(lambda *_: self._move_event_subgroup(1))
+        subgroup_buttons = QHBoxLayout()
+        subgroup_buttons.addWidget(self.event_subgroup_up)
+        subgroup_buttons.addWidget(self.event_subgroup_down)
+        subgroup_buttons.addStretch(1)
+        subgroup_box = QVBoxLayout()
+        subgroup_box.setContentsMargins(0, 0, 0, 0)
+        subgroup_box.setSpacing(4)
+        subgroup_box.addWidget(self.event_subgroup_hint)
+        subgroup_box.addWidget(self.event_subgroup_table)
+        subgroup_box.addLayout(subgroup_buttons)
+        event_layout.addWidget(self._required_label("Event group"), 0, 0)
+        event_layout.addWidget(self.event_group_name, 0, 1)
+        event_layout.addWidget(self._required_label("Source groups"), 1, 0)
+        event_layout.addWidget(self.event_base_group_hint, 1, 1)
+        event_layout.addWidget(QLabel("Switch"), 2, 0)
+        event_layout.addWidget(self.event_switch_combo, 2, 1)
+        event_layout.addWidget(self.event_selection_label, 3, 0)
+        event_layout.addWidget(self.event_selection, 3, 1)
+        event_layout.addWidget(self.event_subgroup_label, 4, 0)
+        event_layout.addLayout(subgroup_box, 4, 1)
+        workflow.addWidget(event_box)
+        event_library = QFrame()
+        event_library.setObjectName("Panel")
+        event_library_layout = QVBoxLayout(event_library)
+        event_library_layout.setContentsMargins(8, 8, 8, 8)
+        event_library_layout.addWidget(QLabel("Event group library"))
+        self.event_group_table = QTableWidget(0, 4)
+        self.event_group_table.setHorizontalHeaderLabels(["Event group", "Source groups", "Switch", "Mode"])
+        self.event_group_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.event_group_table.itemSelectionChanged.connect(self._load_selected_event_group)
+        self.event_group_table.setMinimumHeight(120)
+        self.event_group_table.setMaximumHeight(146)
+        event_library_layout.addWidget(self.event_group_table)
+        workflow.addWidget(event_library)
+        event_buttons = QHBoxLayout()
+        add_event_group = QPushButton("Add")
+        add_event_group.clicked.connect(self._save_event_group_from_settings)
+        remove_event_group = QPushButton("Remove")
+        remove_event_group.clicked.connect(self._remove_event_group)
+        self.settings_event_group_add_button = add_event_group
+        self.settings_event_group_remove_button = remove_event_group
+        event_buttons.addWidget(add_event_group)
+        event_buttons.addWidget(remove_event_group)
+        event_buttons.addStretch(1)
+        workflow.addLayout(event_buttons)
 
         action_row = QHBoxLayout()
         save_phase = QPushButton("Save block phase")
@@ -17169,6 +19440,7 @@ class StimulusGenerationDialog(AppDialog):
         preview_stack.addWidget(self.preview_distribution_canvas, 1)
         right.addLayout(preview_stack, 1)
         layout.addLayout(right, 2)
+        self._update_event_group_switch_fields()
 
     def _build_generate_tab(self) -> None:
         layout = QVBoxLayout(self.generate_tab)
@@ -17268,6 +19540,7 @@ class StimulusGenerationDialog(AppDialog):
 
     def _refresh_all(self) -> None:
         self._refresh_group_table()
+        self._refresh_event_group_table()
         self._refresh_protocol_table()
         self._refresh_block_phase_table()
         self._refresh_block_table()
@@ -17282,6 +19555,8 @@ class StimulusGenerationDialog(AppDialog):
             self._fill_group_form(self.groups[0])
         else:
             self._fill_default_group_form()
+        if hasattr(self, "event_group_name") and not self.event_group_name.text().strip():
+            self.event_group_name.setText(self._next_event_group_name())
         if self.blocks:
             self._fill_block_form(self.blocks[0])
 
@@ -17289,23 +19564,42 @@ class StimulusGenerationDialog(AppDialog):
         self._fill_protocol_form(stimulus_builder.StimulusProtocol(stimulus_builder._default_protocol_name("single_pulse"), "single_pulse"))
 
     def _fill_default_group_form(self) -> None:
-        default_group = stimulus_builder.ElectrodeGroup("new_group", self._default_electrodes())
+        default_group = stimulus_builder.ElectrodeGroup(self._next_site_group_name(), self._default_electrodes())
         self.group_name.setText(default_group.name)
         self.group_electrodes.setText(", ".join(str(item) for item in default_group.electrodes))
+        if hasattr(self, "group_center_electrode"):
+            self.group_center_electrode.clear()
         if hasattr(self, "preview_group_name"):
             self.preview_group_name.blockSignals(True)
             self.preview_group_electrodes.blockSignals(True)
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.blockSignals(True)
             self.preview_group_name.setText(default_group.name)
             self.preview_group_electrodes.setText(", ".join(str(item) for item in default_group.electrodes))
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.clear()
+                self.preview_group_center_electrode.blockSignals(False)
             self.preview_group_name.blockSignals(False)
             self.preview_group_electrodes.blockSignals(False)
 
     def _refresh_group_table(self) -> None:
+        checked = set(self._checked_group_names()) if hasattr(self, "group_table") else set()
+        self._syncing_group_checks = True
+        self.group_table.blockSignals(True)
         self.group_table.setRowCount(len(self.groups))
         for row, group in enumerate(self.groups):
-            self.group_table.setItem(row, 0, QTableWidgetItem(group.name))
-            self.group_table.setItem(row, 1, QTableWidgetItem(", ".join(str(item) for item in group.electrodes)))
+            name_item = QTableWidgetItem(group.name)
+            name_item.setFlags(name_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            name_item.setCheckState(Qt.CheckState.Checked if group.name in checked else Qt.CheckState.Unchecked)
+            self.group_table.setItem(row, 0, name_item)
+            center = getattr(group, "center_electrode", None)
+            suffix = f" | center {center}" if center is not None else ""
+            self.group_table.setItem(row, 1, QTableWidgetItem(", ".join(str(item) for item in group.electrodes) + suffix))
+        self.group_table.blockSignals(False)
+        self._syncing_group_checks = False
         self.group_table.resizeColumnsToContents()
+        self._refresh_event_group_combos()
+        self._sync_event_subgroups_from_checked_groups()
 
     def _refresh_protocol_table(self) -> None:
         self.protocol_table.setRowCount(len(self.protocols))
@@ -17326,9 +19620,129 @@ class StimulusGenerationDialog(AppDialog):
     def _refresh_block_phase_table(self) -> None:
         self.block_phase_table.setRowCount(len(self.block_phases))
         for row, phase in enumerate(self.block_phases):
-            for column, value in enumerate([phase.name, phase.electrode_group, phase.protocol]):
+            event_group = getattr(phase, "event_group", "") or phase.electrode_group
+            for column, value in enumerate([phase.name, event_group, phase.electrode_group, phase.protocol]):
                 self.block_phase_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.block_phase_table.resizeColumnsToContents()
+
+    def _refresh_event_group_table(self) -> None:
+        if not hasattr(self, "event_group_table"):
+            return
+        self.event_group_table.setRowCount(len(self.event_groups))
+        for row, event_group in enumerate(self.event_groups):
+            switch_text = "On" if event_group.switch_enabled else "Off"
+            mode = event_group.selection_mode if event_group.switch_enabled else "single group"
+            source_groups = ", ".join(self._event_group_source_names(event_group))
+            for column, value in enumerate([event_group.name, source_groups, switch_text, mode]):
+                self.event_group_table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.event_group_table.resizeColumnsToContents()
+
+    def _refresh_event_group_combos(self) -> None:
+        return
+
+    def _group_check_item_changed(self, item: QTableWidgetItem) -> None:
+        if getattr(self, "_syncing_group_checks", False):
+            return
+        if item is None or item.column() != 0:
+            return
+        self._sync_event_subgroups_from_checked_groups()
+
+    def _checked_group_names(self) -> list[str]:
+        if not hasattr(self, "group_table"):
+            return []
+        names: list[str] = []
+        for row, group in enumerate(self.groups):
+            item = self.group_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                names.append(group.name)
+        return names
+
+    def _set_checked_group_names(self, names: list[str]) -> None:
+        if not hasattr(self, "group_table"):
+            return
+        targets = {str(name).strip().lower() for name in names}
+        self._syncing_group_checks = True
+        self.group_table.blockSignals(True)
+        for row, group in enumerate(self.groups):
+            item = self.group_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if str(group.name).strip().lower() in targets
+                    else Qt.CheckState.Unchecked
+                )
+        self.group_table.blockSignals(False)
+        self._syncing_group_checks = False
+        self._event_subgroup_order = [
+            group.name
+            for name in names
+            for group in self.groups
+            if str(group.name).strip().lower() == str(name).strip().lower()
+        ]
+        self._sync_event_subgroups_from_checked_groups()
+
+    def _sync_event_subgroups_from_checked_groups(self) -> None:
+        if not hasattr(self, "event_subgroup_table"):
+            return
+        checked = self._checked_group_names()
+        checked_keys = {name.strip().lower() for name in checked}
+        existing_order = [
+            name
+            for name in getattr(self, "_event_subgroup_order", [])
+            if name.strip().lower() in checked_keys
+        ]
+        existing_keys = {name.strip().lower() for name in existing_order}
+        for name in checked:
+            if name.strip().lower() not in existing_keys:
+                existing_order.append(name)
+        self._event_subgroup_order = existing_order
+        self._refresh_event_subgroup_table()
+
+    def _event_subgroup_names(self) -> list[str]:
+        if not hasattr(self, "event_subgroup_table"):
+            return self._checked_group_names()
+        checked = {name.strip().lower() for name in self._checked_group_names()}
+        ordered = [
+            name
+            for name in getattr(self, "_event_subgroup_order", [])
+            if name.strip().lower() in checked
+        ]
+        seen = {name.strip().lower() for name in ordered}
+        for name in self._checked_group_names():
+            key = name.strip().lower()
+            if key not in seen:
+                ordered.append(name)
+                seen.add(key)
+        return ordered
+
+    def _refresh_event_subgroup_table(self) -> None:
+        if not hasattr(self, "event_subgroup_table"):
+            return
+        names = self._event_subgroup_names()
+        self.event_subgroup_table.setRowCount(len(names))
+        for row, name in enumerate(names):
+            group = self._group_by_name(name)
+            electrodes = ", ".join(str(item) for item in getattr(group, "electrodes", []) or []) if group is not None else ""
+            for column, value in enumerate([row + 1, name, electrodes]):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.event_subgroup_table.setItem(row, column, item)
+        self.event_subgroup_table.resizeColumnsToContents()
+
+    def _move_event_subgroup(self, delta: int) -> None:
+        if not hasattr(self, "event_subgroup_table"):
+            return
+        row = self._selected_table_row(self.event_subgroup_table)
+        names = self._event_subgroup_names()
+        if row is None or not (0 <= row < len(names)):
+            return
+        target = row + int(delta)
+        if target < 0 or target >= len(names):
+            return
+        names[row], names[target] = names[target], names[row]
+        self._event_subgroup_order = names
+        self._refresh_event_subgroup_table()
+        self.event_subgroup_table.selectRow(target)
 
     def _refresh_block_combos(self) -> None:
         current_phase = self.block_phase_combo.currentData()
@@ -17345,6 +19759,7 @@ class StimulusGenerationDialog(AppDialog):
             self.block_protocol.addItem(protocol.name, protocol.name)
         self._set_combo_data(self.block_phase_combo, current_phase)
         self.block_phase_combo.blockSignals(False)
+        self._refresh_event_group_combos()
         if self.block_phase_combo.currentIndex() < 0 and self.block_phase_combo.count() > 0:
             self.block_phase_combo.setCurrentIndex(0)
         self._block_phase_combo_changed()
@@ -17401,6 +19816,11 @@ class StimulusGenerationDialog(AppDialog):
         if row is not None and 0 <= row < len(self.groups):
             self._fill_group_form(self.groups[row])
 
+    def _load_selected_event_group(self) -> None:
+        row = self._selected_table_row(self.event_group_table) if hasattr(self, "event_group_table") else None
+        if row is not None and 0 <= row < len(self.event_groups):
+            self._fill_event_group_form(self.event_groups[row])
+
     def _load_selected_protocol(self) -> None:
         row = self._selected_table_row(self.protocol_table)
         if row is not None and 0 <= row < len(self.protocols):
@@ -17451,13 +19871,227 @@ class StimulusGenerationDialog(AppDialog):
     def _fill_group_form(self, group) -> None:
         self.group_name.setText(group.name)
         self.group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+        center_electrode = getattr(group, "center_electrode", None)
+        if hasattr(self, "group_center_electrode"):
+            self.group_center_electrode.setText("" if center_electrode is None else str(center_electrode))
+        self._set_combo_data(self.group_site_switch, "On" if bool(getattr(group, "site_switch_enabled", False)) else "Off")
+        self.group_event_count.setText(str(getattr(group, "pool_event_count", 10)))
+        self.group_event_interval_ms.setText(str(getattr(group, "pool_event_interval_ms", 1000.0)))
+        self.group_event_electrodes.setText(str(getattr(group, "pool_electrodes_per_event", 1)))
+        self._set_combo_data(self.group_event_selection, str(getattr(group, "pool_selection_mode", "balanced_random_groups")))
+        self.group_event_groups.setPlainText(
+            "\n".join(
+                ", ".join(str(item) for item in subgroup)
+                for subgroup in getattr(group, "pool_event_groups", []) or []
+            )
+        )
+        self._update_group_switch_fields()
         if hasattr(self, "preview_group_name"):
             self.preview_group_name.blockSignals(True)
             self.preview_group_electrodes.blockSignals(True)
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.blockSignals(True)
             self.preview_group_name.setText(group.name)
             self.preview_group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.setText("" if center_electrode is None else str(center_electrode))
+                self.preview_group_center_electrode.blockSignals(False)
             self.preview_group_name.blockSignals(False)
             self.preview_group_electrodes.blockSignals(False)
+        if hasattr(self, "group_table"):
+            checked = self._checked_group_names()
+            if not checked:
+                self._set_checked_group_names([group.name])
+
+    def _event_switch_enabled(self) -> bool:
+        if not hasattr(self, "event_switch_combo"):
+            return False
+        value = self.event_switch_combo.currentData()
+        if value is None:
+            value = self.event_switch_combo.currentText()
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _update_event_group_switch_fields(self) -> None:
+        if not hasattr(self, "event_selection"):
+            return
+        enabled = self._event_switch_enabled()
+        for widget in [
+            self.event_selection_label,
+            self.event_selection,
+            self.event_subgroup_label,
+            self.event_subgroup_hint,
+            self.event_subgroup_table,
+            self.event_subgroup_up,
+            self.event_subgroup_down,
+        ]:
+            widget.setVisible(enabled)
+
+    def _event_group_by_name(self, name: str):
+        target = str(name or "").strip().lower()
+        return next((event_group for event_group in self.event_groups if str(event_group.name).strip().lower() == target), None)
+
+    @staticmethod
+    def _event_group_source_names(event_group: StimulusEventGroup) -> list[str]:
+        names = [str(name).strip() for name in getattr(event_group, "electrode_groups", []) or [] if str(name).strip()]
+        if not names and str(getattr(event_group, "electrode_group", "") or "").strip():
+            names = [str(event_group.electrode_group).strip()]
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in names:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(name)
+        return ordered
+
+    def _source_groups_for_event_group(self, event_group: StimulusEventGroup) -> list:
+        source_groups = []
+        for name in self._event_group_source_names(event_group):
+            group = self._group_by_name(name)
+            if group is not None:
+                source_groups.append(group)
+        return source_groups
+
+    def _electrodes_for_event_group(self, event_group: StimulusEventGroup) -> list[int]:
+        electrodes: list[int] = []
+        seen: set[int] = set()
+        for group in self._source_groups_for_event_group(event_group):
+            for electrode in getattr(group, "electrodes", []) or []:
+                value = int(electrode)
+                if value not in seen:
+                    seen.add(value)
+                    electrodes.append(value)
+        return electrodes
+
+    def _effective_group_name_for_event_group(self, event_group_name: str, source_names: list[str]) -> str:
+        if len(source_names) == 1:
+            return source_names[0]
+        base = re.sub(r"[^A-Za-z0-9_]+", "_", str(event_group_name)).strip("_") or "event_group"
+        return f"{base}_site_union"
+
+    def _ensure_event_group_electrode_group(self, event_group: StimulusEventGroup) -> None:
+        electrodes = self._electrodes_for_event_group(event_group)
+        if not electrodes:
+            raise ValueError("Event group source groups do not contain stimulation electrodes")
+        group_name = str(event_group.electrode_group or "").strip()
+        if not group_name:
+            raise ValueError("Event group has no effective electrode group")
+        existing = self._group_by_name(group_name)
+        source_names = self._event_group_source_names(event_group)
+        source_centers = [
+            getattr(group, "center_electrode", None)
+            for group in self._source_groups_for_event_group(event_group)
+            if getattr(group, "center_electrode", None) is not None
+        ]
+        union_center = int(source_centers[0]) if source_centers else None
+        if existing is None:
+            self.groups.append(stimulus_builder.ElectrodeGroup(group_name, electrodes, center_electrode=union_center))
+        elif group_name not in source_names:
+            if list(getattr(existing, "electrodes", []) or []) != electrodes:
+                existing.electrodes = electrodes
+            if getattr(existing, "center_electrode", None) != union_center:
+                existing.center_electrode = union_center
+
+    def _fill_event_group_form(self, event_group: StimulusEventGroup) -> None:
+        self.event_group_name.setText(event_group.name)
+        self._set_checked_group_names(self._event_group_source_names(event_group))
+        self._event_subgroup_order = self._event_group_source_names(event_group)
+        self._refresh_event_subgroup_table()
+        self._set_combo_data(self.event_switch_combo, "on" if event_group.switch_enabled else "off")
+        self._set_combo_data(self.event_selection, event_group.selection_mode)
+        self._update_event_group_switch_fields()
+        source_groups = self._source_groups_for_event_group(event_group)
+        if source_groups and hasattr(self, "preview_group_name") and hasattr(self, "preview_group_electrodes"):
+            self.preview_group_name.blockSignals(True)
+            self.preview_group_electrodes.blockSignals(True)
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.blockSignals(True)
+            self.preview_group_name.setText(event_group.electrode_group)
+            self.preview_group_electrodes.setText(", ".join(str(item) for item in self._electrodes_for_event_group(event_group)))
+            if hasattr(self, "preview_group_center_electrode"):
+                self.preview_group_center_electrode.clear()
+                self.preview_group_center_electrode.blockSignals(False)
+            self.preview_group_name.blockSignals(False)
+            self.preview_group_electrodes.blockSignals(False)
+
+    def _event_group_from_form(self, *, default_name: str | None = None) -> StimulusEventGroup:
+        source_names = self._event_subgroup_names()
+        if not source_names:
+            raise ValueError("Check one or more electrode groups in Site library before creating an event group")
+        source_groups = [self._group_by_name(name) for name in source_names]
+        if any(group is None for group in source_groups):
+            missing = [name for name, group in zip(source_names, source_groups) if group is None]
+            raise ValueError(f"Selected electrode groups were not found: {', '.join(missing)}")
+        name = self.event_group_name.text().strip()
+        if not name:
+            name = default_name or self._next_event_group_name()
+            self.event_group_name.setText(name)
+        switch_enabled = self._event_switch_enabled()
+        effective_group_name = self._effective_group_name_for_event_group(name, source_names)
+        event_groups = []
+        event_group_centers: list[int | None] = []
+        if switch_enabled:
+            event_groups = [
+                [int(electrode) for electrode in getattr(group, "electrodes", []) or []]
+                for group in source_groups
+                if group is not None and getattr(group, "electrodes", [])
+            ]
+            event_group_centers = [
+                getattr(group, "center_electrode", None)
+                for group in source_groups
+                if group is not None and getattr(group, "electrodes", [])
+            ]
+        union_electrodes = []
+        seen_electrodes: set[int] = set()
+        for group in source_groups:
+            for electrode in getattr(group, "electrodes", []) or []:
+                value = int(electrode)
+                if value not in seen_electrodes:
+                    seen_electrodes.add(value)
+                    union_electrodes.append(value)
+        if not union_electrodes:
+            raise ValueError("Checked site groups do not contain stimulation electrodes")
+        if hasattr(self, "preview_group_name") and hasattr(self, "preview_group_electrodes"):
+            self.preview_group_name.blockSignals(True)
+            self.preview_group_electrodes.blockSignals(True)
+            self.preview_group_name.setText(effective_group_name)
+            self.preview_group_electrodes.setText(", ".join(str(item) for item in union_electrodes))
+            self.preview_group_name.blockSignals(False)
+            self.preview_group_electrodes.blockSignals(False)
+        return StimulusEventGroup(
+            name=name,
+            electrode_group=effective_group_name,
+            electrode_groups=list(source_names),
+            switch_enabled=switch_enabled,
+            selection_mode=self._combo_value(self.event_selection, "balanced_random_groups").strip() or "balanced_random_groups",
+            event_groups=event_groups,
+            event_group_centers=event_group_centers,
+        )
+
+    def _group_switch_enabled(self) -> bool:
+        value = self.group_site_switch.currentData()
+        if value is None:
+            value = self.group_site_switch.currentText()
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _update_group_switch_fields(self) -> None:
+        enabled = self._group_switch_enabled()
+        for widget in [
+            self.group_event_count,
+            self.group_event_interval_ms,
+            self.group_event_electrodes,
+            self.group_event_selection,
+            self.group_event_groups,
+        ]:
+            widget.setVisible(enabled)
+
+    def _group_from_form(self) -> stimulus_builder.ElectrodeGroup:
+        center = self._line_edit_int(self.group_center_electrode) if hasattr(self, "group_center_electrode") else None
+        return stimulus_builder.ElectrodeGroup(
+            self.group_name.text().strip(),
+            stimulus_builder.parse_electrodes(self.group_electrodes.text()),
+            center_electrode=center,
+        )
 
     def _protocol_group_for_type(self, protocol_type: str) -> str:
         protocol_type = str(protocol_type or "")
@@ -17528,6 +20162,10 @@ class StimulusGenerationDialog(AppDialog):
             value = field.currentData()
             return str(value if value is not None else field.currentText())
         return str(field.text() if hasattr(field, "text") else default)
+
+    def _combo_value(self, combo: QComboBox, default: str = "") -> str:
+        value = combo.currentData()
+        return str(value if value is not None else combo.currentText() or default)
 
     def _fill_protocol_form(self, protocol) -> None:
         self.protocol_fields["name"].setText(protocol.name)
@@ -17663,25 +20301,30 @@ class StimulusGenerationDialog(AppDialog):
         self.block_table.blockSignals(False)
 
     def _save_preview_workflow(self) -> None:
-        self._save_settings_protocol_and_site()
+        self._save_settings_protocol_and_event_group(for_block_phase=False)
 
     def _save_block_phase_from_settings(self) -> None:
-        saved = self._save_settings_protocol_and_site()
+        saved = self._save_settings_protocol_and_event_group(for_block_phase=True)
         if saved is None:
             return
-        protocol, group_name = saved
+        protocol, event_group = saved
         existing_phase = next(
             (
                 item
                 for item in self.block_phases
-                if item.protocol == protocol.name and item.electrode_group == group_name
+                if str(getattr(item, "event_group", "") or "") == event_group.name
             ),
             None,
         )
         if existing_phase is not None:
             _show_duplicate_database_warning(self, "block phase library", existing_phase.name)
             return
-        phase = StimulusBlockPhase(self._block_phase_name_for(protocol.name, group_name), group_name, protocol.name)
+        phase = StimulusBlockPhase(
+            self._block_phase_name_for(protocol.name, event_group.name),
+            event_group.electrode_group,
+            protocol.name,
+            event_group.name,
+        )
         if _database_key_exists(self.block_phases, phase.name):
             _show_duplicate_database_warning(self, "block phase library", phase.name)
             return
@@ -17709,19 +20352,14 @@ class StimulusGenerationDialog(AppDialog):
         self._refresh_block_combos()
         self.generate_status.setText(f"Block phase removed: {removed.name}")
 
-    def _save_settings_protocol_and_site(self) -> tuple[object, str] | None:
+    def _save_settings_protocol_and_event_group(self, *, for_block_phase: bool) -> tuple[object, StimulusEventGroup] | None:
         try:
             protocol = self._protocol_from_form()
             if not protocol.name:
                 raise ValueError("Protocol name is required")
-            group = stimulus_builder.ElectrodeGroup(
-                self.preview_group_name.text().strip(),
-                stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
-            )
-            if not group.name:
-                raise ValueError("Electrode group name is required")
-            if not group.electrodes:
-                raise ValueError("At least one stimulation electrode is required")
+            event_group = self._event_group_from_form()
+            if not self._electrodes_for_event_group(event_group):
+                raise ValueError("The event group must reference one or more saved electrode groups with electrodes")
         except Exception as exc:
             _show_error_message(self, "Invalid block phase", str(exc))
             return None
@@ -17730,54 +20368,76 @@ class StimulusGenerationDialog(AppDialog):
             _show_error_message(self, "Invalid block phase", "Select a spontaneous source before saving a poisson random block phase")
             return None
         existing_protocol = self._protocol_by_name(protocol.name)
-        existing_group = self._group_by_name(group.name)
+        existing_event_group = self._event_group_by_name(event_group.name)
         if source_path:
             self.protocol_source_paths[protocol.name] = source_path
             protocol.spontaneous_data_path = source_path
         else:
             self.protocol_source_paths.pop(protocol.name, None)
-        if existing_protocol is None:
+        active_event_group = existing_event_group or event_group
+        if for_block_phase:
+            self._ensure_event_group_electrode_group(active_event_group)
+        self._apply_event_group_settings_to_protocol(protocol, active_event_group)
+        if for_block_phase and active_event_group.switch_enabled:
+            protocol.name = self._unique_protocol_name(f"{protocol.name}_{active_event_group.name}")
+            if source_path:
+                self.protocol_source_paths[protocol.name] = source_path
+                protocol.spontaneous_data_path = source_path
+            self.protocols.append(protocol)
+            active_protocol = protocol
+        elif existing_protocol is None:
             self.protocols.append(protocol)
             active_protocol = protocol
         else:
             active_protocol = existing_protocol
+            self._apply_event_group_settings_to_protocol(active_protocol, active_event_group)
             if source_path:
                 active_protocol.spontaneous_data_path = source_path
-        if existing_group is None:
-            self.groups.append(group)
+        if existing_event_group is None:
+            self.event_groups.append(event_group)
         self._clear_preview_caches()
         self._sync_poisson_protocol_auto_group(active_protocol.name)
-        phase_group_name = group.name
         self._refresh_group_table()
+        self._refresh_event_group_table()
         self._refresh_protocol_table()
         self._refresh_block_table()
         self._refresh_block_combos()
         self._refresh_preview_combo()
         self._set_combo_data(self.preview_combo, active_protocol.name)
         self._draw_preview()
-        return active_protocol, phase_group_name
+        return active_protocol, active_event_group
 
     def _preview_settings_workflow(self) -> None:
         try:
             protocol = self._protocol_from_form()
             if not protocol.name:
                 raise ValueError("Protocol name is required")
-            group = stimulus_builder.ElectrodeGroup(
-                self.preview_group_name.text().strip() or "preview_group",
-                stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
-            )
-            if not group.electrodes:
-                raise ValueError("At least one stimulation electrode is required")
+            event_group = self._event_group_from_form(default_name=self._next_event_group_name())
+            preview_electrodes = self._electrodes_for_event_group(event_group)
+            if not preview_electrodes:
+                raise ValueError("Check saved electrode groups with at least one stimulation electrode")
         except Exception as exc:
             _show_error_message(self, "Invalid preview settings", str(exc))
             return
         source_path = str(self.source_combo.currentData() or "") if hasattr(self, "source_combo") else ""
         if source_path:
             protocol.spontaneous_data_path = source_path
-        series = self._preview_series_for_protocol(protocol)
-        if str(getattr(protocol, "type", "")) not in {"poisson_random_electrodes", "custom_sequence", "electrode_pool_sequence"}:
-            series = self._apply_preview_site_group_to_series(series, group.electrodes)
-        self._render_protocol_preview(protocol, series_override=series, stimulation_override=group.electrodes)
+        self._apply_event_group_settings_to_protocol(protocol, event_group)
+        rates = None
+        source_record = self._record_by_path(source_path)
+        if getattr(protocol, "type", "") == "poisson_random_electrodes" and isinstance(source_record, dict):
+            electrodes, rate_values = self._rate_table_from_record(source_record)
+            rates = {int(electrode): float(rate) for electrode, rate in zip(electrodes, rate_values)}
+        series = stimulus_builder.preview_raster_series(
+            protocol,
+            preview_limit_ms=self._preview_generation_limit_ms(protocol),
+            spontaneous_rates=rates,
+            electrode_pool=list(preview_electrodes),
+        )
+        if not event_group.switch_enabled and str(getattr(protocol, "type", "")) not in {"poisson_random_electrodes", "custom_sequence", "electrode_pool_sequence"}:
+            series = self._apply_preview_site_group_to_series(series, preview_electrodes)
+        stimulation_override = None if event_group.switch_enabled else preview_electrodes
+        self._render_protocol_preview(protocol, series_override=series, stimulation_override=stimulation_override)
 
     @staticmethod
     def _apply_preview_site_group_to_series(series: list[dict], electrodes: list[int]) -> list[dict]:
@@ -17795,10 +20455,7 @@ class StimulusGenerationDialog(AppDialog):
 
     def _save_group(self) -> None:
         try:
-            group = stimulus_builder.ElectrodeGroup(
-                self.group_name.text().strip(),
-                stimulus_builder.parse_electrodes(self.group_electrodes.text()),
-            )
+            group = self._group_from_form()
             if not group.name:
                 raise ValueError("Group name is required")
         except Exception as exc:
@@ -17811,12 +20468,20 @@ class StimulusGenerationDialog(AppDialog):
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_combos()
+        self._set_checked_group_names([group.name])
 
     def _save_group_from_settings(self) -> None:
         try:
+            group_name = self.preview_group_name.text().strip()
+            if not group_name:
+                group_name = self._next_site_group_name()
+                self.preview_group_name.setText(group_name)
             group = stimulus_builder.ElectrodeGroup(
-                self.preview_group_name.text().strip(),
+                group_name,
                 stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()),
+                center_electrode=self._line_edit_int(self.preview_group_center_electrode)
+                if hasattr(self, "preview_group_center_electrode")
+                else None,
             )
             if not group.name:
                 raise ValueError("Group name is required")
@@ -17831,10 +20496,66 @@ class StimulusGenerationDialog(AppDialog):
         self.groups.append(group)
         self.group_name.setText(group.name)
         self.group_electrodes.setText(", ".join(str(item) for item in group.electrodes))
+        if hasattr(self, "group_center_electrode"):
+            center = getattr(group, "center_electrode", None)
+            self.group_center_electrode.setText("" if center is None else str(center))
         self._clear_preview_caches()
         self._refresh_group_table()
         self._refresh_block_combos()
+        self._set_checked_group_names([group.name])
+        self.preview_group_name.setText(self._next_site_group_name())
+        if hasattr(self, "preview_group_center_electrode"):
+            self.preview_group_center_electrode.clear()
         self._draw_preview()
+
+    def _save_event_group_from_settings(self) -> None:
+        try:
+            event_group = self._event_group_from_form()
+            if not event_group.name:
+                raise ValueError("Event group name is required")
+        except Exception as exc:
+            _show_error_message(self, "Invalid event group", str(exc))
+            return
+        if _database_key_exists(self.event_groups, event_group.name):
+            _show_duplicate_database_warning(self, "event group library", event_group.name)
+            return
+        self.event_groups.append(event_group)
+        self._clear_preview_caches()
+        self._refresh_event_group_table()
+        self._refresh_block_phase_table()
+        self._refresh_block_combos()
+        self._set_checked_group_names(self._event_group_source_names(event_group))
+        self.event_group_name.setText(self._next_event_group_name())
+        self.generate_status.setText(f"Event group saved: {event_group.name} ({len(self._event_group_source_names(event_group))} site groups)")
+        self._draw_preview()
+
+    def _remove_event_group(self) -> None:
+        row = self._selected_table_row(self.event_group_table) if hasattr(self, "event_group_table") else None
+        if row is None or not (0 <= row < len(self.event_groups)):
+            return
+        removed = self.event_groups[row]
+        removed_phase_keys = {
+            (phase.electrode_group, phase.protocol)
+            for phase in self.block_phases
+            if str(getattr(phase, "event_group", "") or "") == removed.name
+        }
+        del self.event_groups[row]
+        self.block_phases = [
+            phase
+            for phase in self.block_phases
+            if str(getattr(phase, "event_group", "") or "") != removed.name
+        ]
+        if removed_phase_keys:
+            self.blocks = [
+                block
+                for block in self.blocks
+                if (block.electrode_group, block.protocol) not in removed_phase_keys
+            ]
+        self._clear_preview_caches()
+        self._refresh_event_group_table()
+        self._refresh_block_phase_table()
+        self._refresh_block_table()
+        self._refresh_block_combos()
 
     def _save_protocol(self) -> None:
         try:
@@ -17932,8 +20653,26 @@ class StimulusGenerationDialog(AppDialog):
             removed_name = self.groups[row].name
             self.poisson_auto_groups = {key: value for key, value in self.poisson_auto_groups.items() if value != removed_name}
             del self.groups[row]
+            removed_event_groups = {
+                event_group.name
+                for event_group in self.event_groups
+                if removed_name in self._event_group_source_names(event_group) or event_group.electrode_group == removed_name
+            }
+            if removed_event_groups:
+                self.event_groups = [
+                    event_group
+                    for event_group in self.event_groups
+                    if event_group.name not in removed_event_groups
+                ]
+                self.block_phases = [
+                    phase
+                    for phase in self.block_phases
+                    if str(getattr(phase, "event_group", "") or "") not in removed_event_groups
+                ]
             self._clear_preview_caches()
             self._refresh_group_table()
+            self._refresh_event_group_table()
+            self._refresh_block_phase_table()
             self._refresh_block_combos()
 
     def _remove_protocol(self) -> None:
@@ -18084,17 +20823,69 @@ class StimulusGenerationDialog(AppDialog):
             return None
         if not electrodes:
             return None
-        return stimulus_builder.ElectrodeGroup(name, electrodes)
+        center = self._line_edit_int(self.preview_group_center_electrode) if hasattr(self, "preview_group_center_electrode") else None
+        return stimulus_builder.ElectrodeGroup(name, electrodes, center_electrode=center)
+
+    def _settings_group_from_inputs(self, *, preview_name_default: str | None = None) -> object:
+        name = self.preview_group_name.text().strip() if hasattr(self, "preview_group_name") else ""
+        if not name and preview_name_default is not None:
+            name = preview_name_default
+        existing = self._group_by_name(name)
+        if existing is not None:
+            return existing
+        return stimulus_builder.ElectrodeGroup(
+            name,
+            stimulus_builder.parse_electrodes(self.preview_group_electrodes.text()) if hasattr(self, "preview_group_electrodes") else [],
+            center_electrode=self._line_edit_int(self.preview_group_center_electrode)
+            if hasattr(self, "preview_group_center_electrode")
+            else None,
+        )
+
+    @staticmethod
+    def _apply_group_event_settings_to_protocol(protocol, group) -> None:
+        protocol.site_switch_enabled = bool(getattr(group, "site_switch_enabled", False))
+        protocol.pool_event_count = int(getattr(group, "pool_event_count", getattr(protocol, "pool_event_count", 10)))
+        protocol.pool_event_interval_ms = float(getattr(group, "pool_event_interval_ms", getattr(protocol, "pool_event_interval_ms", 1000.0)))
+        protocol.pool_electrodes_per_event = int(getattr(group, "pool_electrodes_per_event", getattr(protocol, "pool_electrodes_per_event", 1)))
+        protocol.pool_selection_mode = str(getattr(group, "pool_selection_mode", getattr(protocol, "pool_selection_mode", "balanced_random_groups")))
+        protocol.pool_event_groups = [list(group_values) for group_values in getattr(group, "pool_event_groups", []) or []]
+        protocol.pool_event_group_centers = [getattr(group, "center_electrode", None) for _group_values in protocol.pool_event_groups]
+
+    @staticmethod
+    def _apply_event_group_settings_to_protocol(protocol, event_group: StimulusEventGroup) -> None:
+        protocol.site_switch_enabled = bool(event_group.switch_enabled)
+        protocol.pool_event_interval_ms = float(getattr(protocol, "pool_event_interval_ms", 1000.0))
+        protocol.pool_selection_mode = str(event_group.selection_mode or "balanced_random_groups")
+        protocol.pool_event_groups = [list(group_values) for group_values in event_group.event_groups]
+        protocol.pool_event_group_centers = [center if center is None else int(center) for center in getattr(event_group, "event_group_centers", []) or []]
 
     def _unique_group_name(self, base: str) -> str:
         existing = {group.name for group in self.groups}
         cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "poisson_auto"
-        if cleaned not in existing:
+        existing_keys = {str(name).strip().lower() for name in existing}
+        if cleaned.lower() not in existing_keys:
             return cleaned
         index = 2
-        while f"{cleaned}_{index}" in existing:
+        while f"{cleaned}_{index}".lower() in existing_keys:
             index += 1
         return f"{cleaned}_{index}"
+
+    def _next_site_group_name(self) -> str:
+        return self._unique_group_name("site_group")
+
+    def _unique_event_group_name(self, base: str) -> str:
+        existing = {event_group.name for event_group in self.event_groups}
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(base)).strip("_") or "event_group"
+        existing_keys = {str(name).strip().lower() for name in existing}
+        if cleaned.lower() not in existing_keys:
+            return cleaned
+        index = 2
+        while f"{cleaned}_{index}".lower() in existing_keys:
+            index += 1
+        return f"{cleaned}_{index}"
+
+    def _next_event_group_name(self) -> str:
+        return self._unique_event_group_name("event_group")
 
     def _unique_protocol_name(self, base: str) -> str:
         existing = {protocol.name for protocol in self.protocols}
@@ -18139,11 +20930,12 @@ class StimulusGenerationDialog(AppDialog):
             lambda_mean_hz=float(self.protocol_fields["lambda_mean_hz"].text() or 1.0),
             lambda_std_hz=float(self.protocol_fields["lambda_std_hz"].text() or 0.25),
             random_seed=int(self.protocol_fields["random_seed"].text() or 42),
-            pool_event_count=int(self.protocol_fields["pool_event_count"].text() or 10),
-            pool_event_interval_ms=float(self.protocol_fields["pool_event_interval_ms"].text() or 1000),
-            pool_electrodes_per_event=int(self.protocol_fields["pool_electrodes_per_event"].text() or 1),
-            pool_selection_mode=self._protocol_field_value("pool_selection_mode", "random").strip() or "random",
-            pool_event_groups=stimulus_builder.parse_electrode_event_groups(self.pool_event_groups.toPlainText()),
+            site_switch_enabled=False,
+            pool_event_count=10,
+            pool_event_interval_ms=1000.0,
+            pool_electrodes_per_event=1,
+            pool_selection_mode="balanced_random_groups",
+            pool_event_groups=[],
             notes="",
         )
 
@@ -18176,6 +20968,9 @@ class StimulusGenerationDialog(AppDialog):
         show_source = False
         show_lambda = False
         show_pool_events = False
+        site_switch_active = False
+        if hasattr(self, "protocol_fields") and "site_switch_enabled" in self.protocol_fields:
+            site_switch_active = self._protocol_field_value("site_switch_enabled", "false").strip().lower() in {"1", "true", "yes", "on"}
         if protocol_type == "single_pulse":
             visible.update({"amplitude_mv", "pulse_width_us", "start_ms", "channel"})
             advanced.add("inter_phase_interval_us")
@@ -18249,6 +21044,12 @@ class StimulusGenerationDialog(AppDialog):
                 "pool_selection_mode",
             })
             advanced.update({"inter_phase_interval_us", "random_seed"})
+            show_pool_events = True
+        if site_switch_active and protocol_type not in {"poisson_random_electrodes", "electrode_pool_sequence"}:
+            visible.update({
+                "pool_selection_mode",
+            })
+            advanced.add("random_seed")
             show_pool_events = True
         return visible, advanced, show_custom, show_source, show_lambda, show_pool_events
 
@@ -18333,7 +21134,8 @@ class StimulusGenerationDialog(AppDialog):
         self.preview_raster_arrays = arrays
         self._clamp_preview_raster_window()
         self._draw_preview_raster_window()
-        self._draw_preview_channel_map(protocol, series, stimulation_override=stimulation_override)
+        window_stimulation = stimulation_override if stimulation_override is not None else self._preview_window_stimulation_electrodes()
+        self._draw_preview_channel_map(protocol, series, stimulation_override=window_stimulation)
         self._draw_preview_distributions(protocol)
 
     def _draw_preview_raster_window(self) -> None:
@@ -18439,6 +21241,7 @@ class StimulusGenerationDialog(AppDialog):
         self.preview_window_ms = min(5000.0, max(1.0, float(self.preview_total_ms)))
         self._clamp_preview_raster_window()
         self._draw_preview_raster_window()
+        self._refresh_preview_map_for_raster_window()
 
     def _preview_raster_scrolled(self, event) -> None:
         if event is None or event.inaxes is not getattr(self, "preview_raster_axis", None):
@@ -18457,6 +21260,7 @@ class StimulusGenerationDialog(AppDialog):
         self.preview_window_start_ms = xdata - fraction * self.preview_window_ms
         self._clamp_preview_raster_window()
         self._draw_preview_raster_window()
+        self._refresh_preview_map_for_raster_window()
 
     def _preview_raster_mouse_pressed(self, event) -> None:
         if event is None or event.inaxes is not getattr(self, "preview_raster_axis", None):
@@ -18485,6 +21289,35 @@ class StimulusGenerationDialog(AppDialog):
 
     def _preview_raster_mouse_released(self, event) -> None:
         self._preview_drag = None
+        self._refresh_preview_map_for_raster_window()
+
+    def _preview_window_stimulation_electrodes(self) -> list[int]:
+        start_ms = float(getattr(self, "preview_window_start_ms", 0.0))
+        stop_ms = start_ms + float(getattr(self, "preview_window_ms", 0.0))
+        electrodes: list[int] = []
+        seen: set[int] = set()
+        for item, values in getattr(self, "preview_raster_arrays", []) or []:
+            if values.size == 0:
+                continue
+            lo = int(np.searchsorted(values, start_ms, side="left"))
+            hi = int(np.searchsorted(values, stop_ms, side="right"))
+            if hi <= lo:
+                continue
+            try:
+                electrode = int(item.get("channel"))
+            except (TypeError, ValueError):
+                continue
+            if electrode not in seen:
+                seen.add(electrode)
+                electrodes.append(electrode)
+        return electrodes
+
+    def _refresh_preview_map_for_raster_window(self) -> None:
+        protocol = getattr(self, "preview_raster_protocol", None)
+        series = getattr(self, "preview_raster_series", None)
+        if protocol is None or series is None:
+            return
+        self._draw_preview_channel_map(protocol, list(series), stimulation_override=self._preview_window_stimulation_electrodes())
 
     def _record_cache_key(self, record: dict | None) -> tuple:
         if not isinstance(record, dict):
@@ -18534,6 +21367,7 @@ class StimulusGenerationDialog(AppDialog):
             "lambda_std_hz",
             "random_seed",
             "spontaneous_data_path",
+            "site_switch_enabled",
             "pool_event_count",
             "pool_event_interval_ms",
             "pool_electrodes_per_event",
@@ -18556,7 +21390,7 @@ class StimulusGenerationDialog(AppDialog):
         source_path = self._preview_source_path_for_protocol(protocol)
         source_record = self._record_by_path(source_path)
         electrode_pool = None
-        if getattr(protocol, "type", "") == "electrode_pool_sequence":
+        if getattr(protocol, "type", "") == "electrode_pool_sequence" or bool(getattr(protocol, "site_switch_enabled", False)):
             try:
                 electrode_pool = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
             except Exception:
@@ -18598,7 +21432,7 @@ class StimulusGenerationDialog(AppDialog):
                     rates = {int(electrode): float(rate) for electrode, rate in zip(electrodes, rate_values)}
                 except Exception:
                     rates = None
-        elif protocol_type == "electrode_pool_sequence":
+        elif protocol_type == "electrode_pool_sequence" or bool(getattr(protocol, "site_switch_enabled", False)):
             try:
                 electrode_pool = stimulus_builder.parse_electrodes(self.preview_group_electrodes.text())
             except Exception:
@@ -19134,7 +21968,9 @@ class StimulusGenerationDialog(AppDialog):
         for candidate in (str(channel), base, normalize_channel_name(channel), normalize_channel_name(base)):
             if candidate in lookup:
                 return int(lookup[candidate])
-        parsed = self._parse_electrode_int(base)
+        parsed = self._parse_maxwell_electrode_label(base)
+        if parsed is None:
+            parsed = self._parse_electrode_int(base)
         return parsed if parsed is not None else fallback
 
     def _default_electrodes(self) -> list[int]:
@@ -19214,6 +22050,239 @@ class StimulusGenerationDialog(AppDialog):
         if index >= 0:
             combo.setCurrentIndex(index)
 
+    def _line_edit_int(self, field: QLineEdit | None) -> int | None:
+        if field is None:
+            return None
+        text = str(field.text() or "").strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            parsed = self._parse_maxwell_electrode_label(text)
+            if parsed is None:
+                parsed = self._parse_electrode_int(text)
+            if parsed is None:
+                raise ValueError(f"Invalid electrode id: {text}")
+            return parsed
+
+    def _build_centered_site_group(self, target: str) -> None:
+        center_field = self.preview_group_center_electrode if target == "preview" else self.group_center_electrode
+        electrode_field = self.preview_group_electrodes if target == "preview" else self.group_electrodes
+        try:
+            center = self._line_edit_int(center_field)
+            if center is None:
+                raise ValueError("Center electrode is required")
+            electrodes = self._centered_recording_group(center, neighbor_count=3)
+        except Exception as exc:
+            _show_error_message(self, "Centered group failed", str(exc))
+            return
+        center_field.setText(str(center))
+        electrode_field.setText(", ".join(str(item) for item in electrodes))
+        if target == "preview":
+            self._preview_site_fields_changed()
+
+    def _centered_recording_group(self, center: int, *, neighbor_count: int = 3) -> list[int]:
+        recording_electrodes = self._recording_map_electrodes()
+        nearest = [
+            electrode
+            for electrode in sorted(
+                recording_electrodes,
+                key=lambda electrode: (self._electrode_grid_distance(center, electrode), electrode),
+            )
+            if int(electrode) != int(center)
+        ][:neighbor_count]
+        if len(nearest) < neighbor_count:
+            raise ValueError(f"Need {neighbor_count} recording electrodes near {center}, found {len(nearest)}")
+        return self._unique_ints([int(center), *nearest])
+
+    def _recording_map_electrodes(self) -> list[int]:
+        loaded_electrodes = self._loaded_recording_map_electrodes()
+        if loaded_electrodes:
+            return loaded_electrodes
+        cfg_path = self._current_cfg_path()
+        if cfg_path:
+            path = Path(cfg_path)
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                electrodes = sorted({int(match) for match in re.findall(r"\b\d+\((\d+)\)", text)})
+                if electrodes:
+                    return electrodes
+        electrodes = self._recording_electrodes_from_channel_map(self.channel_map)
+        if electrodes:
+            return sorted(set(int(item) for item in electrodes))
+        raise RuntimeError(
+            "No loaded recording map is available. Load a MaxWell spike dataset before building a centered site group.\n"
+            + self._recording_map_diagnostics()
+        )
+
+    def _loaded_recording_map_electrodes(self) -> list[int]:
+        records = []
+        source_path = ""
+        if hasattr(self, "source_combo"):
+            source_path = str(self.source_combo.currentData() or "")
+        if source_path:
+            source_record = self._record_by_path(source_path)
+            if isinstance(source_record, dict):
+                records.append(source_record)
+        seen_record_ids = {id(record) for record in records}
+        for record in self.records:
+            if isinstance(record, dict) and id(record) not in seen_record_ids:
+                records.append(record)
+                seen_record_ids.add(id(record))
+        for record in records:
+            electrodes = self._recording_electrodes_from_record(record)
+            if electrodes:
+                return electrodes
+        return []
+
+    def _recording_electrodes_from_record(self, record: dict) -> list[int]:
+        data = record.get("raw_data") if isinstance(record, dict) else None
+        if isinstance(data, UnifiedMEAData):
+            electrodes = self._recording_electrodes_from_unified(data)
+            if electrodes:
+                return electrodes
+        path = Path(str(record.get("path", ""))) if isinstance(record, dict) else Path("")
+        if path.suffix.lower() in {".h5", ".hdf5"} and path.is_file():
+            electrodes = self._recording_electrodes_from_h5_path(path)
+            if electrodes:
+                return electrodes
+        return []
+
+    def _recording_electrodes_from_h5_path(self, path: Path) -> list[int]:
+        try:
+            import h5py  # type: ignore
+        except Exception:
+            return []
+        electrodes: set[int] = set()
+        try:
+            with h5py.File(path, "r") as h5_file:
+                def visit(_name, obj) -> None:
+                    if not hasattr(obj, "dtype") or not str(_name).endswith("settings/mapping"):
+                        return
+                    names = getattr(obj.dtype, "names", None) or ()
+                    if "electrode" not in names:
+                        return
+                    try:
+                        values = np.asarray(obj["electrode"]).reshape(-1)
+                    except Exception:
+                        try:
+                            values = np.asarray(obj)["electrode"].reshape(-1)
+                        except Exception:
+                            return
+                    for value in values:
+                        try:
+                            electrode = int(value.item() if hasattr(value, "item") else value)
+                        except (TypeError, ValueError):
+                            continue
+                        if electrode >= 0:
+                            electrodes.add(electrode)
+                h5_file.visititems(visit)
+        except Exception:
+            return []
+        return sorted(electrodes)
+
+    def _recording_electrodes_from_unified(self, data: UnifiedMEAData) -> list[int]:
+        meta = data.meta if isinstance(getattr(data, "meta", None), dict) else {}
+        channel_map = meta.get("channel_map", {}) if isinstance(meta, dict) else {}
+        electrodes: list[int] = []
+        if isinstance(channel_map, dict):
+            for channel, payload in channel_map.items():
+                parsed = None
+                if isinstance(payload, dict):
+                    parsed = self._parse_electrode_int(payload.get("electrode"))
+                if parsed is None:
+                    parsed = self._parse_maxwell_electrode_label(channel)
+                if parsed is None:
+                    parsed = self._parse_electrode_int(channel)
+                if parsed is not None:
+                    electrodes.append(parsed)
+        if not electrodes:
+            for channel in getattr(data, "spikes", {}) or {}:
+                parsed = self._parse_maxwell_electrode_label(channel)
+                if parsed is not None:
+                    electrodes.append(parsed)
+        return sorted(set(int(item) for item in electrodes))
+
+    def _recording_map_diagnostics(self) -> str:
+        lines = [f"Stimulus generation sees {len(getattr(self, 'records', []) or [])} loaded record(s)."]
+        for index, record in enumerate((getattr(self, "records", []) or [])[:6], start=1):
+            if not isinstance(record, dict):
+                lines.append(f"{index}. invalid record object")
+                continue
+            data = record.get("raw_data")
+            path = str(record.get("path", ""))
+            if isinstance(data, UnifiedMEAData):
+                meta = data.meta if isinstance(data.meta, dict) else {}
+                channel_map = meta.get("channel_map", {})
+                map_count = len(channel_map) if isinstance(channel_map, dict) else 0
+                source = str(meta.get("source", ""))
+                sample_channels = list((getattr(data, "spikes", {}) or {}).keys())[:3]
+                parsed_count = len(self._recording_electrodes_from_unified(data))
+                h5_count = len(self._recording_electrodes_from_h5_path(Path(path))) if Path(path).suffix.lower() in {".h5", ".hdf5"} and Path(path).is_file() else 0
+                lines.append(
+                    f"{index}. {Path(path).name}: source={source or 'unknown'}, channels={len(getattr(data, 'spikes', {}) or {})}, "
+                    f"meta_map={map_count}, parsed_electrodes={parsed_count}, h5_mapping={h5_count}, samples={sample_channels}"
+                )
+            else:
+                lines.append(f"{index}. {Path(path).name}: raw_data={type(data).__name__}")
+        return "\n".join(lines)
+
+    def _recording_electrodes_from_channel_map(self, channel_map: ChannelMap | None) -> list[int]:
+        electrodes: list[int] = []
+        if not isinstance(channel_map, ChannelMap):
+            return electrodes
+        for electrode_key, payload in channel_map.electrodes.items():
+            if not isinstance(payload, dict):
+                continue
+            if not payload.get("routed") and not payload.get("channel"):
+                continue
+            parsed = self._parse_electrode_int(payload.get("electrode"))
+            if parsed is None:
+                parsed = self._parse_electrode_int(electrode_key)
+            if parsed is not None:
+                electrodes.append(parsed)
+        return sorted(set(int(item) for item in electrodes))
+
+    def _current_cfg_path(self) -> str:
+        if hasattr(self, "info_fields") and "cfg_path" in self.info_fields:
+            return str(self.info_fields["cfg_path"].text() or "").strip()
+        return str(getattr(self.info, "cfg_path", "") or "").strip()
+
+    @staticmethod
+    def _electrode_grid_distance(left: int, right: int) -> int:
+        left_row, left_col = int(left) // 220, int(left) % 220
+        right_row, right_col = int(right) // 220, int(right) % 220
+        return abs(left_row - right_row) + abs(left_col - right_col)
+
+    @staticmethod
+    def _parse_maxwell_electrode_label(value) -> int | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        match = re.search(r"(?:^|[_\W])e(\d+)(?:$|[_\W])", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(?:^|[_\W])electrode[_-]?(\d+)(?:$|[_\W])", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _unique_ints(values: list[int]) -> list[int]:
+        seen: set[int] = set()
+        result: list[int] = []
+        for value in values:
+            item = int(value)
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
     def _parse_electrode_int(self, value) -> int | None:
         if value is None:
             return None
@@ -19222,6 +22291,67 @@ class StimulusGenerationDialog(AppDialog):
         except (TypeError, ValueError):
             match = re.search(r"(\d+)", str(value))
             return int(match.group(1)) if match else None
+
+
+class AnalysisHubDialog(AppDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analysis")
+        self.resize(520, 360)
+        self.setMinimumSize(460, 320)
+
+        self.dynamic_button = QPushButton("Dynamic Analysis")
+        self.dynamic_button.setMinimumHeight(48)
+        self.dynamic_button.clicked.connect(self._open_dynamic)
+        self.stimulus_button = QPushButton("Stimulus Response Analysis")
+        self.stimulus_button.setMinimumHeight(48)
+        self.stimulus_button.clicked.connect(self._open_stimulus)
+        self.stable_delay_button = QPushButton("Stable Delay Map")
+        self.stable_delay_button.setMinimumHeight(48)
+        self.stable_delay_button.clicked.connect(self._open_stable_delay)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("MutedText")
+        self.status_label.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Analysis")
+        title.setObjectName("Header")
+        title.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        layout.addWidget(title)
+        layout.addWidget(self.status_label)
+        layout.addSpacing(4)
+        layout.addWidget(self.dynamic_button)
+        layout.addWidget(self.stimulus_button)
+        layout.addWidget(self.stable_delay_button)
+        layout.addStretch(1)
+
+    def refresh_state(self, *, has_database: bool, busy: bool) -> None:
+        enabled = bool(has_database and not busy)
+        self.dynamic_button.setEnabled(enabled)
+        self.stimulus_button.setEnabled(enabled)
+        self.stable_delay_button.setEnabled(enabled)
+        if not has_database:
+            self.status_label.setText("Load files into the database before running analysis.")
+        elif busy:
+            self.status_label.setText("An analysis or loading task is running. Wait for it to finish before starting another analysis.")
+        else:
+            self.status_label.setText("Choose an analysis workflow for the loaded database.")
+
+    def _open_dynamic(self) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "open_multi_file_factor_analysis"):
+            parent.open_multi_file_factor_analysis()
+
+    def _open_stimulus(self) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "open_stimulus_response_analysis"):
+            parent.open_stimulus_response_analysis()
+
+    def _open_stable_delay(self) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "open_stable_delay_map_analysis"):
+            parent.open_stable_delay_map_analysis()
 
 
 class MainWindow(QMainWindow):
@@ -19250,10 +22380,12 @@ class MainWindow(QMainWindow):
         self.maxwell_waveform_progress = None
         self.active_stimulus_worker = None
         self.active_multi_file_fa_worker = None
+        self.analysis_hub_dialog = None
         self.stimulus_response_dialog = None
         self.stimulus_response_payload = None
         self.multi_file_fa_dialog = None
         self.multi_file_fa_payload = None
+        self.stable_delay_dialog = None
         self.generic_analysis_dialog = None
         self.generic_analysis_payload = None
         self.custom_data_selection_dialog = None
@@ -19306,10 +22438,8 @@ class MainWindow(QMainWindow):
         self.channel_map_button.clicked.connect(self.open_channel_map)
         self.sorting_button = QPushButton("Sorting")
         self.sorting_button.clicked.connect(self.open_sorting)
-        self.stimulus_response_button = QPushButton("Stimulus Response Analysis")
-        self.stimulus_response_button.clicked.connect(self.open_stimulus_response_analysis)
-        self.multi_file_fa_button = QPushButton("Dynamics Analysis")
-        self.multi_file_fa_button.clicked.connect(self.open_multi_file_factor_analysis)
+        self.analysis_button = QPushButton("Analysis")
+        self.analysis_button.clicked.connect(self.open_analysis)
         self.generic_analysis_button = QPushButton("Custom Analysis")
         self.generic_analysis_button.clicked.connect(self.open_generic_analysis)
 
@@ -19330,9 +22460,7 @@ class MainWindow(QMainWindow):
         for button in [
             self.channel_map_button,
             self.sorting_button,
-            self.stimulus_response_button,
-            self.multi_file_fa_button,
-            self.generic_analysis_button,
+            self.analysis_button,
         ]:
             button.setMinimumHeight(40)
             side_layout.addWidget(button)
@@ -19414,18 +22542,15 @@ class MainWindow(QMainWindow):
         sorting_action.triggered.connect(self.open_sorting)
         tools_menu.addAction(sorting_action)
         tools_menu.addSeparator()
-        stimulus_action = QAction("Stimulus Response Analysis", self)
-        stimulus_action.triggered.connect(self.open_stimulus_response_analysis)
-        tools_menu.addAction(stimulus_action)
+        analysis_action = QAction("Analysis", self)
+        analysis_action.triggered.connect(self.open_analysis)
+        tools_menu.addAction(analysis_action)
         stimulus_generation_action = QAction("Stimulus Generation", self)
         stimulus_generation_action.triggered.connect(self.open_stimulus_generation)
         tools_menu.addAction(stimulus_generation_action)
         closed_loop_action = QAction("Closed Loop Control", self)
         closed_loop_action.triggered.connect(self.open_closed_loop_control)
         tools_menu.addAction(closed_loop_action)
-        multi_file_fa_action = QAction("Dynamics Analysis", self)
-        multi_file_fa_action.triggered.connect(self.open_multi_file_factor_analysis)
-        tools_menu.addAction(multi_file_fa_action)
         generic_action = QAction("Custom Analysis", self)
         generic_action.triggered.connect(self.open_generic_analysis)
         tools_menu.addAction(generic_action)
@@ -19466,9 +22591,35 @@ class MainWindow(QMainWindow):
         self.save_spike_train_action.setEnabled(has_data and not any_busy)
         self.channel_map_button.setEnabled(not any_busy)
         self.sorting_button.setEnabled(has_data and not any_busy)
-        self.stimulus_response_button.setEnabled(has_database and not (loading or stimulus_busy or dynamics_busy))
-        self.multi_file_fa_button.setEnabled(has_database and not (loading or stimulus_busy or dynamics_busy))
+        analysis_busy = loading or stimulus_busy or dynamics_busy
+        self.analysis_button.setEnabled(has_database and not analysis_busy)
+        if self.analysis_hub_dialog is not None:
+            self.analysis_hub_dialog.refresh_state(has_database=has_database, busy=analysis_busy)
         self.generic_analysis_button.setEnabled(has_database and not any_busy)
+
+    def open_analysis(self):
+        if not self.file_database:
+            _show_info_message(self, "Analysis", "Load files into the database before analysis.")
+            return
+        if self.analysis_hub_dialog is None:
+            dialog = AnalysisHubDialog(self)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.finished.connect(lambda _result: self._forget_analysis_hub_dialog(dialog))
+            self.analysis_hub_dialog = dialog
+        loading = self.active_load_worker is not None
+        stimulus_busy = self.active_stimulus_worker is not None
+        dynamics_busy = self.active_multi_file_fa_worker is not None
+        self.analysis_hub_dialog.refresh_state(
+            has_database=bool(self.file_database),
+            busy=bool(loading or stimulus_busy or dynamics_busy),
+        )
+        self.analysis_hub_dialog.show()
+        self.analysis_hub_dialog.raise_()
+        self.analysis_hub_dialog.activateWindow()
+
+    def _forget_analysis_hub_dialog(self, dialog) -> None:
+        if self.analysis_hub_dialog is dialog:
+            self.analysis_hub_dialog = None
 
     def open_stimulus_generation(self):
         self._ensure_source_channel_map_ready("Preparing stimulus generation")
@@ -19547,8 +22698,6 @@ class MainWindow(QMainWindow):
             dialog = StimulusDatabaseAnalysisDialog(self.file_database, self)
             dialog.setWindowModality(Qt.WindowModality.NonModal)
             dialog.accepted.connect(self._start_stimulus_response_from_dialog)
-            dialog.psth_button.clicked.connect(self._open_cached_stimulus_psth)
-            dialog.activation_curve_button.clicked.connect(self._open_cached_stimulus_activation_curve)
             self.stimulus_response_dialog = dialog
         elif hasattr(self.stimulus_response_dialog, "_set_records"):
             self.stimulus_response_dialog._set_records(self.file_database)
@@ -19559,14 +22708,21 @@ class MainWindow(QMainWindow):
             _show_info_message(self, "Stimulus Response", "Stimulus response analysis is already running.")
             return
         dialog = self.stimulus_response_dialog or self._stimulus_response_analysis_dialog()
-        paths, pre_ms, response_ms, artifact_ms = dialog.values()
+        paths, pre_ms, response_ms, artifact_ms, zero_stimulus_index, strong_response_window_ms = dialog.values()
         if not paths:
             _show_info_message(self, "Stimulus Response", "Select at least one database file.")
             dialog.show()
             return
         self.pipeline_progress = self._start_progress("Stimulus response", "Starting stimulus response analysis...", 100)
         self._set_app_status("Stimulus response running", "Preparing stimulus-aligned rasters and summary payloads.")
-        worker = StimulusResponseWorker(paths, pre_ms=pre_ms, response_ms=response_ms, artifact_ms=artifact_ms)
+        worker = StimulusResponseWorker(
+            paths,
+            pre_ms=pre_ms,
+            response_ms=response_ms,
+            artifact_ms=artifact_ms,
+            zero_stimulus_index=zero_stimulus_index,
+            strong_response_window_ms=strong_response_window_ms,
+        )
         self.pipeline_progress.canceled.connect(worker.cancel)
         worker.signals.progress.connect(self._on_progress)
         worker.signals.finished.connect(lambda payload, worker=worker: self._stimulus_response_finished(payload, worker))
@@ -19621,28 +22777,8 @@ class MainWindow(QMainWindow):
         self._set_app_status("Stimulus response cancelled", message or "Stimulus response analysis cancelled")
         self._return_to_stimulus_analysis_dialog()
 
-    def _open_cached_stimulus_psth(self):
-        if not self.stimulus_response_payload:
-            _show_info_message(self, "Stimulus Response", "Run analysis before opening PSTH.")
-            return
-        self._open_stimulus_psth_window(self.stimulus_response_payload)
-
-    def _open_cached_stimulus_activation_curve(self):
-        if not self.stimulus_response_payload:
-            _show_info_message(self, "Stimulus Response", "Run analysis before opening activation curve.")
-            return
-        self._open_stimulus_activation_curve_window(self.stimulus_response_payload)
-
     def _open_stimulus_raster_window(self, payload: dict):
-        window = StimulusResponseWindow(payload, self, channel_map=self.channel_map)
-        self._show_stimulus_result_window(window)
-
-    def _open_stimulus_psth_window(self, payload: dict):
-        window = StimulusPSTHWindow(payload, self)
-        self._show_stimulus_result_window(window)
-
-    def _open_stimulus_activation_curve_window(self, payload: dict):
-        window = StimulusActivationCurveWindow(payload, self)
+        window = StimulusTrialResponseWindow(payload, self, channel_map=self.channel_map)
         self._show_stimulus_result_window(window)
 
     def _show_stimulus_result_window(self, window: QDialog):
@@ -20094,6 +23230,70 @@ class MainWindow(QMainWindow):
         if errors:
             self._log(f"Processed-data cache warnings: {'; '.join(errors[:4])}")
 
+    def open_stable_delay_map_analysis(self):
+        if not self.file_database:
+            _show_info_message(self, "Stable Delay Map", "Load files into the database before stable-delay analysis.")
+            return
+        dialog = self._stable_delay_analysis_dialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _stable_delay_analysis_dialog(self):
+        if self.stable_delay_dialog is None:
+            dialog = StableDelayDatabaseDialog(self.file_database, self)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.accepted.connect(self._start_stable_delay_map_from_dialog)
+            self.stable_delay_dialog = dialog
+        elif hasattr(self.stable_delay_dialog, "_set_records"):
+            self.stable_delay_dialog._set_records(self.file_database)
+        return self.stable_delay_dialog
+
+    def _start_stable_delay_map_from_dialog(self):
+        dialog = self._stable_delay_analysis_dialog()
+        paths = dialog.values()
+        if not paths:
+            _show_info_message(self, "Stable Delay Map", "Select one database file.")
+            dialog.show()
+            return
+        selected_path = str(paths[0])
+        record = next((item for item in self.file_database if str(item.get("path", "")) == selected_path), None)
+        if record is None:
+            _show_info_message(self, "Stable Delay Map", "The selected database file is no longer loaded.")
+            dialog.show()
+            return
+        data = record.get("raw_data")
+        if not isinstance(data, UnifiedMEAData):
+            _show_info_message(self, "Stable Delay Map", "The selected file does not contain spike-event data.")
+            dialog.show()
+            return
+        spike_series = _spike_series_from_unified(data)
+        if not spike_series:
+            _show_info_message(self, "Stable Delay Map", "The selected file does not contain readable spike trains.")
+            dialog.show()
+            return
+        progress = self._start_progress("Stable Delay Map", "Detecting stable-delay electrodes and connections...", 0)
+        QApplication.processEvents()
+        try:
+            channel_map = _maxwell_channel_map_from_unified(data) or self.channel_map
+            window = StableDelayMapWindow(spike_series, channel_map, self)
+        except Exception as exc:
+            self._finish_progress(progress)
+            _show_error_message(self, "Stable Delay Map failed", str(exc))
+            dialog.show()
+            return
+        self._finish_progress(progress)
+        window.finished.connect(lambda _result: self._return_to_stable_delay_dialog())
+        self._show_child(window)
+        _defer_hide(dialog, 0)
+
+    def _return_to_stable_delay_dialog(self):
+        if self.stable_delay_dialog is None:
+            return
+        self.stable_delay_dialog.show()
+        self.stable_delay_dialog.raise_()
+        self.stable_delay_dialog.activateWindow()
+
     def open_multi_file_factor_analysis(self):
         if self.active_multi_file_fa_worker is not None:
             _show_info_message(self, "Dynamics Analysis", "Dynamics analysis is already running.")
@@ -20397,6 +23597,7 @@ class MainWindow(QMainWindow):
         if errors:
             self._log(f"Skipped {len(errors)} files: {'; '.join(errors[:4])}")
         self._log(f"Database loaded: {len(self.file_database)} files")
+        self._refresh_open_tool_contexts()
         self._set_app_status("Database ready", f"{len(self.file_database)} file(s) loaded. Rendering database rows...")
         finish_load_progress()
         QTimer.singleShot(
@@ -20413,6 +23614,14 @@ class MainWindow(QMainWindow):
                 "These files already exist in the file database and were not saved:\n"
                 + "\n".join(skipped_duplicates[:12]),
             )
+
+    def _refresh_open_tool_contexts(self) -> None:
+        if self.stimulus_generation_dialog is not None:
+            self.stimulus_generation_dialog.refresh_pipeline_context(self.file_database, self.channel_map)
+        if self.closed_loop_dialog is not None:
+            self.closed_loop_dialog.records = list(self.file_database)
+            self.closed_loop_dialog.channel_map = self.channel_map
+            self.closed_loop_dialog.heatmap_canvas.set_channel_map(self.channel_map)
 
     def _data_load_failed(self, details: str, worker):
         if self.active_load_worker is worker:
@@ -20449,7 +23658,13 @@ class MainWindow(QMainWindow):
             if filtered is None:
                 return None
             raw_data = filtered
-        return {"path": path, "raw_data": raw_data, "data_kind": data_kind}
+        normalized = {"path": path, "raw_data": raw_data, "data_kind": data_kind}
+        if isinstance(raw_data, UnifiedMEAData):
+            params = _apply_stimulus_metadata_parameters(_extract_stimulus_parameters(path), raw_data)
+            if params:
+                normalized["parameters"] = params
+                normalized["condition"] = _stimulus_parameter_label(params, path)
+        return normalized
 
     def _upsert_database_record(self, record: dict) -> int:
         path = str(record.get("path", ""))

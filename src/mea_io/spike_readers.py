@@ -8,6 +8,7 @@ requires Axion's MATLAB loader in typical workflows.
 
 from __future__ import annotations
 
+import csv
 import json
 import mmap
 import os
@@ -1470,8 +1471,21 @@ def read_maxwell_h5(
 
     stim_times = np.concatenate(event_times) if event_times else np.array([], dtype=float)
     stim_times = np.asarray(sorted(set(float(value) for value in stim_times if np.isfinite(value))), dtype=float)
-    if stim_times.size == 0:
-        stim_times = _load_maxwell_stim_sidecar_times(path)
+    sidecar_stim = _load_maxwell_stim_sidecar(path)
+    sidecar_stim_times = np.asarray(sidecar_stim.get("stim_times", np.array([], dtype=float)), dtype=float)
+    sidecar_records = list(sidecar_stim.get("stimulus_records", []) or [])
+    if sidecar_records and stim_times.size:
+        sidecar_records = _align_stim_sidecar_records_to_times(sidecar_records, stim_times)
+    elif sidecar_stim_times.size and stim_times.size == 0:
+        stim_times = sidecar_stim_times
+    if sidecar_records:
+        event_records = _merge_stim_sidecar_records(event_records, sidecar_records)
+    h5_stim_records = [dict(record) for record in event_records if _stim_electrodes_from_record(record)]
+    stimulus_records = sidecar_records or h5_stim_records
+    stim_electrodes = _unique_sidecar_ints(
+        list(sidecar_stim.get("stim_electrodes", []) or [])
+        + [electrode for record in h5_stim_records for electrode in _stim_electrodes_from_record(record)]
+    )
     artifact_window_s = max(0.0, float(stim_artifact_window_ms) / 1000.0)
     spike_filters: Dict[str, Dict[str, np.ndarray]] = {}
     artifacts_removed_by_channel: Dict[str, int] = {}
@@ -1542,6 +1556,11 @@ def read_maxwell_h5(
         "raw_spike_count": int(total_spikes),
         "event_count": int(stim_times.size),
         "event_records": event_records,
+        "stim_electrodes": stim_electrodes,
+        "stimulus_records": stimulus_records,
+        "stimulus_sidecar_files": sidecar_stim.get("files", []),
+        "stimulus_sidecar_candidates": sidecar_stim.get("candidate_files", []),
+        "stimulus_sidecar_summary": sidecar_stim.get("summary", {}),
         "duration_s": float(duration_s),
         "reader": "native_maxwell_h5",
         "stim_artifact_window_ms": float(stim_artifact_window_ms),
@@ -1565,36 +1584,575 @@ def read_maxwell_h5(
 
 
 def _load_maxwell_stim_sidecar_times(path: Path) -> np.ndarray:
-    candidates = [
-        path.with_name("stim_times.txt"),
-        path.with_name("segment_time_meta.json"),
-        path.parent / "stim_times.txt",
-        path.parent / "segment_time_meta.json",
-    ]
+    return np.asarray(_load_maxwell_stim_sidecar(path).get("stim_times", np.array([], dtype=float)), dtype=float)
+
+
+def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
+    candidates = _maxwell_stim_sidecar_candidates(path)
+    records: List[Dict[str, Any]] = []
+    stim_times: List[float] = []
+    stim_electrodes: List[int] = []
+    used_files: List[str] = []
+    summary: Dict[str, Any] = {}
+    parsed_sources: Dict[str, Dict[str, Any]] = {}
     for candidate in candidates:
         if not candidate.is_file():
             continue
         try:
-            if candidate.suffix.lower() == ".txt":
-                values = []
-                for raw_line in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    line = raw_line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    try:
-                        values.append(float(line))
-                    except ValueError:
-                        continue
-                if values:
-                    return np.asarray(sorted(set(float(value) for value in values if np.isfinite(value))), dtype=float)
-            elif candidate.suffix.lower() == ".json":
-                payload = json.loads(candidate.read_text(encoding="utf-8"))
-                values = payload.get("stim_times_sec", [])
-                if isinstance(values, list) and values:
-                    return np.asarray(sorted(set(float(value) for value in values if np.isfinite(value))), dtype=float)
+            parsed = _parse_maxwell_stim_sidecar_file(candidate)
         except Exception:
             continue
-    return np.array([], dtype=float)
+        if not parsed:
+            continue
+        used_files.append(str(candidate))
+        parsed_sources[candidate.name.lower()] = parsed
+        file_records = list(parsed.get("records", []) or [])
+        records.extend(file_records)
+        stim_times.extend(float(value) for value in parsed.get("stim_times", []) if _is_finite_number(value))
+        for record in file_records:
+            stim_times.extend(
+                float(value)
+                for value in [record.get("time_s"), record.get("stim_time_sec"), record.get("plan_time_sec")]
+                if _is_finite_number(value)
+            )
+            stim_electrodes.extend(_stim_electrodes_from_record(record))
+        stim_electrodes.extend(int(value) for value in parsed.get("stim_electrodes", []) if _is_int_like(value))
+        summary[candidate.name] = {
+            "record_count": len(file_records),
+            "stim_time_count": int(len(parsed.get("stim_times", []) or [])),
+            "stim_electrode_count": int(len(_unique_sidecar_ints(parsed.get("stim_electrodes", []) or []))),
+        }
+
+    run_records, run_files, run_summary = _load_run_root_stim_send_records(path)
+    if run_records:
+        used_files.extend(run_files)
+        summary.update(run_summary)
+        unique_records = _unique_stim_sidecar_records(run_records)
+        finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
+        return {
+            "stim_times": np.asarray(finite_times, dtype=float),
+            "stimulus_records": unique_records,
+            "stim_electrodes": _unique_sidecar_ints(
+                electrode for record in unique_records for electrode in _stim_electrodes_from_record(record)
+            ),
+            "files": _unique_sidecar_strings(used_files),
+            "candidate_files": [str(candidate) for candidate in candidates] + run_files,
+            "summary": summary,
+        }
+
+    aligned_records = _aligned_local_stim_plan_records(parsed_sources)
+    if aligned_records:
+        unique_records = _unique_stim_sidecar_records(aligned_records)
+        finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
+        return {
+            "stim_times": np.asarray(finite_times, dtype=float),
+            "stimulus_records": unique_records,
+            "stim_electrodes": _unique_sidecar_ints(
+                electrode for record in unique_records for electrode in _stim_electrodes_from_record(record)
+            ),
+            "files": _unique_sidecar_strings(used_files),
+            "candidate_files": [str(candidate) for candidate in candidates],
+            "summary": summary,
+        }
+
+    finite_times = sorted(set(float(value) for value in stim_times if _is_finite_number(value)))
+    unique_records = _unique_stim_sidecar_records(records)
+    return {
+        "stim_times": np.asarray(finite_times, dtype=float),
+        "stimulus_records": unique_records,
+        "stim_electrodes": _unique_sidecar_ints(stim_electrodes),
+        "files": _unique_sidecar_strings(used_files),
+        "candidate_files": [str(candidate) for candidate in candidates],
+        "summary": summary,
+    }
+
+
+def _maxwell_stim_sidecar_candidates(path: Path) -> List[Path]:
+    folder = path.parent
+    preferred = [
+        "segment_time_meta.json",
+        "stim_plan.json",
+        "stim_plan.csv",
+        "stim_times.txt",
+        "external_time_log.json",
+    ]
+    candidates: List[Path] = []
+    for name in preferred:
+        candidates.append(folder / name)
+    for pattern in ("*stim*.json", "*stim*.txt", "*time*_meta.json", "*time*_log.json"):
+        try:
+            candidates.extend(sorted(folder.glob(pattern)))
+        except OSError:
+            continue
+    seen: set[str] = set()
+    result: List[Path] = []
+    for candidate in candidates:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key not in seen:
+            seen.add(key)
+            result.append(candidate)
+    return result
+
+
+def _aligned_local_stim_plan_records(parsed_sources: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    actual_times: List[float] = []
+    for name in ("segment_time_meta.json", "stim_times.txt"):
+        parsed = parsed_sources.get(name)
+        if parsed:
+            actual_times = [float(value) for value in parsed.get("stim_times", []) if _is_finite_number(value)]
+            if actual_times:
+                break
+    if not actual_times:
+        return []
+    plan_records: List[Dict[str, Any]] = []
+    for name in ("stim_plan.json", "stim_plan.csv"):
+        parsed = parsed_sources.get(name)
+        if not parsed:
+            continue
+        records = [dict(record) for record in parsed.get("records", []) or [] if _stim_electrodes_from_record(record)]
+        if records:
+            plan_records = records
+            break
+    if not plan_records or len(plan_records) != len(actual_times):
+        return []
+    aligned: List[Dict[str, Any]] = []
+    for index, (record, actual_time) in enumerate(zip(plan_records, actual_times)):
+        payload = dict(record)
+        if _is_finite_number(payload.get("time_s")):
+            payload.setdefault("plan_time_sec", float(payload.get("time_s")))
+        payload["time_s"] = float(actual_time)
+        payload["stim_time_sec"] = float(actual_time)
+        payload.setdefault("stim_index", index + 1)
+        payload["stim_time_source"] = "segment_time_meta"
+        aligned.append(payload)
+    return aligned
+
+
+def _load_run_root_stim_send_records(path: Path) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
+    context = _maxwell_segment_context(path)
+    if not context:
+        return [], [], {}
+    run_dir = context["run_dir"]
+    candidate_files = [
+        run_dir / "external_time_table.json",
+        run_dir / "external_time_log.json",
+        run_dir / "external_time_table.csv",
+    ]
+    records: List[Dict[str, Any]] = []
+    used_files: List[str] = []
+    summary: Dict[str, Any] = {}
+    for candidate in candidate_files:
+        if not candidate.is_file():
+            continue
+        try:
+            parsed_records = _parse_run_root_stim_send_file(candidate, context)
+        except Exception:
+            continue
+        if not parsed_records:
+            continue
+        records.extend(parsed_records)
+        used_files.append(str(candidate))
+        summary[candidate.name] = {
+            "record_count": len(parsed_records),
+            "match_block": context.get("block"),
+            "match_phase": context.get("phase"),
+            "match_segment": context.get("segment_name"),
+        }
+        break
+    return records, used_files, summary
+
+
+def _maxwell_segment_context(path: Path) -> Dict[str, Any]:
+    parts_lower = [part.lower() for part in path.parts]
+    if "raw_data" not in parts_lower:
+        return {}
+    raw_index = parts_lower.index("raw_data")
+    if len(path.parts) <= raw_index + 3:
+        return {}
+    run_dir = Path(*path.parts[:raw_index])
+    block_dir = Path(*path.parts[: raw_index + 2])
+    phase_dir = Path(*path.parts[: raw_index + 3])
+    block_name = path.parts[raw_index + 1]
+    phase_name = path.parts[raw_index + 2]
+    block_meta = _read_simple_yaml_mapping(block_dir / "block_meta.yaml")
+    block_name = str(block_meta.get("name") or block_name).strip()
+    segment_name = _strip_maxwell_raw_suffix(path.name)
+    segment_meta = phase_dir / "segment_time_meta.json"
+    if segment_meta.is_file():
+        try:
+            payload = json.loads(segment_meta.read_text(encoding="utf-8-sig"))
+            if isinstance(payload, dict):
+                segment_name = str(payload.get("segment_name") or segment_name).strip()
+        except Exception:
+            pass
+    return {
+        "run_dir": run_dir,
+        "block": block_name,
+        "phase": phase_name,
+        "segment_name": segment_name,
+    }
+
+
+def _strip_maxwell_raw_suffix(name: str) -> str:
+    text = str(name)
+    for suffix in (".raw.h5", ".h5", ".raw_spike_train.npz", ".npz"):
+        if text.lower().endswith(suffix):
+            return text[: -len(suffix)]
+    return Path(text).stem
+
+
+def _read_simple_yaml_mapping(path: Path) -> Dict[str, str]:
+    if not path.is_file():
+        return {}
+    mapping: Dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        mapping[key.strip()] = value.strip().strip("'\"")
+    return mapping
+
+
+def _parse_run_root_stim_send_file(path: Path, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        rows = payload if isinstance(payload, list) else payload.get("events", []) if isinstance(payload, dict) else []
+    elif path.suffix.lower() == ".csv":
+        text = path.read_text(encoding="utf-8-sig", errors="ignore")
+        rows = list(csv.DictReader(line for line in text.splitlines() if line.strip()))
+    else:
+        return []
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("event_type") or row.get("type") or "") != "stim_send":
+            continue
+        if str(row.get("block") or "") != str(context.get("block") or ""):
+            continue
+        if str(row.get("phase") or "") != str(context.get("phase") or ""):
+            continue
+        if str(row.get("segment_name") or "") != str(context.get("segment_name") or ""):
+            continue
+        record = _normalize_stim_sidecar_record(row)
+        if record and _stim_electrodes_from_record(record):
+            record["sidecar_source"] = path.name
+            record["stim_time_source"] = "external_time_table"
+            records.append(record)
+    records.sort(key=lambda item: (int(item.get("stim_index", 0) or 0), float(item.get("time_s", 0.0))))
+    return records
+
+
+def _parse_maxwell_stim_sidecar_file(path: Path) -> Dict[str, Any]:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return _parse_maxwell_stim_sidecar_json(path)
+    if suffix == ".csv":
+        return _parse_maxwell_stim_sidecar_csv(path)
+    if suffix == ".txt":
+        return _parse_maxwell_stim_sidecar_txt(path)
+    return {}
+
+
+def _parse_maxwell_stim_sidecar_json(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    records: List[Dict[str, Any]] = []
+    stim_times: List[float] = []
+    stim_electrodes: List[int] = []
+    if isinstance(payload, dict):
+        for key in ("stim_times_sec", "stim_times", "times_sec"):
+            values = payload.get(key, [])
+            if isinstance(values, list):
+                stim_times.extend(float(value) for value in values if _is_finite_number(value))
+        for key in ("stim_records", "stimulus_records", "stimuli", "events"):
+            values = payload.get(key, [])
+            if isinstance(values, list):
+                for item in values:
+                    if key == "events" and not _is_stim_sidecar_event(item):
+                        continue
+                    record = _normalize_stim_sidecar_record(item)
+                    if record:
+                        records.append(record)
+    elif isinstance(payload, list):
+        for item in payload:
+            record = _normalize_stim_sidecar_record(item)
+            if record:
+                records.append(record)
+    record_electrodes = [electrode for record in records for electrode in _stim_electrodes_from_record(record)]
+    if record_electrodes:
+        stim_electrodes.extend(record_electrodes)
+    elif isinstance(payload, dict):
+        for key in ("stim_electrodes", "electrodes", "candidate_electrodes", "pool_electrodes"):
+            stim_electrodes.extend(_parse_stim_electrode_values(payload.get(key)))
+    for record in records:
+        record.setdefault("sidecar_source", path.name)
+    return {
+        "stim_times": stim_times,
+        "records": records,
+        "stim_electrodes": stim_electrodes,
+    }
+
+
+def _is_stim_sidecar_event(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return True
+    event_type = str(raw.get("event_type", raw.get("type", "")) or "").lower()
+    if "stim" in event_type:
+        return True
+    for key in ("electrodes", "electrode", "stim_electrodes", "stim_electrode", "stimulation_electrodes"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return True
+    return False
+
+
+def _parse_maxwell_stim_sidecar_csv(path: Path) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not lines:
+        return {}
+    reader = csv.DictReader(lines)
+    if reader.fieldnames:
+        for row in reader:
+            if not _is_stim_sidecar_event(row):
+                continue
+            record = _normalize_stim_sidecar_record(row)
+            if record:
+                record.setdefault("sidecar_source", path.name)
+                records.append(record)
+    return {
+        "stim_times": [record["time_s"] for record in records if _is_finite_number(record.get("time_s"))],
+        "records": records,
+        "stim_electrodes": [electrode for record in records for electrode in _stim_electrodes_from_record(record)],
+    }
+
+
+def _parse_maxwell_stim_sidecar_txt(path: Path) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        time_value = _first_float_from_text(line)
+        if time_value is None:
+            continue
+        record: Dict[str, Any] = {"time_s": float(time_value), "sidecar_source": path.name}
+        electrodes = _parse_stim_electrodes_from_text(line)
+        if electrodes:
+            record["electrodes"] = electrodes
+            record["electrode"] = electrodes[0]
+        records.append(record)
+    return {
+        "stim_times": [record["time_s"] for record in records],
+        "records": records,
+        "stim_electrodes": [electrode for record in records for electrode in _stim_electrodes_from_record(record)],
+    }
+
+
+def _normalize_stim_sidecar_record(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        if _is_finite_number(raw):
+            return {"time_s": float(raw)}
+        return {}
+    record = dict(raw)
+    time_value = None
+    for key in ("time_s", "time_sec", "stim_time_sec", "stim_times_sec", "plan_time_sec", "offset_sec"):
+        if key in record and _is_finite_number(record.get(key)):
+            time_value = float(record.get(key))
+            break
+    if time_value is None:
+        return {}
+    electrodes: List[int] = []
+    for key in (
+        "electrodes",
+        "electrode",
+        "stim_electrodes",
+        "stim_electrode",
+        "stimulation_electrodes",
+        "candidate_electrodes",
+    ):
+        if key in record:
+            electrodes.extend(_parse_stim_electrode_values(record.get(key)))
+    normalized = _json_safe(record)
+    normalized["time_s"] = float(time_value)
+    if electrodes:
+        normalized["electrodes"] = _unique_sidecar_ints(electrodes)
+        normalized.setdefault("electrode", normalized["electrodes"][0])
+    return normalized
+
+
+def _merge_stim_sidecar_records(
+    event_records: List[Dict[str, Any]],
+    sidecar_records: List[Dict[str, Any]],
+    *,
+    tolerance_s: float = 0.002,
+) -> List[Dict[str, Any]]:
+    if not event_records:
+        return [dict(record) for record in sidecar_records]
+    sidecar_by_time = [
+        (float(record.get("time_s")), record)
+        for record in sidecar_records
+        if _is_finite_number(record.get("time_s"))
+    ]
+    if not sidecar_by_time:
+        return event_records
+    merged: List[Dict[str, Any]] = []
+    matched_indices: set[int] = set()
+    for event in event_records:
+        payload = dict(event)
+        event_time = payload.get("time_s")
+        if _is_finite_number(event_time) and not _stim_electrodes_from_record(payload):
+            distances = [
+                (abs(float(event_time) - time_s), index, record)
+                for index, (time_s, record) in enumerate(sidecar_by_time)
+            ]
+            if distances:
+                distance, index, record = min(distances, key=lambda item: item[0])
+                if distance <= tolerance_s:
+                    matched_indices.add(index)
+                    for key, value in record.items():
+                        payload.setdefault(key, value)
+                    payload["stim_sidecar_time_delta_s"] = float(distance)
+        merged.append(payload)
+    if not any(_stim_electrodes_from_record(record) for record in merged):
+        merged.extend(dict(record) for index, (_time_s, record) in enumerate(sidecar_by_time) if index not in matched_indices)
+    return merged
+
+
+def _align_stim_sidecar_records_to_times(
+    sidecar_records: List[Dict[str, Any]],
+    target_times: np.ndarray,
+) -> List[Dict[str, Any]]:
+    targets = np.asarray(target_times, dtype=float)
+    targets = targets[np.isfinite(targets)]
+    records = [dict(record) for record in sidecar_records if _is_finite_number(record.get("time_s"))]
+    if not records or targets.size != len(records):
+        return sidecar_records
+    records.sort(key=lambda item: (int(item.get("stim_index", 0) or 0), float(item.get("time_s", 0.0))))
+    targets = np.sort(targets)
+    aligned: List[Dict[str, Any]] = []
+    for record, target_time in zip(records, targets):
+        payload = dict(record)
+        original_time = float(payload.get("time_s"))
+        payload.setdefault("sidecar_time_s", original_time)
+        payload.setdefault("sidecar_stim_time_sec", payload.get("stim_time_sec", original_time))
+        payload["time_s"] = float(target_time)
+        payload["stim_time_sec"] = float(target_time)
+        payload["stim_time_source"] = "maxwell_h5_event_aligned"
+        payload["stim_sidecar_time_delta_s"] = float(target_time) - float(original_time)
+        aligned.append(payload)
+    return aligned
+
+
+def _unique_stim_sidecar_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[Tuple[int, Tuple[int, ...]]] = set()
+    result: List[Dict[str, Any]] = []
+    for record in records:
+        time_s = record.get("time_s")
+        if not _is_finite_number(time_s):
+            continue
+        electrodes = tuple(_stim_electrodes_from_record(record))
+        key = (int(round(float(time_s) * 1_000_000)), electrodes)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(record))
+    return result
+
+
+def _stim_electrodes_from_record(record: Dict[str, Any]) -> List[int]:
+    values: List[int] = []
+    for key in ("electrodes", "electrode", "stim_electrodes", "stim_electrode", "stimulation_electrodes"):
+        if isinstance(record, dict) and key in record:
+            values.extend(_parse_stim_electrode_values(record.get(key)))
+    return _unique_sidecar_ints(values)
+
+
+def _parse_stim_electrode_values(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        values: List[int] = []
+        for key in ("electrodes", "electrode", "values", "group"):
+            if key in value:
+                values.extend(_parse_stim_electrode_values(value.get(key)))
+        return _unique_sidecar_ints(values)
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        values: List[int] = []
+        for item in value:
+            values.extend(_parse_stim_electrode_values(item))
+        return _unique_sidecar_ints(values)
+    if isinstance(value, (int, np.integer)):
+        return [int(value)]
+    if isinstance(value, float) and np.isfinite(value) and float(value).is_integer():
+        return [int(value)]
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return []
+    return _unique_sidecar_ints(int(token) for token in re.findall(r"[-+]?\d+", text))
+
+
+def _parse_stim_electrodes_from_text(text: str) -> List[int]:
+    matches = []
+    for pattern in (r"electrodes?\s*[:=]\s*([^\s#]+)", r"sites?\s*[:=]\s*([^\s#]+)"):
+        matches.extend(match.group(1) for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    values: List[int] = []
+    for match in matches:
+        values.extend(_parse_stim_electrode_values(match))
+    return _unique_sidecar_ints(values)
+
+
+def _first_float_from_text(text: str) -> Optional[float]:
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_int_like(value: Any) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _unique_sidecar_ints(values) -> List[int]:
+    seen: set[int] = set()
+    result: List[int] = []
+    for value in values:
+        try:
+            item = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _unique_sidecar_strings(values) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _nev_type_label(file_type_id: bytes) -> str:
@@ -2051,6 +2609,7 @@ def read_blackrock_nev(file_path: str | Path, cancel_check=None) -> UnifiedMEADa
 def read_unified_npz(path: str | Path) -> UnifiedMEAData:
     """Read a unified NPZ file produced by downstream curation workflows."""
 
+    path = Path(path)
     with np.load(path, allow_pickle=True) as npz:
         stim_times = np.asarray(npz.get("stim_times", np.array([], dtype=float)), dtype=float)
 
@@ -2132,6 +2691,9 @@ def read_unified_npz(path: str | Path) -> UnifiedMEAData:
                 channel = key[len("embed_") :]
                 sorting.setdefault(channel, {})["embedding"] = np.asarray(npz[key], dtype=np.float32)
 
+    meta = _augment_stim_metadata_from_sidecar(path, meta, stim_times)
+    if "stim_times_from_sidecar" in meta and stim_times.size == 0:
+        stim_times = np.asarray(meta.get("stim_times_from_sidecar", []), dtype=float)
     return UnifiedMEAData(
         spikes=spikes,
         waveforms=waveforms,
@@ -2141,6 +2703,31 @@ def read_unified_npz(path: str | Path) -> UnifiedMEAData:
         meta=meta,
         sorting={channel: obj for channel, obj in sorting.items() if obj},
     )
+
+
+def _augment_stim_metadata_from_sidecar(path: Path, meta: Dict[str, Any], stim_times: np.ndarray) -> Dict[str, Any]:
+    if not isinstance(meta, dict):
+        meta = {}
+    has_sites = bool(meta.get("stim_electrodes")) or bool(meta.get("stimulus_records"))
+    sidecar_stim = _load_maxwell_stim_sidecar(path)
+    sidecar_records = list(sidecar_stim.get("stimulus_records", []) or [])
+    sidecar_electrodes = list(sidecar_stim.get("stim_electrodes", []) or [])
+    sidecar_times = np.asarray(sidecar_stim.get("stim_times", np.array([], dtype=float)), dtype=float)
+    meta = dict(meta)
+    meta["stimulus_sidecar_files"] = sidecar_stim.get("files", [])
+    meta["stimulus_sidecar_candidates"] = sidecar_stim.get("candidate_files", [])
+    meta["stimulus_sidecar_summary"] = sidecar_stim.get("summary", {})
+    if not has_sites and (sidecar_records or sidecar_electrodes):
+        if sidecar_electrodes:
+            meta["stim_electrodes"] = sidecar_electrodes
+        if sidecar_records:
+            meta["stimulus_records"] = sidecar_records
+            existing_events = list(meta.get("event_records", []) or [])
+            meta["event_records"] = _merge_stim_sidecar_records(existing_events, sidecar_records)
+    if np.asarray(stim_times, dtype=float).size == 0 and sidecar_times.size:
+        meta["stim_times_from_sidecar"] = sidecar_times.tolist()
+        meta.setdefault("event_count", int(sidecar_times.size))
+    return meta
 
 
 def save_unified_npz(data: UnifiedMEAData, path: str | Path, *, include_waveforms: bool = True) -> Path:
@@ -2155,13 +2742,14 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path, *, include_waveform
 
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    save_meta = _metadata_with_same_folder_stim_sidecar_for_save(data)
 
     arrays: Dict[str, Any] = {
         "stim_times": np.asarray(data.stim_times, dtype=float),
         "bad_intervals": np.asarray(data.bad_intervals, dtype=float).reshape(-1, 2)
         if np.asarray(data.bad_intervals).size
         else np.zeros((0, 2), dtype=float),
-        "meta_json": json.dumps(_json_safe(data.meta), ensure_ascii=False),
+        "meta_json": json.dumps(_json_safe(save_meta), ensure_ascii=False),
         "sorting_meta_json": json.dumps(
             _json_safe({key: value for key, value in data.sorting.items() if str(key).startswith("_")}),
             ensure_ascii=False,
@@ -2203,6 +2791,19 @@ def save_unified_npz(data: UnifiedMEAData, path: str | Path, *, include_waveform
 
     np.savez_compressed(output, **arrays)
     return output
+
+
+def _metadata_with_same_folder_stim_sidecar_for_save(data: UnifiedMEAData) -> Dict[str, Any]:
+    meta = dict(data.meta) if isinstance(data.meta, dict) else {}
+    if meta.get("stim_electrodes") and meta.get("stimulus_records"):
+        return meta
+    source_path = meta.get("file") or meta.get("source_file") or meta.get("path")
+    if not source_path:
+        return meta
+    try:
+        return _augment_stim_metadata_from_sidecar(Path(str(source_path)), meta, np.asarray(data.stim_times, dtype=float))
+    except Exception:
+        return meta
 
 
 def save_spike_train_npz(data: UnifiedMEAData, path: str | Path) -> Path:

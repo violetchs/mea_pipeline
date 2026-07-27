@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import re
 import time
@@ -17,9 +19,22 @@ from python.maxwell_setup import (
     probe_stimulation_electrodes,
 )
 from python.random_stim_plan import build_poisson_random_plan
+from python.random_stim_plan import build_electrode_pool_sequence_plan
+from python.random_stim_plan import build_site_switch_plan
+from python.random_stim_plan import electrode_pool_event_groups
+from python.random_stim_plan import site_switch_event_groups_for_count
 from python.random_stim_plan import poisson_rates_for_electrodes
 from python.random_stim_plan import select_poisson_candidate_electrodes
 from python.utils.time_log import ExternalTimeLog, SegmentStimLog
+
+PLAN_PROTOCOL_TYPES = {"poisson_random_electrodes", "electrode_pool_sequence"}
+
+
+def _protocol_uses_plan(protocol: dict[str, Any]) -> bool:
+    if protocol.get("type") in PLAN_PROTOCOL_TYPES:
+        return True
+    switch_cfg = protocol.get("site_switch", {}) or {}
+    return bool(switch_cfg.get("enabled", False))
 
 
 def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, Any], run_dir: Path, dry_run: bool = False) -> None:
@@ -30,6 +45,7 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
 
     groups = {item["name"]: item for item in stimulation_config.get("electrode_groups", [])}
     protocols = {item["name"]: item for item in stimulation_config.get("protocols", [])}
+    _hydrate_site_switch_event_centers(protocols, groups)
     blocks = system_config.get("experiment", {}).get("blocks", [])
     if not blocks:
         raise ValueError("No experiment.blocks configured")
@@ -100,7 +116,28 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
             )
             if protocol and electrode_group:
                 electrode_group = _effective_electrode_group(protocol, electrode_group)
-                if not dry_run and protocol.get("type") != "poisson_random_electrodes" and not is_record_only:
+                if not dry_run and not _protocol_uses_plan(protocol) and not is_record_only:
+                    electrode_group, replacements, unresolved_electrodes = _replace_unconnectable_stimulation_electrodes(
+                        cfg_path,
+                        electrode_group,
+                        system_config,
+                        protocol,
+                    )
+                    if replacements:
+                        replacement_text = ",".join(f"{source}->{target}" for source, target in replacements.items())
+                        logging.warning("Replaced unconnectable stimulation electrodes: %s", replacement_text)
+                        audit.mark_event(
+                            "stimulation_electrode_replacement",
+                            block_name,
+                            "",
+                            "",
+                            extra={"replacements": replacement_text},
+                        )
+                    if unresolved_electrodes:
+                        raise RuntimeError(
+                            "No connectable replacement found for stimulation electrode(s): "
+                            + ",".join(str(item) for item in unresolved_electrodes)
+                        )
                     audit.mark_event(
                         "array_configure_start",
                         block_name,
@@ -218,6 +255,55 @@ def _validate_cfg_stimulation_sites(
     }
 
 
+def _hydrate_site_switch_event_centers(protocols: dict[str, dict[str, Any]], groups: dict[str, dict[str, Any]]) -> None:
+    centers_by_values: dict[tuple[int, ...], int] = {}
+    for group in groups.values():
+        values = tuple(_event_group_values(group.get("electrodes", [])))
+        center = _group_center_electrode(group)
+        if values and center is not None:
+            centers_by_values[values] = int(center)
+            centers_by_values[tuple(sorted(values))] = int(center)
+    for protocol in protocols.values():
+        switch_cfg = protocol.get("site_switch", {}) if isinstance(protocol, dict) else {}
+        if not isinstance(switch_cfg, dict) or not switch_cfg.get("enabled"):
+            continue
+        event_groups = switch_cfg.get("event_groups") or []
+        if not event_groups or switch_cfg.get("event_group_centers"):
+            continue
+        centers: list[int | None] = []
+        for raw_group in event_groups:
+            values = _event_group_values(raw_group)
+            center = centers_by_values.get(tuple(values), centers_by_values.get(tuple(sorted(values))))
+            if center is None and values:
+                center = int(values[0])
+            centers.append(center)
+        if any(center is not None for center in centers):
+            switch_cfg["event_group_centers"] = centers
+
+
+def _event_group_values(raw_group: Any) -> list[int]:
+    if raw_group is None:
+        return []
+    if isinstance(raw_group, str):
+        return [int(float(token)) for token in re.split(r"[\s,;]+", raw_group.strip("[]()")) if token.strip()]
+    if isinstance(raw_group, dict):
+        for key in ("electrodes", "group", "values"):
+            if key in raw_group:
+                return _event_group_values(raw_group.get(key))
+        return []
+    if isinstance(raw_group, (list, tuple, set)):
+        values: list[int] = []
+        for value in raw_group:
+            if isinstance(value, (list, tuple, set, dict)):
+                values.extend(_event_group_values(value))
+            elif isinstance(value, str) and ("," in value or ";" in value or value.strip().startswith("[")):
+                values.extend(_event_group_values(value))
+            else:
+                values.append(int(value))
+        return _unique_ints(values)
+    return [int(raw_group)]
+
+
 def _cfg_recording_electrodes(cfg_path: Path) -> set[int]:
     if not cfg_path.is_file():
         raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
@@ -319,9 +405,64 @@ def _run_stim_phase(
             fallback_electrodes=[int(item) for item in filtered_group.get("electrodes", [])],
         )
         stim_times = [float(row["time_sec"]) for row in plan_rows]
+    elif protocol.get("type") == "electrode_pool_sequence":
+        filtered_group = dict(electrode_group)
+        filtered_group["electrodes"] = [int(item) for item in electrode_group.get("electrodes", [])]
+        if not filtered_group["electrodes"]:
+            raise ValueError("Electrode pool sequence needs a non-empty site group")
+        plan_rows = build_electrode_pool_sequence_plan(
+            protocol=protocol,
+            phase_dir=phase_dir,
+            duration_s=duration_s,
+            fallback_electrodes=filtered_group["electrodes"],
+        )
+        stim_times = [float(row["time_sec"]) for row in plan_rows]
+    elif _protocol_uses_plan(protocol):
+        filtered_group = dict(electrode_group)
+        filtered_group["electrodes"] = [int(item) for item in electrode_group.get("electrodes", [])]
+        if not filtered_group["electrodes"]:
+            raise ValueError("Site switching needs a non-empty site group")
+        base_stim_times = get_stim_times_for_protocol(protocol, duration_s)
+        plan_rows = build_site_switch_plan(
+            protocol=protocol,
+            phase_dir=phase_dir,
+            duration_s=duration_s,
+            fallback_electrodes=filtered_group["electrodes"],
+            stim_times_sec=base_stim_times,
+        )
+        stim_times = [float(row["time_sec"]) for row in plan_rows]
     else:
         plan_rows = []
         stim_times = get_stim_times_for_protocol(protocol, duration_s)
+    if not dry_run and _protocol_uses_plan(protocol) and protocol.get("type") != "poisson_random_electrodes":
+        plan_electrodes = sorted(_planned_electrodes(plan_rows, filtered_group))
+        electrode_center_lookup = _planned_electrode_centers(plan_rows, filtered_group)
+        probe_group = dict(filtered_group)
+        probe_group["electrodes"] = plan_electrodes
+        filtered_group, replacements, unresolved_electrodes = _replace_unconnectable_stimulation_electrodes(
+            cfg_path,
+            probe_group,
+            system_config,
+            protocol,
+            electrode_center_lookup=electrode_center_lookup,
+        )
+        if replacements:
+            plan_rows = _apply_electrode_replacements_to_plan_rows(plan_rows, replacements)
+            _rewrite_replaced_stim_plan_files(phase_dir, plan_rows, filtered_group, replacements)
+            replacement_text = ",".join(f"{source}->{target}" for source, target in replacements.items())
+            logging.warning("Replaced unconnectable stimulation electrodes in plan: %s", replacement_text)
+            audit.mark_event(
+                "stimulation_electrode_replacement",
+                block_name,
+                phase_id,
+                segment_name,
+                extra={"replacements": replacement_text},
+            )
+        if unresolved_electrodes:
+            raise RuntimeError(
+                "No connectable replacement found for stimulation electrode(s): "
+                + ",".join(str(item) for item in unresolved_electrodes)
+            )
     planned_electrodes = _planned_electrodes(plan_rows, electrode_group)
     audit.mark_event(
         "stim_plan_ready",
@@ -353,7 +494,7 @@ def _run_stim_phase(
         logging.info("Dry run: %s %s pulses=%d", block_name, protocol.get("name"), len(stim_times))
         audit.mark_event("stim_dry_run_complete", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
     else:
-        if protocol.get("type") == "poisson_random_electrodes":
+        if _protocol_uses_plan(protocol):
             audit.mark_event(
                 "array_configure_start",
                 block_name,
@@ -378,7 +519,7 @@ def _run_stim_phase(
                 segment_name,
                 extra={"stim_unit_count": len(set(stim_unit_by_electrode.values()))},
             )
-            logging.info("Poisson array configured: block=%s stim_units=%d", block_name, len(set(stim_unit_by_electrode.values())))
+            logging.info("Plan-based array configured: block=%s stim_units=%d", block_name, len(set(stim_unit_by_electrode.values())))
         audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": "stimulation"})
         saving = create_experiment_saving(phase_dir, segment_name)
         record_start_epoch = time.time()
@@ -396,7 +537,7 @@ def _run_stim_phase(
             )
             time.sleep(recording_settle_s)
             audit.mark_event("recording_settle_done", block_name, phase_id, segment_name, extra={"recording_settle_s": recording_settle_s})
-        if protocol.get("type") == "poisson_random_electrodes":
+        if _protocol_uses_plan(protocol):
             audit.mark_event("stim_sequence_build_start", block_name, phase_id, segment_name, extra={"protocol_type": protocol_type})
             sequence = build_poisson_random_sequence(protocol, plan_rows, stim_unit_by_electrode)
             audit.mark_event("stim_sequence_build_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
@@ -450,23 +591,24 @@ def _run_stim_phase(
     for index, stim_time in enumerate(stim_times, start=1):
         plan_row = plan_rows[index - 1] if plan_rows else {}
         epoch_sec = sequence_start_epoch + stim_time
-        segment_log.add_stim(epoch_sec, index)
+        stim_extra = {
+            "stim_index": index,
+            "stim_time_sec": stim_time + sequence_start_offset,
+            "plan_time_sec": stim_time,
+            "amplitude_mv": plan_row.get("amplitude_mv", protocol.get("amplitude_mv", "")),
+            "electrodes": _plan_row_electrodes_text(plan_row, electrode_group),
+            "lambda_hz": plan_row.get("lambda_hz", ""),
+            "firing_rate_hz": plan_row.get("firing_rate_hz", ""),
+            "pulses_per_stimulus": plan_row.get("pulses_per_stimulus", protocol.get("pulses_per_burst", "")),
+        }
+        segment_log.add_stim(epoch_sec, index, extra=stim_extra)
         audit.mark_event(
             "stim_send",
             block_name,
             phase_id,
             segment_name,
             epoch_sec=epoch_sec,
-            extra={
-                "stim_index": index,
-                "stim_time_sec": stim_time + sequence_start_offset,
-                "plan_time_sec": stim_time,
-                "amplitude_mv": plan_row.get("amplitude_mv", protocol.get("amplitude_mv", "")),
-                "electrodes": str(plan_row.get("electrode", ",".join(str(item) for item in electrode_group.get("electrodes", [])))),
-                "lambda_hz": plan_row.get("lambda_hz", ""),
-                "firing_rate_hz": plan_row.get("firing_rate_hz", ""),
-                "pulses_per_stimulus": plan_row.get("pulses_per_stimulus", protocol.get("pulses_per_burst", "")),
-            },
+            extra=stim_extra,
         )
     segment_log.record_end_epoch = time.time()
     segment_log.save_txt(phase_dir / "stim_times.txt")
@@ -501,6 +643,32 @@ def _planned_electrodes(plan_rows: list[dict[str, Any]], electrode_group: dict[s
     return electrodes
 
 
+def _planned_electrode_centers(plan_rows: list[dict[str, Any]], electrode_group: dict[str, Any]) -> dict[int, int]:
+    lookup: dict[int, int] = {}
+    fallback_center = _group_center_electrode(electrode_group)
+    for row in plan_rows:
+        center = row.get("center_electrode", fallback_center)
+        try:
+            center_int = int(center)
+        except (TypeError, ValueError):
+            continue
+        for electrode in _planned_electrodes([row], electrode_group):
+            lookup[int(electrode)] = center_int
+    return lookup
+
+
+def _plan_row_electrodes_text(plan_row: dict[str, Any], electrode_group: dict[str, Any]) -> str:
+    if "electrodes" in plan_row:
+        values = plan_row.get("electrodes")
+        if isinstance(values, str):
+            return values
+        if isinstance(values, (list, tuple)):
+            return ",".join(str(int(value)) for value in values)
+    if "electrode" in plan_row:
+        return str(plan_row.get("electrode"))
+    return ",".join(str(item) for item in electrode_group.get("electrodes", []))
+
+
 def _recording_settle_s(system_config: dict[str, Any], protocol: dict[str, Any]) -> float:
     maxwell_cfg = system_config.get("maxwell", {}) if isinstance(system_config, dict) else {}
     protocol_cfg = protocol.get("random_electrode_plan", {}) if isinstance(protocol, dict) else {}
@@ -512,14 +680,96 @@ def _recording_settle_s(system_config: dict[str, Any], protocol: dict[str, Any])
 
 
 def _effective_electrode_group(protocol: dict[str, Any], electrode_group: dict[str, Any]) -> dict[str, Any]:
-    if protocol.get("type") != "poisson_random_electrodes":
-        return electrode_group
     fallback = [int(item) for item in electrode_group.get("electrodes", [])]
-    candidate_electrodes = select_poisson_candidate_electrodes(protocol, fallback)
+    if protocol.get("type") == "poisson_random_electrodes":
+        candidate_electrodes = select_poisson_candidate_electrodes(protocol, fallback)
+        source = "poisson_random_electrodes"
+    elif protocol.get("type") == "electrode_pool_sequence":
+        event_groups = electrode_pool_event_groups(protocol, fallback)
+        candidate_electrodes = _unique_ints([electrode for group in event_groups for electrode in group]) or fallback
+        source = "electrode_pool_sequence"
+    elif _protocol_uses_plan(protocol):
+        stim_count = len(get_stim_times_for_protocol(protocol, 24 * 60 * 60))
+        event_groups = site_switch_event_groups_for_count(protocol, fallback, stim_count)
+        candidate_electrodes = _unique_ints([electrode for group in event_groups for electrode in group]) or fallback
+        source = "site_switch"
+    else:
+        return electrode_group
     effective = dict(electrode_group)
     effective["electrodes"] = candidate_electrodes
-    effective["candidate_source"] = "poisson_random_electrodes"
+    effective["candidate_source"] = source
     return effective
+
+
+def _apply_electrode_replacements_to_plan_rows(
+    plan_rows: list[dict[str, Any]],
+    replacements: dict[int, int],
+) -> list[dict[str, Any]]:
+    if not replacements:
+        return list(plan_rows)
+    updated: list[dict[str, Any]] = []
+    for row in plan_rows:
+        next_row = dict(row)
+        if "electrodes" in next_row:
+            values = next_row.get("electrodes")
+            if isinstance(values, str):
+                electrodes = [int(float(token)) for token in values.replace(";", ",").split(",") if token.strip()]
+                next_row["electrodes"] = ",".join(str(replacements.get(electrode, electrode)) for electrode in electrodes)
+            elif isinstance(values, (list, tuple)):
+                next_row["electrodes"] = [int(replacements.get(int(electrode), int(electrode))) for electrode in values]
+        if "electrode" in next_row:
+            electrode = int(next_row["electrode"])
+            next_row["electrode"] = int(replacements.get(electrode, electrode))
+        updated.append(next_row)
+    return updated
+
+
+def _rewrite_replaced_stim_plan_files(
+    phase_dir: Path,
+    plan_rows: list[dict[str, Any]],
+    electrode_group: dict[str, Any],
+    replacements: dict[int, int],
+) -> None:
+    if not replacements:
+        return
+    csv_path = phase_dir / "stim_plan.csv"
+    json_path = phase_dir / "stim_plan.json"
+    fieldnames = [
+        "time_sec",
+        "electrode",
+        "electrodes",
+        "firing_rate_hz",
+        "lambda_hz",
+        "amplitude_mv",
+        "pulse_width_us",
+        "pulses_per_stimulus",
+        "center_electrode",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in plan_rows:
+            csv_row = {key: row.get(key, "") for key in fieldnames}
+            if isinstance(csv_row.get("electrodes"), (list, tuple)):
+                csv_row["electrodes"] = ",".join(str(int(item)) for item in csv_row["electrodes"])
+            writer.writerow(csv_row)
+
+    payload: dict[str, Any] = {}
+    if json_path.exists():
+        try:
+            loaded = json.loads(json_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except Exception:
+            payload = {}
+    payload["candidate_electrodes"] = [int(item) for item in electrode_group.get("electrodes", [])]
+    config = payload.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+    config["stimulation_electrode_replacements"] = {str(source): int(target) for source, target in replacements.items()}
+    payload["config"] = config
+    payload["stimuli"] = plan_rows
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _replace_unconnectable_poisson_electrodes(
@@ -531,6 +781,35 @@ def _replace_unconnectable_poisson_electrodes(
     original_electrodes = [int(item) for item in electrode_group.get("electrodes", [])]
     rates, random_cfg = poisson_rates_for_electrodes(protocol, original_electrodes, restrict_to_fallback=False)
     floor = float(random_cfg.get("lambda_floor_hz", 0.001))
+    return _replace_unconnectable_stimulation_electrodes(
+        cfg_path,
+        electrode_group,
+        system_config,
+        protocol,
+        rates=rates,
+        floor=floor,
+        max_radius=int(random_cfg.get("replacement_max_radius", 10) or 10),
+    )
+
+
+def _replace_unconnectable_stimulation_electrodes(
+    cfg_path: Path,
+    electrode_group: dict[str, Any],
+    system_config: dict[str, Any],
+    protocol: dict[str, Any] | None = None,
+    *,
+    rates: dict[int, float] | None = None,
+    floor: float = 1.0,
+    max_radius: int | None = None,
+    electrode_center_lookup: dict[int, int] | None = None,
+) -> tuple[dict[str, Any], dict[int, int], list[int]]:
+    original_electrodes = _unique_ints([int(item) for item in electrode_group.get("electrodes", [])])
+    rate_map = rates or {electrode: float(floor) for electrode in original_electrodes}
+    maxwell_cfg = system_config.get("maxwell", {}) if isinstance(system_config, dict) else {}
+    protocol_cfg = protocol.get("random_electrode_plan", {}) if isinstance(protocol, dict) else {}
+    if max_radius is None:
+        max_radius = int(protocol_cfg.get("replacement_max_radius", maxwell_cfg.get("replacement_max_radius", 10)) or 10)
+    max_radius = max(2, int(max_radius))
     connected_electrodes, missing_electrodes, stim_unit_by_electrode = probe_stimulation_electrodes(
         cfg_path,
         electrode_group,
@@ -539,7 +818,7 @@ def _replace_unconnectable_poisson_electrodes(
     primary_electrodes, stim_unit_conflicts = _dedupe_by_stimulation_unit(
         connected_electrodes,
         stim_unit_by_electrode,
-        rates,
+        rate_map,
         floor,
     )
     unresolved_targets = _unique_ints([*missing_electrodes, *stim_unit_conflicts])
@@ -548,19 +827,31 @@ def _replace_unconnectable_poisson_electrodes(
         filtered["electrodes"] = primary_electrodes
         return filtered, {}, []
 
-    max_radius = max(2, int(random_cfg.get("replacement_max_radius", 10) or 10))
     search_radii = _replacement_search_radii(max_radius)
     used = set(primary_electrodes)
     used_stim_units = {int(stim_unit_by_electrode[electrode]) for electrode in primary_electrodes if electrode in stim_unit_by_electrode}
     missing_set = set(unresolved_targets)
-    neighbor_pool = sorted(
-        {
-            candidate
-            for electrode in unresolved_targets
-            for candidate in _electrode_neighbors(electrode, max_radius)
-            if candidate not in missing_set
-        }
-    )
+    cfg_electrodes = _cfg_recording_electrodes(cfg_path)
+    center_electrode = _group_center_electrode(electrode_group)
+    center_lookup = {int(key): int(value) for key, value in (electrode_center_lookup or {}).items()}
+    center_pool = sorted(set(center_lookup.values()) | ({center_electrode} if center_electrode is not None else set()))
+    if center_pool:
+        neighbor_pool = sorted(
+            (candidate for candidate in cfg_electrodes if candidate not in missing_set),
+            key=lambda candidate: (
+                min(_electrode_grid_distance(center, candidate) for center in center_pool),
+                candidate,
+            ),
+        )
+    else:
+        neighbor_pool = sorted(
+            {
+                candidate
+                for electrode in unresolved_targets
+                for candidate in _electrode_neighbors(electrode, max_radius)
+                if candidate not in missing_set and candidate in cfg_electrodes
+            }
+        )
     probe_group = dict(electrode_group)
     probe_group["electrodes"] = neighbor_pool
     if neighbor_pool:
@@ -578,11 +869,16 @@ def _replace_unconnectable_poisson_electrodes(
     unresolved: list[int] = []
     for electrode in unresolved_targets:
         replacement = None
-        for radius in search_radii:
+        target_center = center_lookup.get(int(electrode), center_electrode)
+        for radius in ([None] if target_center is not None else search_radii):
+            if target_center is not None:
+                radius_candidates = neighbor_pool
+            else:
+                radius_candidates = _electrode_neighbors(electrode, radius)
             ranked = sorted(
                 (
                     candidate
-                    for candidate in _electrode_neighbors(electrode, radius)
+                    for candidate in radius_candidates
                     if (
                         candidate in connectable_neighbor_set
                         and candidate not in used
@@ -590,8 +886,8 @@ def _replace_unconnectable_poisson_electrodes(
                     )
                 ),
                 key=lambda candidate: (
-                    -float(rates.get(candidate, floor)),
-                    _electrode_grid_distance(electrode, candidate),
+                    -float(rate_map.get(candidate, floor)),
+                    _electrode_grid_distance(target_center if target_center is not None else electrode, candidate),
                     candidate,
                 ),
             )
@@ -613,6 +909,8 @@ def _replace_unconnectable_poisson_electrodes(
             resolved_electrodes.append(replacements[electrode])
     filtered = dict(electrode_group)
     filtered["electrodes"] = _unique_ints(resolved_electrodes)
+    if not filtered["electrodes"]:
+        return filtered, replacements, unresolved
     final_connected, _final_missing, final_stim_units = probe_stimulation_electrodes(
         cfg_path,
         filtered,
@@ -621,13 +919,23 @@ def _replace_unconnectable_poisson_electrodes(
     final_primary, final_conflicts = _dedupe_by_stimulation_unit(
         final_connected,
         final_stim_units,
-        rates,
+        rate_map,
         floor,
     )
     if final_conflicts:
         unresolved.extend(final_conflicts)
         filtered["electrodes"] = final_primary
     return filtered, replacements, unresolved
+
+
+def _group_center_electrode(electrode_group: dict[str, Any]) -> int | None:
+    try:
+        value = electrode_group.get("center_electrode")
+        if value is None or str(value).strip() == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _dedupe_by_stimulation_unit(
