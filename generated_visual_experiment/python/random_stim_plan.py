@@ -65,7 +65,8 @@ def build_poisson_random_plan(
     fallback_electrodes: list[int],
 ) -> list[dict[str, Any]]:
     rates, random_cfg = _poisson_rates_and_config(protocol, fallback_electrodes)
-    candidate_electrodes = select_candidate_electrodes(
+    explicit = _unique_ints([int(value) for value in random_cfg.get("candidate_electrodes", []) or []])
+    candidate_electrodes = explicit or select_candidate_electrodes(
         rates,
         region_count=int(random_cfg.get("region_count", 32)),
         max_candidates=int(random_cfg.get("max_candidate_electrodes", 32)),
@@ -113,34 +114,6 @@ def build_poisson_random_plan(
         )
     save_plan(phase_dir, rows, candidate_electrodes, random_cfg)
     return rows
-
-
-def enforce_common_dac_spacing(
-    rows: list[dict[str, Any]],
-    *,
-    inter_phase_interval_us: float = 0.0,
-    duration_s: float,
-) -> tuple[list[dict[str, Any]], int, float]:
-    filtered: list[dict[str, Any]] = []
-    next_available_s = 0.0
-    skipped = 0
-    max_interval_s = 0.0
-    for row in rows:
-        interval_s = (2.0 * float(row.get("pulse_width_us", 300.0)) + max(0.0, float(inter_phase_interval_us))) / 1_000_000.0
-        max_interval_s = max(max_interval_s, interval_s)
-        time_s = float(row["time_sec"])
-        if time_s + 1e-9 < next_available_s:
-            skipped += 1
-            continue
-        if time_s > float(duration_s):
-            skipped += 1
-            continue
-        item = dict(row)
-        item["time_sec"] = round(time_s, 6)
-        item["pulses_per_stimulus"] = 1
-        filtered.append(item)
-        next_available_s = time_s + interval_s
-    return filtered, skipped, max_interval_s
 
 
 def build_electrode_pool_sequence_plan(
@@ -438,7 +411,39 @@ def _expand_pool_event_groups(base_groups: list[list[int]], *, mode: str, repeat
     return [list(group) for _repeat in range(max(1, int(repeats))) for group in groups]
 
 
+def enforce_common_dac_spacing(
+    rows: list[dict[str, Any]],
+    *,
+    inter_phase_interval_us: float = 0.0,
+    duration_s: float,
+) -> tuple[list[dict[str, Any]], int, float]:
+    filtered: list[dict[str, Any]] = []
+    next_available_s = 0.0
+    skipped = 0
+    max_interval_s = 0.0
+    for row in rows:
+        interval_s = (2.0 * float(row.get("pulse_width_us", 300.0)) + max(0.0, float(inter_phase_interval_us))) / 1_000_000.0
+        max_interval_s = max(max_interval_s, interval_s)
+        time_s = float(row["time_sec"])
+        if time_s + 1e-9 < next_available_s:
+            skipped += 1
+            continue
+        if time_s > float(duration_s):
+            skipped += 1
+            continue
+        item = dict(row)
+        item["time_sec"] = round(time_s, 6)
+        item["pulses_per_stimulus"] = 1
+        filtered.append(item)
+        next_available_s = time_s + interval_s
+    return filtered, skipped, max_interval_s
+
+
 def select_poisson_candidate_electrodes(protocol: dict[str, Any], fallback_electrodes: list[int]) -> list[int]:
+    random_cfg = protocol.get("random_electrode_plan", {}) if isinstance(protocol, dict) else {}
+    explicit = _unique_ints([int(value) for value in random_cfg.get("candidate_electrodes", []) or []])
+    if explicit:
+        return explicit
     rates, random_cfg = _poisson_rates_and_config(protocol, fallback_electrodes)
     candidate_electrodes = select_candidate_electrodes(
         rates,
@@ -563,10 +568,22 @@ def _first_existing(row: dict[str, Any], candidates: list[str]) -> str | None:
     return None
 
 
-def select_candidate_electrodes(rates: dict[int, float], region_count: int, max_candidates: int) -> list[int]:
+def select_candidate_electrodes(
+    rates: dict[int, float],
+    region_count: int,
+    max_candidates: int,
+    electrode_order: list[int] | None = None,
+) -> list[int]:
     if region_count <= 0:
         region_count = 32
-    sorted_items = sorted(rates.items(), key=lambda item: item[0])
+    order_lookup = {int(electrode): index for index, electrode in enumerate(_unique_ints([int(value) for value in electrode_order or []]))}
+    sorted_items = sorted(
+        rates.items(),
+        key=lambda item: (
+            order_lookup.get(int(item[0]), len(order_lookup)),
+            int(item[0]),
+        ),
+    )
     if not sorted_items:
         return []
     if len(sorted_items) <= max(1, min(max_candidates, 32)) and int(region_count) >= len(sorted_items):

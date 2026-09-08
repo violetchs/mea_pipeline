@@ -819,6 +819,62 @@ def _maxwell_sampling_rate(group) -> float | None:
     return sr if np.isfinite(sr) and sr > 0 else None
 
 
+_MAXWELL_RAW_DATASET_NAMES = ("raw", "data", "signals", "signal", "traces")
+_MAXWELL_CHANNEL_DATASET_NAMES = ("channels", "channel", "channel_ids", "channel_id")
+_MAXWELL_FRAME_DATASET_NAMES = ("frame_nos", "frameno", "frame_numbers", "frame_number", "frames")
+
+
+def _maxwell_child_dataset(group, names: Tuple[str, ...]):
+    for name in names:
+        if name in group:
+            obj = group[name]
+            if hasattr(obj, "shape") and hasattr(obj, "dtype"):
+                return obj, name
+    return None, ""
+
+
+def _maxwell_raw_group_entry(raw_group) -> Dict[str, Any] | None:
+    raw, raw_name = _maxwell_child_dataset(raw_group, _MAXWELL_RAW_DATASET_NAMES)
+    channels, channels_name = _maxwell_child_dataset(raw_group, _MAXWELL_CHANNEL_DATASET_NAMES)
+    frame_nos, frame_nos_name = _maxwell_child_dataset(raw_group, _MAXWELL_FRAME_DATASET_NAMES)
+    if raw is None or channels is None or frame_nos is None:
+        return None
+    if getattr(raw, "ndim", 0) != 2:
+        return None
+    try:
+        channel_count = int(channels.size)
+        frame_count = int(frame_nos.size)
+    except Exception:
+        return None
+    shape = tuple(int(value) for value in raw.shape)
+    if len(shape) != 2:
+        return None
+    if shape[0] == channel_count and shape[1] == frame_count:
+        channel_axis = 0
+        frame_axis = 1
+    elif shape[1] == channel_count and shape[0] == frame_count:
+        channel_axis = 1
+        frame_axis = 0
+    elif shape[0] == channel_count:
+        channel_axis = 0
+        frame_axis = 1
+    elif shape[1] == channel_count:
+        channel_axis = 1
+        frame_axis = 0
+    else:
+        return None
+    return {
+        "raw": raw,
+        "raw_name": raw_name,
+        "channels": channels,
+        "channels_name": channels_name,
+        "frame_nos": frame_nos,
+        "frame_nos_name": frame_nos_name,
+        "channel_axis": channel_axis,
+        "frame_axis": frame_axis,
+    }
+
+
 def _maxwell_raw_group_metadata(group, group_path: str, sr: float | None) -> Tuple[List[Dict[str, Any]], int | None]:
     raw_groups: List[Dict[str, Any]] = []
     first_frame: int | None = None
@@ -827,10 +883,11 @@ def _maxwell_raw_group_metadata(group, group_path: str, sr: float | None) -> Tup
 
     for group_name in sorted(group["groups"].keys(), key=_maxwell_group_sort_key):
         raw_group = group["groups"][group_name]
+        entry = _maxwell_raw_group_entry(raw_group)
         frame_nos_path = None
-        if "frame_nos" in raw_group:
-            frame_nos = raw_group["frame_nos"]
-            frame_nos_path = f"{group_path}/groups/{group_name}/frame_nos"
+        if entry is not None:
+            frame_nos = entry["frame_nos"]
+            frame_nos_path = f"{group_path}/groups/{group_name}/{entry['frame_nos_name']}"
             if frame_nos.shape and frame_nos.size:
                 try:
                     value = int(frame_nos[0])
@@ -838,18 +895,22 @@ def _maxwell_raw_group_metadata(group, group_path: str, sr: float | None) -> Tup
                 except Exception:
                     pass
 
-        if "raw" not in raw_group:
+        if entry is None:
             continue
-        raw = raw_group["raw"]
+        raw = entry["raw"]
+        frame_axis = int(entry["frame_axis"])
         payload: Dict[str, Any] = {
             "group": str(group_name),
-            "path": f"{group_path}/groups/{group_name}/raw",
+            "path": f"{group_path}/groups/{group_name}/{entry['raw_name']}",
             "shape": tuple(int(value) for value in raw.shape),
             "dtype": str(raw.dtype),
             "frame_nos_path": frame_nos_path,
+            "channels_path": f"{group_path}/groups/{group_name}/{entry['channels_name']}",
+            "channel_axis": int(entry["channel_axis"]),
+            "frame_axis": frame_axis,
         }
         if sr and len(raw.shape) >= 2:
-            payload["duration_s"] = float(raw.shape[1]) / float(sr)
+            payload["duration_s"] = float(raw.shape[frame_axis]) / float(sr)
         raw_groups.append(payload)
     return raw_groups, first_frame
 
@@ -921,6 +982,111 @@ def _maxwell_decode_raw_snippet(snippet: np.ndarray, zero_count: float) -> np.nd
     return snippet
 
 
+def _maxwell_frame_candidates(frames: np.ndarray, frame_nos: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+    source = np.asarray(frames, dtype=np.int64)
+    if source.size == 0:
+        return [("identity", source)]
+    raw_frames = np.asarray(frame_nos, dtype=np.int64)
+    if raw_frames.size == 0:
+        return [("identity", source)]
+    first_frame = int(raw_frames[0])
+    min_source = int(np.nanmin(source))
+    candidates = [
+        ("identity", source),
+        ("local_plus_raw_first", source + first_frame),
+        ("local_plus_raw_first_minus_one", source + first_frame - 1),
+        ("first_spike_to_raw_first", source + first_frame - min_source),
+    ]
+    unique: List[Tuple[str, np.ndarray]] = []
+    seen: set[Tuple[int, int, int]] = set()
+    for name, values in candidates:
+        values = np.asarray(values, dtype=np.int64)
+        key = (int(values[0]), int(values[-1]), int(values.size))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((name, values))
+    return unique
+
+
+def _maxwell_frame_start_indices(
+    frames: np.ndarray,
+    frame_nos: np.ndarray,
+    *,
+    pre: int,
+    post: int,
+    sample_count: int,
+    raw_frame_count: int,
+    contiguous_frames: bool,
+) -> np.ndarray:
+    source = np.asarray(frames, dtype=np.int64)
+    starts = np.full(source.size, -1, dtype=np.int64)
+    if source.size == 0 or frame_nos.size == 0:
+        return starts
+    first_frame = int(frame_nos[0])
+    last_frame = int(frame_nos[-1])
+    for index, frame in enumerate(source):
+        start_frame = int(frame) - int(pre)
+        stop_frame = int(frame) + int(post)
+        if start_frame < first_frame or stop_frame > last_frame:
+            continue
+        if contiguous_frames:
+            start_index = start_frame - first_frame
+            stop_index = start_index + sample_count
+            if start_index < 0 or stop_index > raw_frame_count:
+                continue
+        else:
+            center_index = int(np.searchsorted(frame_nos, int(frame)))
+            start_index = center_index - pre
+            stop_index = start_index + sample_count
+            if start_index < 0 or stop_index > frame_nos.size:
+                continue
+            if frame_nos[start_index] != start_frame or frame_nos[stop_index - 1] != stop_frame:
+                continue
+        starts[index] = int(start_index)
+    return starts
+
+
+def _maxwell_score_waveform_alignment(
+    raw,
+    *,
+    channel_axis: int,
+    frame_axis: int,
+    row: int,
+    start_indices: np.ndarray,
+    sample_count: int,
+    zero_count: float,
+    gain_uv: float | None,
+) -> float:
+    valid_starts = np.asarray(start_indices, dtype=np.int64)
+    valid_starts = valid_starts[valid_starts >= 0]
+    if valid_starts.size == 0:
+        return 0.0
+    if valid_starts.size > 96:
+        take = np.linspace(0, valid_starts.size - 1, 96).astype(int)
+        valid_starts = valid_starts[take]
+    ptp_values: List[float] = []
+    for start_index in valid_starts:
+        stop_index = int(start_index) + int(sample_count)
+        try:
+            if channel_axis == 0 and frame_axis == 1:
+                snippet = np.asarray(raw[int(row), int(start_index):stop_index], dtype=np.float32)
+            else:
+                snippet = np.asarray(raw[int(start_index):stop_index, int(row)], dtype=np.float32)
+        except Exception:
+            continue
+        if snippet.size != sample_count:
+            continue
+        snippet = _maxwell_decode_raw_snippet(snippet, zero_count)
+        if gain_uv is not None:
+            snippet = snippet * np.float32(gain_uv)
+        if np.any(np.isfinite(snippet)):
+            ptp_values.append(float(np.nanmax(snippet) - np.nanmin(snippet)))
+    if not ptp_values:
+        return 0.0
+    return float(np.nanmedian(ptp_values))
+
+
 def _maxwell_extract_waveforms(
     group,
     group_path: str,
@@ -951,28 +1117,31 @@ def _maxwell_extract_waveforms(
 
     raw_group = None
     channel_row = -1
+    raw_entry = None
     for raw_group_name in sorted(group["groups"].keys(), key=_maxwell_group_sort_key):
         candidate = group["groups"][raw_group_name]
-        if "raw" not in candidate or "channels" not in candidate or "frame_nos" not in candidate:
+        entry = _maxwell_raw_group_entry(candidate)
+        if entry is None:
             continue
         try:
-            channels = np.asarray(candidate["channels"])
+            channels = np.asarray(entry["channels"])
         except Exception as exc:
             info["error"] = f"could not read raw channel list: {exc}"
             continue
         rows = np.flatnonzero(channels.astype(int) == int(channel_id))
         if rows.size:
             raw_group = candidate
+            raw_entry = entry
             channel_row = int(rows[0])
             info["raw_group"] = str(raw_group_name)
             break
 
-    if raw_group is None or channel_row < 0:
+    if raw_group is None or raw_entry is None or channel_row < 0:
         info["error"] = "source channel is not present in any raw data group"
         return None, info
 
     try:
-        frame_nos = np.asarray(raw_group["frame_nos"], dtype=np.int64)
+        frame_nos = np.asarray(raw_entry["frame_nos"], dtype=np.int64)
     except Exception as exc:
         info["error"] = f"could not read raw frame numbers: {exc}"
         return None, info
@@ -980,10 +1149,12 @@ def _maxwell_extract_waveforms(
         info["error"] = "raw frame_nos is empty"
         return None, info
 
-    raw = raw_group["raw"]
+    raw = raw_entry["raw"]
     if raw.ndim != 2:
         info["error"] = f"unsupported raw matrix shape: {raw.shape}"
         return None, info
+    channel_axis = int(raw_entry["channel_axis"])
+    frame_axis = int(raw_entry["frame_axis"])
 
     gain_uv = _maxwell_waveform_gain_uv(group)
     zero_count = _maxwell_adc_zero_count(raw, group)
@@ -999,7 +1170,7 @@ def _maxwell_extract_waveforms(
             continue
         start_index = int(start_frame - first_frame)
         stop_index = start_index + sample_count
-        if start_index < 0 or stop_index > raw.shape[1]:
+        if start_index < 0 or stop_index > raw.shape[frame_axis]:
             continue
         if frame_nos[start_index] != start_frame or frame_nos[stop_index - 1] != stop_frame:
             located = int(np.searchsorted(frame_nos, int(frame)))
@@ -1010,7 +1181,10 @@ def _maxwell_extract_waveforms(
             if frame_nos[start_index] != start_frame or frame_nos[stop_index - 1] != stop_frame:
                 continue
         try:
-            snippet = np.asarray(raw[channel_row, start_index:stop_index], dtype=np.float32)
+            if channel_axis == 0 and frame_axis == 1:
+                snippet = np.asarray(raw[channel_row, start_index:stop_index], dtype=np.float32)
+            else:
+                snippet = np.asarray(raw[start_index:stop_index, channel_row], dtype=np.float32)
         except Exception as exc:
             info["error"] = f"could not read raw waveform data: {exc}"
             return None, info
@@ -1042,8 +1216,6 @@ def _maxwell_extract_group_waveforms(
     pre, post, sample_count = _maxwell_waveform_sample_counts(sr, window_ms)
     waveforms_by_channel: Dict[str, np.ndarray] = {}
     info_by_channel: Dict[str, Dict[str, Any]] = {}
-    total_spikes = int(sum(np.asarray(frames).size for _, frames in requests.values()))
-    estimated_bytes = total_spikes * int(sample_count) * np.dtype(np.float32).itemsize
 
     for channel_name, (channel_id, frames) in requests.items():
         info_by_channel[channel_name] = {
@@ -1059,21 +1231,17 @@ def _maxwell_extract_group_waveforms(
 
     if not requests or sample_count <= 0 or "groups" not in group:
         return waveforms_by_channel, info_by_channel
-    if estimated_bytes > int(max_waveform_bytes):
-        error = f"waveform extraction skipped: estimated {estimated_bytes} bytes exceeds limit"
-        for info in info_by_channel.values():
-            info["error"] = error
-        return waveforms_by_channel, info_by_channel
 
     pending = set(requests)
     for raw_group_name in sorted(group["groups"].keys(), key=_maxwell_group_sort_key):
         _raise_if_cancelled(cancel_check)
         raw_group = group["groups"][raw_group_name]
-        if "raw" not in raw_group or "channels" not in raw_group or "frame_nos" not in raw_group:
+        raw_entry = _maxwell_raw_group_entry(raw_group)
+        if raw_entry is None:
             continue
         try:
-            raw_channels = np.asarray(raw_group["channels"], dtype=np.int64)
-            frame_nos = np.asarray(raw_group["frame_nos"], dtype=np.int64)
+            raw_channels = np.asarray(raw_entry["channels"], dtype=np.int64)
+            frame_nos = np.asarray(raw_entry["frame_nos"], dtype=np.int64)
         except Exception as exc:
             for channel_name in pending:
                 info_by_channel[channel_name]["error"] = f"could not read raw channel/frame metadata: {exc}"
@@ -1089,13 +1257,29 @@ def _maxwell_extract_group_waveforms(
         ]
         if not active_names:
             continue
+        readable_names: List[str] = []
+        for channel_name in active_names:
+            frames = np.asarray(requests[channel_name][1])
+            channel_bytes = int(frames.size) * int(sample_count) * np.dtype(np.float32).itemsize
+            if channel_bytes > int(max_waveform_bytes):
+                info_by_channel[channel_name]["error"] = (
+                    f"waveform extraction skipped for channel: estimated {channel_bytes} bytes exceeds per-load limit"
+                )
+                pending.discard(channel_name)
+                continue
+            readable_names.append(channel_name)
+        active_names = readable_names
+        if not active_names:
+            continue
 
-        raw = raw_group["raw"]
+        raw = raw_entry["raw"]
         if raw.ndim != 2:
             for channel_name in active_names:
                 info_by_channel[channel_name]["error"] = f"unsupported raw matrix shape: {raw.shape}"
             pending.difference_update(active_names)
             continue
+        channel_axis = int(raw_entry["channel_axis"])
+        frame_axis = int(raw_entry["frame_axis"])
 
         gain_uv = _maxwell_waveform_gain_uv(group)
         zero_count = _maxwell_adc_zero_count(raw, group)
@@ -1108,50 +1292,83 @@ def _maxwell_extract_group_waveforms(
         for channel_name in active_names:
             channel_id, frames = requests[channel_name]
             frames = np.asarray(frames, dtype=np.int64)
-            waveforms_by_channel[channel_name] = np.full((frames.size, sample_count), np.nan, dtype=np.float32)
             info = info_by_channel[channel_name]
             info["raw_group"] = str(raw_group_name)
             info["unit"] = unit
             info["adc_zero_count"] = float(zero_count)
             info["baseline_corrected"] = False
             row = row_by_channel[int(channel_id)]
-            for spike_index, frame in enumerate(frames):
+            best_name = "identity"
+            best_frames = frames
+            best_starts = np.full(frames.size, -1, dtype=np.int64)
+            best_score = (-1.0, -1)
+            for candidate_name, candidate_frames in _maxwell_frame_candidates(frames, frame_nos):
+                _raise_if_cancelled(cancel_check)
+                candidate_starts = _maxwell_frame_start_indices(
+                    candidate_frames,
+                    frame_nos,
+                    pre=pre,
+                    post=post,
+                    sample_count=sample_count,
+                    raw_frame_count=int(raw.shape[frame_axis]),
+                    contiguous_frames=contiguous_frames,
+                )
+                valid_count = int(np.count_nonzero(candidate_starts >= 0))
+                if valid_count <= 0:
+                    continue
+                waveform_score = _maxwell_score_waveform_alignment(
+                    raw,
+                    channel_axis=channel_axis,
+                    frame_axis=frame_axis,
+                    row=row,
+                    start_indices=candidate_starts,
+                    sample_count=sample_count,
+                    zero_count=zero_count,
+                    gain_uv=gain_uv,
+                )
+                score = (waveform_score, valid_count)
+                if score > best_score:
+                    best_score = score
+                    best_name = candidate_name
+                    best_frames = np.asarray(candidate_frames, dtype=np.int64)
+                    best_starts = candidate_starts
+            waveforms_by_channel[channel_name] = np.full((best_frames.size, sample_count), np.nan, dtype=np.float32)
+            info["frame_alignment"] = best_name
+            info["frame_alignment_valid_count"] = int(np.count_nonzero(best_starts >= 0))
+            info["frame_alignment_score_ptp"] = float(max(0.0, best_score[0]))
+            if best_frames.size:
+                info["first_requested_frame"] = int(best_frames[0])
+                info["last_requested_frame"] = int(best_frames[-1])
+            info["raw_first_frame"] = int(first_frame)
+            info["raw_last_frame"] = int(last_frame)
+            for spike_index, start_index in enumerate(best_starts):
                 if spike_index % 2048 == 0:
                     _raise_if_cancelled(cancel_check)
-                start_frame = int(frame) - pre
-                stop_frame = int(frame) + post
-                if start_frame < first_frame or stop_frame > last_frame:
+                if int(start_index) < 0:
                     continue
-                if contiguous_frames:
-                    start_index = start_frame - first_frame
-                else:
-                    center_index = int(np.searchsorted(frame_nos, int(frame)))
-                    start_index = center_index - pre
-                    stop_index = start_index + sample_count
-                    if start_index < 0 or stop_index > frame_nos.size:
-                        continue
-                    if frame_nos[start_index] != start_frame or frame_nos[stop_index - 1] != stop_frame:
-                        continue
                 flat_records.append((start_index, channel_name, spike_index, row))
 
         if flat_records:
             flat_records.sort(key=lambda item: item[0])
-            chunk_samples = raw.chunks[1] if raw.chunks and len(raw.chunks) > 1 and raw.chunks[1] else sample_count
+            chunk_samples = raw.chunks[frame_axis] if raw.chunks and len(raw.chunks) > frame_axis and raw.chunks[frame_axis] else sample_count
             block_samples = max(int(chunk_samples), sample_count, int(float(sr or 20000.0) * 0.5))
             cursor = 0
             while cursor < len(flat_records):
                 _raise_if_cancelled(cancel_check)
                 first_start = int(flat_records[cursor][0])
                 block_start = max(0, (first_start // int(chunk_samples)) * int(chunk_samples))
-                block_stop = min(raw.shape[1], block_start + block_samples)
+                block_stop = min(raw.shape[frame_axis], block_start + block_samples)
                 end = cursor
                 while end < len(flat_records) and flat_records[end][0] + sample_count <= block_stop:
                     end += 1
                 if end == cursor:
-                    block_stop = min(raw.shape[1], flat_records[cursor][0] + sample_count)
+                    block_stop = min(raw.shape[frame_axis], flat_records[cursor][0] + sample_count)
                     end += 1
                 try:
-                    block = np.asarray(raw[:, block_start:block_stop], dtype=np.float32)
+                    if channel_axis == 0 and frame_axis == 1:
+                        block = np.asarray(raw[:, block_start:block_stop], dtype=np.float32)
+                    else:
+                        block = np.asarray(raw[block_start:block_stop, :], dtype=np.float32)
                 except Exception as exc:
                     for channel_name in active_names:
                         info_by_channel[channel_name]["error"] = f"could not read raw waveform data: {exc}"
@@ -1160,7 +1377,10 @@ def _maxwell_extract_group_waveforms(
                 for start_index, channel_name, spike_index, row in flat_records[cursor:end]:
                     local_start = int(start_index) - int(block_start)
                     local_stop = local_start + sample_count
-                    snippet = block[int(row), local_start:local_stop]
+                    if channel_axis == 0 and frame_axis == 1:
+                        snippet = block[int(row), local_start:local_stop]
+                    else:
+                        snippet = block[local_start:local_stop, int(row)]
                     if snippet.size != sample_count:
                         continue
                     snippet = _maxwell_decode_raw_snippet(snippet, zero_count)
@@ -1414,8 +1634,8 @@ def read_maxwell_h5(
                     total_spikes += int(values.size)
 
                     if extract_waveforms and group_raw_meta:
-                        frames = np.asarray(spike_data["frameno"][mask], dtype=np.int64)[order]
-                        group_waveform_requests[channel_name] = (channel_int, frames)
+                        source_frames = np.asarray(spike_data["frameno"][mask], dtype=np.int64)[order]
+                        group_waveform_requests[channel_name] = (channel_int, source_frames)
 
                     payload = dict(mapping)
                     payload.update(
@@ -1481,10 +1701,10 @@ def read_maxwell_h5(
     if sidecar_records:
         event_records = _merge_stim_sidecar_records(event_records, sidecar_records)
     h5_stim_records = [dict(record) for record in event_records if _stim_electrodes_from_record(record)]
-    stimulus_records = sidecar_records or h5_stim_records
+    stimulus_records = _prefer_site_rich_stimulus_records(sidecar_records, h5_stim_records)
     stim_electrodes = _unique_sidecar_ints(
         list(sidecar_stim.get("stim_electrodes", []) or [])
-        + [electrode for record in h5_stim_records for electrode in _stim_electrodes_from_record(record)]
+        + [electrode for record in stimulus_records for electrode in _stim_electrodes_from_record(record)]
     )
     artifact_window_s = max(0.0, float(stim_artifact_window_ms) / 1000.0)
     spike_filters: Dict[str, Dict[str, np.ndarray]] = {}
@@ -1561,6 +1781,7 @@ def read_maxwell_h5(
         "stimulus_sidecar_files": sidecar_stim.get("files", []),
         "stimulus_sidecar_candidates": sidecar_stim.get("candidate_files", []),
         "stimulus_sidecar_summary": sidecar_stim.get("summary", {}),
+        "connect_settle_ms": float(sidecar_stim["connect_settle_ms"]) if _is_finite_number(sidecar_stim.get("connect_settle_ms")) else None,
         "duration_s": float(duration_s),
         "reader": "native_maxwell_h5",
         "stim_artifact_window_ms": float(stim_artifact_window_ms),
@@ -1595,6 +1816,7 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
     used_files: List[str] = []
     summary: Dict[str, Any] = {}
     parsed_sources: Dict[str, Dict[str, Any]] = {}
+    connect_settle_ms: Optional[float] = None
     for candidate in candidates:
         if not candidate.is_file():
             continue
@@ -1604,6 +1826,8 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
             continue
         if not parsed:
             continue
+        if connect_settle_ms is None and _is_finite_number(parsed.get("connect_settle_ms")):
+            connect_settle_ms = float(parsed.get("connect_settle_ms"))
         used_files.append(str(candidate))
         parsed_sources[candidate.name.lower()] = parsed
         file_records = list(parsed.get("records", []) or [])
@@ -1629,7 +1853,7 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
         summary.update(run_summary)
         unique_records = _unique_stim_sidecar_records(run_records)
         finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
-        return {
+        result = {
             "stim_times": np.asarray(finite_times, dtype=float),
             "stimulus_records": unique_records,
             "stim_electrodes": _unique_sidecar_ints(
@@ -1639,12 +1863,15 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
             "candidate_files": [str(candidate) for candidate in candidates] + run_files,
             "summary": summary,
         }
+        if connect_settle_ms is not None:
+            result["connect_settle_ms"] = float(connect_settle_ms)
+        return result
 
     aligned_records = _aligned_local_stim_plan_records(parsed_sources)
     if aligned_records:
         unique_records = _unique_stim_sidecar_records(aligned_records)
         finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
-        return {
+        result = {
             "stim_times": np.asarray(finite_times, dtype=float),
             "stimulus_records": unique_records,
             "stim_electrodes": _unique_sidecar_ints(
@@ -1654,10 +1881,28 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
             "candidate_files": [str(candidate) for candidate in candidates],
             "summary": summary,
         }
+        if connect_settle_ms is not None:
+            result["connect_settle_ms"] = float(connect_settle_ms)
+        return result
 
-    finite_times = sorted(set(float(value) for value in stim_times if _is_finite_number(value)))
     unique_records = _unique_stim_sidecar_records(records)
-    return {
+    if unique_records:
+        finite_times = sorted(
+            {
+                round(float(record["time_s"]), 9)
+                for record in unique_records
+                if _is_finite_number(record.get("time_s"))
+            }
+        )
+    else:
+        finite_times = sorted(
+            {
+                round(float(value), 9)
+                for value in stim_times
+                if _is_finite_number(value)
+            }
+        )
+    result = {
         "stim_times": np.asarray(finite_times, dtype=float),
         "stimulus_records": unique_records,
         "stim_electrodes": _unique_sidecar_ints(stim_electrodes),
@@ -1665,6 +1910,9 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
         "candidate_files": [str(candidate) for candidate in candidates],
         "summary": summary,
     }
+    if connect_settle_ms is not None:
+        result["connect_settle_ms"] = float(connect_settle_ms)
+    return result
 
 
 def _maxwell_stim_sidecar_candidates(path: Path) -> List[Path]:
@@ -1860,12 +2108,18 @@ def _parse_maxwell_stim_sidecar_json(path: Path) -> Dict[str, Any]:
     records: List[Dict[str, Any]] = []
     stim_times: List[float] = []
     stim_electrodes: List[int] = []
+    connect_settle_ms = _first_finite_number_from_nested(
+        payload,
+        ("connect_settle_ms", "stim_connect_settle_ms", "site_switch_connect_settle_ms", "settling_artifact_offset_ms"),
+    )
     if isinstance(payload, dict):
         for key in ("stim_times_sec", "stim_times", "times_sec"):
             values = payload.get(key, [])
             if isinstance(values, list):
                 stim_times.extend(float(value) for value in values if _is_finite_number(value))
-        for key in ("stim_records", "stimulus_records", "stimuli", "events"):
+        # ``segment_time_meta.json`` written by the Maxwell experiment
+        # runner stores the per-pulse rows under ``stim_rows``.
+        for key in ("stim_records", "stimulus_records", "stimuli", "events", "stim_rows"):
             values = payload.get(key, [])
             if isinstance(values, list):
                 for item in values:
@@ -1887,11 +2141,31 @@ def _parse_maxwell_stim_sidecar_json(path: Path) -> Dict[str, Any]:
             stim_electrodes.extend(_parse_stim_electrode_values(payload.get(key)))
     for record in records:
         record.setdefault("sidecar_source", path.name)
-    return {
+    result = {
         "stim_times": stim_times,
         "records": records,
         "stim_electrodes": stim_electrodes,
     }
+    if connect_settle_ms is not None:
+        result["connect_settle_ms"] = float(connect_settle_ms)
+    return result
+
+
+def _first_finite_number_from_nested(value: Any, keys: Tuple[str, ...]) -> Optional[float]:
+    if isinstance(value, dict):
+        for key in keys:
+            if key in value and _is_finite_number(value.get(key)):
+                return float(value.get(key))
+        for item in value.values():
+            nested = _first_finite_number_from_nested(item, keys)
+            if nested is not None:
+                return nested
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            nested = _first_finite_number_from_nested(item, keys)
+            if nested is not None:
+                return nested
+    return None
 
 
 def _is_stim_sidecar_event(raw: Any) -> bool:
@@ -1951,6 +2225,171 @@ def _parse_maxwell_stim_sidecar_txt(path: Path) -> Dict[str, Any]:
     }
 
 
+_STIM_RECORD_ELECTRODE_KEYS = (
+    "electrodes",
+    "electrode",
+    "stim_electrodes",
+    "stim_electrode",
+    "stimulation_electrodes",
+    "stimulus_electrodes",
+    "target_electrodes",
+    "target_electrode",
+)
+_STIM_RECORD_SITE_KEYS = (
+    "site_electrodes",
+    "site_electrode",
+    "stimulus_site",
+    "stimulation_site",
+    "stimulus_sites",
+    "stimulation_sites",
+    "site_group",
+    "site_groups",
+    "electrode_group",
+    "electrode_groups",
+    "event_group_electrodes",
+    "event_electrodes",
+)
+
+
+def _parse_stim_site_value(value: Any) -> List[int]:
+    """Parse a site/group field without treating names such as ``site_2`` as electrode 2."""
+
+    if isinstance(value, dict):
+        return _parse_stim_electrode_values(value)
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        return _parse_stim_electrode_values(value)
+    if isinstance(value, (int, np.integer)):
+        return [int(value)]
+    if isinstance(value, float) and np.isfinite(value) and float(value).is_integer():
+        return [int(value)]
+    text = str(value or "").strip()
+    if not text or not re.fullmatch(r"[\[\]\(\)\{\}\s,;:+\-0-9]+", text):
+        return []
+    return _parse_stim_electrode_values(text)
+
+
+def _record_stim_electrodes(record: Dict[str, Any]) -> List[int]:
+    values: List[int] = []
+    if not isinstance(record, dict):
+        return values
+    for key in _STIM_RECORD_ELECTRODE_KEYS:
+        if key in record:
+            values.extend(_parse_stim_electrode_values(record.get(key)))
+    for key in _STIM_RECORD_SITE_KEYS:
+        if key in record:
+            values.extend(_parse_stim_site_value(record.get(key)))
+    return _unique_sidecar_ints(values)
+
+
+def _record_time_s(record: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(record, dict):
+        return None
+    for key in (
+        "time_s",
+        "time_sec",
+        "stim_time_sec",
+        "plan_time_sec",
+        "offset_sec",
+        "epoch_sec",
+    ):
+        if _is_finite_number(record.get(key)):
+            return float(record.get(key))
+    return None
+
+
+def _prefer_site_rich_stimulus_records(
+    primary_records: List[Dict[str, Any]] | None,
+    fallback_records: List[Dict[str, Any]] | None,
+    *,
+    tolerance_s: float = 0.002,
+) -> List[Dict[str, Any]]:
+    """Keep one metadata row per primary event and fill missing sites from a fallback source.
+
+    Maxwell files commonly contain several sidecars for the same pulse.  Some contain
+    only timestamps while the H5 event message or another sidecar contains the actual
+    stimulation electrodes.  The old code selected the timestamp-only list with
+    ``sidecar_records or h5_records`` and silently discarded the sites.
+    """
+
+    primary = [dict(record) for record in (primary_records or []) if isinstance(record, dict)]
+    fallback = [dict(record) for record in (fallback_records or []) if isinstance(record, dict)]
+    fallback_rich = [
+        (index, record)
+        for index, record in enumerate(fallback)
+        if _record_stim_electrodes(record) and _record_time_s(record) is not None
+    ]
+    if not primary:
+        return _unique_stim_sidecar_records(fallback)
+
+    used_fallback: set[int] = set()
+    merged: List[Dict[str, Any]] = []
+    for record in primary:
+        payload = dict(record)
+        if not _record_stim_electrodes(payload):
+            record_time = _record_time_s(payload)
+            candidates = [
+                (
+                    abs(float(_record_time_s(candidate)) - float(record_time)),
+                    index,
+                    candidate,
+                )
+                for index, candidate in fallback_rich
+                if index not in used_fallback
+                and record_time is not None
+                and _record_time_s(candidate) is not None
+            ]
+            if candidates:
+                distance, index, candidate = min(candidates, key=lambda item: item[0])
+                if distance <= float(tolerance_s):
+                    used_fallback.add(index)
+                    for key, value in candidate.items():
+                        payload.setdefault(key, value)
+                    payload["stim_site_source"] = "merged_site_rich_metadata"
+        electrodes = _record_stim_electrodes(payload)
+        if electrodes:
+            payload["electrodes"] = electrodes
+            payload.setdefault("electrode", electrodes[0])
+        merged.append(payload)
+
+    # If the primary source had no row for a pulse, keep an unmatched rich
+    # fallback row.  This is useful for NPZ files whose metadata was saved
+    # before the sidecar was discovered.
+    primary_times = [
+        float(value)
+        for value in (_record_time_s(record) for record in primary)
+        if value is not None
+    ]
+    if not primary_times:
+        merged.extend(record for _index, record in fallback_rich)
+    else:
+        for index, record in fallback_rich:
+            if index in used_fallback:
+                continue
+            record_time = _record_time_s(record)
+            if record_time is None:
+                continue
+            if not any(abs(float(record_time) - value) <= float(tolerance_s) for value in primary_times):
+                continue
+            # A rich row at a matching time can replace a timestamp-only row
+            # only when that row was not already matched above.
+            if not any(
+                _record_time_s(item) is not None
+                and abs(float(_record_time_s(item)) - float(record_time)) <= float(tolerance_s)
+                and _record_stim_electrodes(item)
+                for item in merged
+            ):
+                merged.append(record)
+    normalized: List[Dict[str, Any]] = []
+    for record in _unique_stim_sidecar_records(merged):
+        electrodes = _record_stim_electrodes(record)
+        if electrodes:
+            record = dict(record)
+            record["electrodes"] = electrodes
+            record.setdefault("electrode", electrodes[0])
+        normalized.append(record)
+    return normalized
+
+
 def _normalize_stim_sidecar_record(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         if _is_finite_number(raw):
@@ -1958,23 +2397,30 @@ def _normalize_stim_sidecar_record(raw: Any) -> Dict[str, Any]:
         return {}
     record = dict(raw)
     time_value = None
-    for key in ("time_s", "time_sec", "stim_time_sec", "stim_times_sec", "plan_time_sec", "offset_sec"):
+    # Maxwell segment logs use ``offset_sec`` for the recording-local time
+    # and ``epoch_sec`` for the wall-clock timestamp.  Prefer the local
+    # offset so sidecar records align with H5 event timestamps.
+    for key in (
+        "time_s",
+        "time_sec",
+        "stim_time_sec",
+        "stim_times_sec",
+        "offset_sec",
+        "plan_time_sec",
+        "epoch_sec",
+    ):
         if key in record and _is_finite_number(record.get(key)):
             time_value = float(record.get(key))
             break
     if time_value is None:
         return {}
     electrodes: List[int] = []
-    for key in (
-        "electrodes",
-        "electrode",
-        "stim_electrodes",
-        "stim_electrode",
-        "stimulation_electrodes",
-        "candidate_electrodes",
-    ):
+    for key in (*_STIM_RECORD_ELECTRODE_KEYS, "candidate_electrodes", *_STIM_RECORD_SITE_KEYS):
         if key in record:
-            electrodes.extend(_parse_stim_electrode_values(record.get(key)))
+            if key in _STIM_RECORD_SITE_KEYS:
+                electrodes.extend(_parse_stim_site_value(record.get(key)))
+            else:
+                electrodes.extend(_parse_stim_electrode_values(record.get(key)))
     normalized = _json_safe(record)
     normalized["time_s"] = float(time_value)
     if electrodes:
@@ -2047,6 +2493,15 @@ def _align_stim_sidecar_records_to_times(
 
 
 def _unique_stim_sidecar_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # ``stim_times.txt`` is often emitted beside the richer JSON log.  It
+    # repeats the same timestamps but has no site information, so it must not
+    # create a second metadata record for every pulse.
+    rich_time_keys = {
+        int(round(float(record.get("time_s")) * 1_000_000))
+        for record in records
+        if _is_finite_number(record.get("time_s"))
+        and _stim_electrodes_from_record(record)
+    }
     seen: set[Tuple[int, Tuple[int, ...]]] = set()
     result: List[Dict[str, Any]] = []
     for record in records:
@@ -2054,7 +2509,10 @@ def _unique_stim_sidecar_records(records: List[Dict[str, Any]]) -> List[Dict[str
         if not _is_finite_number(time_s):
             continue
         electrodes = tuple(_stim_electrodes_from_record(record))
-        key = (int(round(float(time_s) * 1_000_000)), electrodes)
+        time_key = int(round(float(time_s) * 1_000_000))
+        if not electrodes and time_key in rich_time_keys:
+            continue
+        key = (time_key, electrodes)
         if key in seen:
             continue
         seen.add(key)
@@ -2063,11 +2521,7 @@ def _unique_stim_sidecar_records(records: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def _stim_electrodes_from_record(record: Dict[str, Any]) -> List[int]:
-    values: List[int] = []
-    for key in ("electrodes", "electrode", "stim_electrodes", "stim_electrode", "stimulation_electrodes"):
-        if isinstance(record, dict) and key in record:
-            values.extend(_parse_stim_electrode_values(record.get(key)))
-    return _unique_sidecar_ints(values)
+    return _record_stim_electrodes(record)
 
 
 def _parse_stim_electrode_values(value: Any) -> List[int]:
@@ -2075,9 +2529,17 @@ def _parse_stim_electrode_values(value: Any) -> List[int]:
         return []
     if isinstance(value, dict):
         values: List[int] = []
-        for key in ("electrodes", "electrode", "values", "group"):
+        for key in (
+            *_STIM_RECORD_ELECTRODE_KEYS,
+            "values",
+            "group",
+            *_STIM_RECORD_SITE_KEYS,
+        ):
             if key in value:
-                values.extend(_parse_stim_electrode_values(value.get(key)))
+                if key in _STIM_RECORD_SITE_KEYS:
+                    values.extend(_parse_stim_site_value(value.get(key)))
+                else:
+                    values.extend(_parse_stim_electrode_values(value.get(key)))
         return _unique_sidecar_ints(values)
     if isinstance(value, (list, tuple, set, np.ndarray)):
         values: List[int] = []
@@ -2717,13 +3179,16 @@ def _augment_stim_metadata_from_sidecar(path: Path, meta: Dict[str, Any], stim_t
     meta["stimulus_sidecar_files"] = sidecar_stim.get("files", [])
     meta["stimulus_sidecar_candidates"] = sidecar_stim.get("candidate_files", [])
     meta["stimulus_sidecar_summary"] = sidecar_stim.get("summary", {})
+    if _is_finite_number(sidecar_stim.get("connect_settle_ms")):
+        meta["connect_settle_ms"] = float(sidecar_stim.get("connect_settle_ms"))
     if not has_sites and (sidecar_records or sidecar_electrodes):
+        existing_events = list(meta.get("event_records", []) or [])
+        merged_records = _prefer_site_rich_stimulus_records(sidecar_records, existing_events)
         if sidecar_electrodes:
             meta["stim_electrodes"] = sidecar_electrodes
-        if sidecar_records:
-            meta["stimulus_records"] = sidecar_records
-            existing_events = list(meta.get("event_records", []) or [])
-            meta["event_records"] = _merge_stim_sidecar_records(existing_events, sidecar_records)
+        if merged_records:
+            meta["stimulus_records"] = merged_records
+            meta["event_records"] = _merge_stim_sidecar_records(existing_events, merged_records)
     if np.asarray(stim_times, dtype=float).size == 0 and sidecar_times.size:
         meta["stim_times_from_sidecar"] = sidecar_times.tolist()
         meta.setdefault("event_count", int(sidecar_times.size))

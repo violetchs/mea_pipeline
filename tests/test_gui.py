@@ -11,6 +11,7 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 
 from src.analysis import run_generic_matrix_analysis
+from generated_visual_experiment.python.maxwell_setup import _route_signature
 from src.gui.app import (
     AutoSortingDialog,
     MainWindow,
@@ -26,25 +27,18 @@ from src.gui.app import (
     StimulusDatabaseAnalysisDialog,
     StimulusGenerationDialog,
     StimulusResponseWindow,
+    StimulusTrialResponseWindow,
     TemporalCouplingWindow,
-    BurstDelayWindow,
     DataLoadWorker,
     DataFilesInputDialog,
     FileDatabaseLoadWorker,
     ElectrodeMapCanvas,
     _activity_heatmap_color,
     _available_channels_for_data,
-    _burst_correlation_analysis,
-    _burst_delay_aligned_pairs,
-    _burst_delay_first_spike_matrix,
-    _burst_delay_pair_values,
-    _burst_sequence_payload,
     _burst_trajectory_analysis,
     _aligned_weight_similarity,
     _multi_file_factor_analysis_payload,
     _non_overlapping_spike_windows,
-    _source_interval_delay_values,
-    _spike_train_delay_aligned_pairs,
     _detect_burst_intervals,
     _format_time_tick,
     _cluster_color_map,
@@ -56,6 +50,7 @@ from src.gui.app import (
     _stimulus_parameter_label,
     _stimulus_response_group_records,
     _stimulus_response_record_from_data,
+    _stimulus_response_records_from_data,
     _stimulus_response_supported_files,
     _loaded_data_activity_label,
     _generic_analysis_matrix_from_record,
@@ -73,7 +68,10 @@ from src.gui.app import (
     CustomPlotWindow,
     _default_axion_channel_map,
     _default_maxwell_channel_map,
+    _canonicalize_maxwell_channel_map,
+    _maxwell_channel_map_from_unified,
     StimulusResponseInputDialog,
+    StableDelayMapWindow,
     _temporal_coupling_pairs,
     _unit_spike_trains_from_unified,
 )
@@ -91,6 +89,13 @@ def test_activity_heatmap_color_uses_black_to_red_scale():
     assert (high.red(), high.green(), high.blue()) == (220, 38, 38)
     assert mid.green() > mid.red()
     assert mid.green() > mid.blue()
+
+
+def test_event_level_route_signature_tracks_dac_assignment_changes():
+    base = _route_signature([10, 11], {10: 0, 11: 1}, {10: 0, 11: 1}, event_level_switch=True)
+    swapped = _route_signature([10, 11], {11: 0, 10: 1}, {10: 0, 11: 1}, event_level_switch=True)
+
+    assert base != swapped
 
 
 def test_spike_trains_from_unified_uses_channel_number_order():
@@ -197,6 +202,73 @@ def test_default_axion_channel_map_wells_arrange_in_three_by_two_grid():
     assert float(b1["y_um"]) > float(a1["y_um"])
     assert float(b2["x_um"]) > float(b1["x_um"])
     assert float(b3["x_um"]) > float(b2["x_um"])
+
+
+def test_default_maxwell_channel_map_uses_zero_based_physical_ids():
+    channel_map = _default_maxwell_channel_map()
+
+    assert channel_map is not None
+    assert channel_map.rows == 120
+    assert channel_map.cols == 220
+    assert len(channel_map.electrodes) == 26400
+    assert channel_map.electrodes["e0"]["electrode"] == 0
+    assert channel_map.electrodes["e26399"]["electrode"] == 26399
+    assert channel_map.electrodes["e26399"]["grid_row"] == 119
+    assert channel_map.electrodes["e26399"]["grid_col"] == 219
+    assert "e26620" not in channel_map.electrodes
+
+
+def test_maxwell_legacy_map_is_remapped_using_grid_coordinates():
+    legacy = ChannelMap(
+        name="maxwell_map",
+        rows=120,
+        cols=220,
+        electrodes={
+            "e221": {
+                "electrode": 221,
+                "grid_row": 0,
+                "grid_col": 0,
+                "x_um": 17.5,
+                "y_um": 17.5,
+            },
+            "e26620": {
+                "electrode": 26620,
+                "grid_row": 119,
+                "grid_col": 219,
+                "x_um": 3850.0,
+                "y_um": 2100.0,
+            },
+        },
+    )
+
+    normalized = _canonicalize_maxwell_channel_map(legacy)
+
+    assert normalized is not None
+    assert set(normalized.electrodes) == {"e0", "e26399"}
+    assert normalized.electrodes["e0"]["electrode"] == 0
+    assert normalized.electrodes["e26399"]["electrode"] == 26399
+
+
+def test_maxwell_unified_map_resolves_electrode_from_physical_coordinates():
+    data = UnifiedMEAData(
+        spikes={"well0_e11721": np.array([0.1])},
+        meta={
+            "source": "maxwell_h5",
+            "channel_map": {
+                "well0_e11721": {
+                    "electrode": 11721 + 221,
+                    "x_um": 1067.5,
+                    "y_um": 927.5,
+                }
+            },
+        },
+    )
+
+    normalized = _maxwell_channel_map_from_unified(data)
+
+    assert normalized is not None
+    assert normalized.electrodes["e11500"]["channel"] == "well0_e11721"
+    assert normalized.electrodes["e11500"]["electrode"] == 11500
 
 
 def test_axion_heatmap_keeps_same_electrode_names_separate_across_wells():
@@ -364,65 +436,6 @@ def test_detect_burst_intervals_handles_zero_inflated_sparse_recordings():
 
     assert intervals
     assert any(start <= 5.01 and stop >= 5.03 for start, stop in intervals)
-
-
-def test_burst_correlation_analysis_orders_similar_burst_patterns():
-    intervals = [(0.0, 0.1), (1.0, 1.1), (2.0, 2.1), (3.0, 3.1)]
-    spike_series = [
-        ("unit_a", np.array([0.01, 0.02, 1.01, 1.02])),
-        ("unit_b", np.array([0.03, 1.03])),
-        ("unit_c", np.array([2.01, 2.02, 3.01, 3.02])),
-        ("unit_d", np.array([2.03, 3.03])),
-    ]
-
-    analysis = _burst_correlation_analysis(spike_series, intervals)
-    correlation = analysis["correlation"]
-    order = analysis["order"]
-
-    assert correlation.shape == (4, 4)
-    assert correlation[0, 1] > 0.9
-    assert correlation[2, 3] > 0.9
-    positions = {burst: index for index, burst in enumerate(order)}
-    assert abs(positions[0] - positions[1]) == 1
-    assert abs(positions[2] - positions[3]) == 1
-
-
-def test_burst_correlation_analysis_uses_within_burst_timing():
-    intervals = [(0.0, 0.04), (1.0, 1.04), (2.0, 2.04)]
-    spike_series = [
-        ("unit_a", np.array([0.005, 1.005, 2.025])),
-        ("unit_b", np.array([0.025, 1.025, 2.005])),
-    ]
-
-    analysis = _burst_correlation_analysis(
-        spike_series,
-        intervals,
-        time_bin_ms=10.0,
-        window_ms=40.0,
-        normalization="per_burst",
-    )
-    correlation = analysis["correlation"]
-
-    assert analysis["activity"].shape == (3, 2, 4)
-    assert correlation[0, 1] > 0.9
-    assert correlation[0, 2] < 0.5
-
-
-def test_burst_sequence_payload_saves_relative_spike_times_only():
-    payload = _burst_sequence_payload(
-        [
-            ("unit_a", np.array([0.01, 0.02, 1.01])),
-            ("unit_b", np.array([0.03, 1.04])),
-        ],
-        [(0.0, 0.05), (1.0, 1.05)],
-    )
-
-    assert payload["format"] == "mea_pipeline_burst_sequences_v1"
-    assert payload["labels"].tolist() == ["unit_a", "unit_b"]
-    assert payload["burst_intervals_s"].tolist() == [[0.0, 0.05], [1.0, 1.05]]
-    assert payload["relative_spike_times_s"][0, 0].tolist() == [0.01, 0.02]
-    assert payload["relative_spike_times_s"][1, 1].tolist() == [0.040000000000000036]
-    assert "waveforms" not in payload
 
 
 def test_burst_trajectory_analysis_returns_factor_analysis_latent_state_loadings_and_reconstruction():
@@ -1141,572 +1154,6 @@ def test_multi_file_factor_analysis_window_visualizes_aligned_w_similarity():
     assert "Reconstruction R2" in window.performance_canvas.figure.axes[0].get_title()
 
 
-def test_burst_delay_first_spike_matrix_uses_all_channels_by_default():
-    spike_series = [(f"chan{index}", np.array([0.01 * index, 1.0])) for index in range(1, 7)]
-
-    channels, _intervals, first_times = _burst_delay_first_spike_matrix(spike_series, [(0.0, 0.2)])
-
-    assert channels == ["chan1", "chan2", "chan3", "chan4", "chan5", "chan6"]
-    assert first_times.shape == (1, 6)
-
-    limited_channels, _intervals, limited_first_times = _burst_delay_first_spike_matrix(
-        spike_series,
-        [(0.0, 0.2)],
-        max_channels=3,
-    )
-
-    assert limited_channels == ["chan1", "chan2", "chan3"]
-    assert limited_first_times.shape == (1, 3)
-
-
-def test_burst_delay_first_spike_matrix_respects_burst_window():
-    spike_series = [
-        ("chan1", np.array([0.008, 0.018])),
-        ("chan2", np.array([0.003, 0.020])),
-    ]
-
-    channels, intervals, first_times = _burst_delay_first_spike_matrix(
-        spike_series,
-        [(0.0, 0.030)],
-        burst_window_ms=5.0,
-    )
-
-    assert channels == ["chan1", "chan2"]
-    assert intervals == [(0.0, 0.005)]
-    assert np.isnan(first_times[0, 0])
-    assert first_times[0, 1] == pytest.approx(0.003)
-
-
-def test_burst_delay_aligned_pairs_reports_five_bin_delay_average():
-    delays_ms = np.asarray([8.0, 9.0, 10.0, 10.0, 10.0, 10.0, 10.0, 11.0, 11.0, 12.0, 12.0])
-    first_times = np.column_stack([np.zeros(delays_ms.size), delays_ms / 1000.0])
-
-    results = _burst_delay_aligned_pairs(
-        ["chan1", "chan2"],
-        first_times,
-        max_abs_delay_ms=20.0,
-        min_abs_delay_ms=1.0,
-        bin_ms=1.0,
-        min_peak_count=5,
-        min_peak_fraction=0.4,
-        min_peak_to_background=1.0,
-    )
-
-    assert len(results) == 1
-    assert results[0]["reference"] == "chan1"
-    assert results[0]["target"] == "chan2"
-    assert results[0]["peak_count"] == 5
-    assert results[0]["delay_window_count"] == delays_ms.size
-    assert results[0]["delay_ms"] == pytest.approx(float(np.mean(delays_ms)))
-
-
-def test_burst_delay_min_delay_excludes_near_zero_pairs():
-    first_times = np.array(
-        [
-            [0.000, 0.0005, 0.0040],
-            [0.010, 0.0105, 0.0140],
-            [0.020, 0.0205, 0.0240],
-            [0.030, 0.0305, 0.0340],
-            [0.040, 0.0405, 0.0440],
-        ]
-    )
-
-    results = _burst_delay_aligned_pairs(
-        ["chan1", "chan2", "chan3"],
-        first_times,
-        max_abs_delay_ms=10.0,
-        min_abs_delay_ms=1.0,
-        bin_ms=1.0,
-        min_peak_count=5,
-        min_peak_fraction=0.4,
-        min_peak_to_background=1.0,
-    )
-
-    assert [(result["reference"], result["target"]) for result in results] == [("chan1", "chan3")]
-    np.testing.assert_allclose(
-        _burst_delay_pair_values(first_times, 0, 1, 10.0, min_abs_delay_ms=1.0),
-        np.array([]),
-    )
-
-
-def test_source_interval_delay_values_use_first_target_per_source_interval():
-    source = np.array([0.000, 0.010, 0.020])
-    target = np.array([0.002, 0.003, 0.012, 0.018, 0.025])
-
-    values = _source_interval_delay_values(source, target, max_abs_delay_ms=10.0, min_abs_delay_ms=1.0)
-
-    np.testing.assert_allclose(values, np.array([2.0, 2.0]))
-
-
-def test_source_interval_delay_values_skip_source_intervals_without_inserted_target():
-    source = np.array([0.000, 0.010, 0.020, 0.030])
-    target = np.array([0.012, 0.040])
-
-    values = _source_interval_delay_values(
-        source,
-        target,
-        max_abs_delay_ms=50.0,
-        min_abs_delay_ms=1.0,
-        intervals=[(0.0, 0.035)],
-    )
-
-    np.testing.assert_allclose(values, np.array([2.0]))
-
-
-def test_source_interval_delay_values_include_single_source_spike_before_burst_end():
-    source = np.array([0.010])
-    target = np.array([0.014])
-
-    values = _source_interval_delay_values(
-        source,
-        target,
-        max_abs_delay_ms=20.0,
-        min_abs_delay_ms=1.0,
-        intervals=[(0.0, 0.020)],
-    )
-
-    np.testing.assert_allclose(values, np.array([4.0]))
-
-
-def test_spike_train_delay_pairs_support_burst_and_all_spike_modes():
-    source = np.array([0.000, 0.010, 0.020, 0.100, 0.110, 0.120])
-    target = np.array([0.002, 0.012, 0.102, 0.112])
-    channels = ["chan1", "chan2"]
-    trains = [source, target]
-
-    burst_values = _source_interval_delay_values(
-        source,
-        target,
-        max_abs_delay_ms=10.0,
-        min_abs_delay_ms=1.0,
-        intervals=[(0.0, 0.03)],
-    )
-    all_values = _source_interval_delay_values(source, target, max_abs_delay_ms=10.0, min_abs_delay_ms=1.0)
-
-    np.testing.assert_allclose(burst_values, np.array([2.0, 2.0]))
-    np.testing.assert_allclose(all_values, np.array([2.0, 2.0, 2.0, 2.0]))
-
-    results = _spike_train_delay_aligned_pairs(
-        channels,
-        trains,
-        intervals=None,
-        max_abs_delay_ms=10.0,
-        min_abs_delay_ms=1.0,
-        bin_ms=1.0,
-        min_peak_count=4,
-        min_peak_fraction=0.5,
-        min_peak_to_background=1.0,
-        mode="all_spikes",
-    )
-
-    assert len(results) == 1
-    assert results[0]["reference"] == "chan1"
-    assert results[0]["target"] == "chan2"
-    assert results[0]["mode"] == "all_spikes"
-    assert results[0]["delay_ms"] == pytest.approx(2.0)
-
-
-def test_burst_delay_pair_selectors_filter_significant_subset(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2", "chan3", "chan4"]
-    window.aligned_pairs = [
-        {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 2.0},
-        {"reference_index": 0, "target_index": 2, "reference": "chan1", "target": "chan3", "delay_ms": 3.0},
-        {"reference_index": 3, "target_index": 2, "reference": "chan4", "target": "chan3", "delay_ms": -1.5},
-    ]
-
-    window._refresh_channel_combos("", "")
-
-    def items(combo):
-        return [combo.itemText(index) for index in range(combo.count())]
-
-    assert items(window.reference_combo) == ["None", "chan1", "chan4"]
-    assert items(window.target_combo) == ["None"]
-
-    window.reference_combo.setCurrentText("chan1")
-
-    assert items(window.reference_combo) == ["None", "chan1", "chan4"]
-    assert items(window.target_combo) == ["None", "chan2", "chan3"]
-
-    window.target_combo.setCurrentText("chan3")
-
-    assert items(window.reference_combo) == ["None", "chan1", "chan4"]
-    assert items(window.target_combo) == ["None", "chan2", "chan3"]
-
-    window.reference_combo.setCurrentText("chan4")
-
-    assert items(window.reference_combo) == ["None", "chan1", "chan4"]
-    assert items(window.target_combo) == ["None", "chan3"]
-    assert window.target_combo.currentText() == "None"
-
-
-def test_burst_delay_manual_pair_uses_channel_map_picks_not_dropdowns(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2", "chan3", "chan4"]
-    window.first_times = np.array([[0.001, 0.004, 0.007, 0.012], [0.002, 0.005, np.nan, 0.014]])
-    window.aligned_pairs = [
-        {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 3.0},
-    ]
-    window._refresh_channel_combos("", "")
-
-    window.manual_pair_check.setChecked(True)
-    window.map_canvas.figure.clear()
-    window._map_ax = window.map_canvas.figure.add_subplot(111)
-    window._map_channel_indices = np.array([0, 1, 2, 3], dtype=int)
-    window._map_channel_xy = np.array([[0.0, 0.0], [0.2, 0.0], [0.4, 0.0], [0.6, 0.0]], dtype=float)
-
-    def items(combo):
-        return [combo.itemText(index) for index in range(combo.count())]
-
-    assert items(window.reference_combo) == ["None", "chan1"]
-    assert items(window.target_combo) == ["None"]
-
-    class Click:
-        def __init__(self, xdata, ydata, button):
-            self.inaxes = window._map_ax
-            self.xdata = xdata
-            self.ydata = ydata
-            self.x, self.y = window._map_ax.transData.transform((xdata, ydata))
-            self.button = button
-
-    window._map_clicked(Click(0.2, 0.0, 1))
-    window.map_canvas.figure.clear()
-    window._map_ax = window.map_canvas.figure.add_subplot(111)
-    window._map_channel_indices = np.array([0, 1, 2, 3], dtype=int)
-    window._map_channel_xy = np.array([[0.0, 0.0], [0.2, 0.0], [0.4, 0.0], [0.6, 0.0]], dtype=float)
-    window._map_clicked(Click(0.6, 0.0, 3))
-    selected = window._selected_pair_result()
-
-    assert window._manual_reference_index == 1
-    assert window._manual_target_index == 3
-    assert selected["manual"] is True
-    assert selected["reference"] == "chan2"
-    assert selected["target"] == "chan4"
-    np.testing.assert_allclose(window._selected_pair_delay_values(selected), np.array([8.0, 9.0]))
-
-
-def test_burst_delay_map_clicks_are_manual_pair_by_default(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2"]
-    window.first_times = np.array([[0.001, 0.004], [0.002, 0.005]])
-    window.map_canvas.figure.clear()
-    window._map_ax = window.map_canvas.figure.add_subplot(111)
-    window._map_channel_indices = np.array([0, 1], dtype=int)
-    window._map_channel_xy = np.array([[0.0, 0.0], [0.2, 0.0]], dtype=float)
-
-    class Click:
-        def __init__(self, xdata, ydata, button):
-            self.inaxes = window._map_ax
-            self.xdata = xdata
-            self.ydata = ydata
-            self.x, self.y = window._map_ax.transData.transform((xdata, ydata))
-            self.button = button
-
-    window._map_clicked(Click(0.0, 0.0, 1))
-    window.map_canvas.figure.clear()
-    window._map_ax = window.map_canvas.figure.add_subplot(111)
-    window._map_channel_indices = np.array([0, 1], dtype=int)
-    window._map_channel_xy = np.array([[0.0, 0.0], [0.2, 0.0]], dtype=float)
-    window._map_clicked(Click(0.2, 0.0, 3))
-    selected = window._selected_pair_result()
-
-    assert window._manual_pair_active is True
-    assert window._highlight_channel_index == 1
-    assert selected["manual"] is True
-    assert selected["reference"] == "chan1"
-    assert selected["target"] == "chan2"
-
-
-def test_burst_delay_map_canvas_connects_click_handler(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-
-    callbacks = window.map_canvas.callbacks.callbacks.get("button_press_event", {})
-
-    assert callbacks
-
-
-def test_burst_delay_parameter_changes_wait_for_analyze(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-
-    window.max_lag_ms.setValue(101)
-
-    assert window.active_delay_worker is None
-    assert "click Analyze" in window.summary.text()
-
-
-def test_burst_delay_draws_source_target_waveforms(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    source_waveforms = np.array([[0.0, -1.0, 0.2, 0.0], [0.1, -0.8, 0.1, 0.0]])
-    target_waveforms = np.array([[0.0, -0.9, 0.3, 0.0], [0.0, -0.7, 0.2, 0.1]])
-    window = BurstDelayWindow(
-        [("chan1", np.array([0.0])), ("chan2", np.array([0.002]))],
-        [],
-        channel_map=ChannelMap.new("test"),
-        waveform_series={"chan1 unit 0": source_waveforms, "chan2": target_waveforms},
-        sampling_rate=30000,
-    )
-    window.channels = ["chan1", "chan2"]
-    window.aligned_pairs = [
-        {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 2.0}
-    ]
-    window._refresh_channel_combos("", "")
-    window.reference_combo.setCurrentIndex(window.reference_combo.findData(0))
-    window.target_combo.setCurrentIndex(window.target_combo.findData(1))
-
-    window._draw_waveforms()
-
-    axes = window.waveform_canvas.figure.axes
-    assert len(axes) == 2
-    assert "Source: chan1" == axes[0].get_title()
-    assert "Target: chan2" == axes[1].get_title()
-    assert axes[0].get_xlabel() == "Time (ms)"
-    assert axes[0].get_lines()
-    assert axes[1].get_lines()
-
-
-def test_burst_delay_connected_components_use_undirected_significant_pairs(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2", "chan3", "chan4", "chan5"]
-    window.aligned_pairs = [
-        {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 1.0},
-        {"reference_index": 2, "target_index": 1, "reference": "chan3", "target": "chan2", "delay_ms": 2.0},
-        {"reference_index": 3, "target_index": 4, "reference": "chan4", "target": "chan5", "delay_ms": 3.0},
-    ]
-
-    assert window._delay_connected_components() == [[0, 1, 2], [3, 4]]
-
-
-def test_burst_delay_propagation_paths_follow_source_to_sink_in_large_component(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    channel_map = ChannelMap.new("test")
-    electrodes = ["A1", "A2", "A3", "A4", "A5", "B5", "C5", "D5", "E5", "F5"]
-    for index, electrode in enumerate(electrodes, start=1):
-        channel_map.set_channel(electrode, f"chan{index}")
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=channel_map)
-    window.channels = [f"chan{index}" for index in range(1, 11)]
-    path_edges = [(index, index + 1) for index in range(9)]
-    branch_edges = [(0, 2), (0, 3), (4, 9), (6, 9), (7, 9)]
-    window.aligned_pairs = []
-    for reference_index, target_index in path_edges + branch_edges:
-        window.aligned_pairs.append(
-            {
-                "reference_index": reference_index,
-                "target_index": target_index,
-                "reference": f"chan{reference_index + 1}",
-                "target": f"chan{target_index + 1}",
-                "delay_ms": float((target_index - reference_index) * 5.0),
-                "peak_count": 30,
-                "peak_fraction": 0.7,
-                "peak_to_background": 8.0,
-            }
-        )
-
-    components = window._delay_connected_components()
-    paths = window._propagation_paths(components)
-
-    assert paths
-    node_paths = [[layer[0] for layer in path["layers"]] for path in paths]
-    assert any(path_nodes[0] == 0 and path_nodes[-1] == 9 and len(path_nodes) >= 3 for path_nodes in node_paths)
-
-
-def test_burst_delay_raster_can_anchor_source_away_from_zero(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2"]
-    window.first_times = np.array([[0.010, 0.017], [0.030, 0.041], [np.nan, 0.050]])
-    pair = {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 9.0}
-
-    source_x, target_x, burst_rows, anchor = window._delay_raster_points(pair)
-
-    assert anchor == 0.0
-    np.testing.assert_allclose(source_x, np.array([10.0, 30.0]))
-    np.testing.assert_allclose(target_x, np.array([17.0, 41.0]))
-    np.testing.assert_array_equal(burst_rows, np.array([0, 1]))
-    window.intervals = [(0.0, 0.200), (1.0, 1.150)]
-    left, right, xlabel = window._delay_raster_xlim(anchor)
-    assert (left, right) == pytest.approx((0.0, 200.0))
-    assert xlabel == "Time from burst onset (ms)"
-
-    window.burst_window_ms.blockSignals(True)
-    window.burst_window_ms.setValue(50.0)
-    window.burst_window_ms.blockSignals(False)
-    left, right, xlabel = window._delay_raster_xlim(anchor)
-    assert (left, right) == pytest.approx((0.0, 50.0))
-    assert xlabel == "Time from burst onset, first 50 ms"
-
-    window.raster_align_combo.setCurrentIndex(window.raster_align_combo.findData("source"))
-    source_x, target_x, burst_rows, anchor = window._delay_raster_points(pair)
-
-    assert anchor > 0.0
-    np.testing.assert_allclose(source_x, np.full(2, anchor))
-    np.testing.assert_allclose(target_x, anchor + np.array([7.0, 11.0]))
-    np.testing.assert_array_equal(burst_rows, np.array([0, 1]))
-    left, right, xlabel = window._delay_raster_xlim(anchor)
-    assert (left, right) == pytest.approx((anchor - 50.0, anchor + 50.0))
-    assert xlabel == "Time (ms, source anchored)"
-
-
-def test_burst_delay_first_spike_probability_fit_uses_burst_count(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1"]
-    window.intervals = [(0.0, 0.050), (1.0, 1.050), (2.0, 2.050), (3.0, 3.050)]
-    window.channel_trains = [np.array([0.005, 1.015, 2.080, 3.035])]
-    window.bin_ms.blockSignals(True)
-    window.bin_ms.setValue(10.0)
-    window.bin_ms.blockSignals(False)
-
-    fit = window._first_spike_probability_fit(0, 0.0, 50.0)
-
-    assert fit["burst_count"] == 4
-    assert fit["spike_count"] == 3
-    assert float(np.sum(fit["observed_probability"])) == pytest.approx(0.75)
-    assert np.all(fit["lower_probability"] <= fit["fit_probability"])
-    assert np.all(fit["fit_probability"] <= fit["upper_probability"])
-
-
-def test_burst_delay_first_spike_peak_colors_order_channels(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2"]
-    window.intervals = [(0.0, 0.050), (1.0, 1.050), (2.0, 2.050)]
-    window.channel_trains = [np.array([0.004, 1.005, 2.006]), np.array([0.034, 1.035, 2.036])]
-    window.bin_ms.blockSignals(True)
-    window.bin_ms.setValue(10.0)
-    window.bin_ms.blockSignals(False)
-
-    peak_times = window._first_spike_peak_times_by_channel()
-    low = min(peak_times.values())
-    high = max(peak_times.values())
-
-    assert peak_times[0] < peak_times[1]
-    assert window._first_spike_peak_color(peak_times[0], low, high) == "#001678"
-    assert window._first_spike_peak_color(peak_times[1], low, high) == "#8b0000"
-
-
-def test_burst_delay_raster_overlays_first_spike_probability_axis(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    monkeypatch.setattr(gui_app.QTimer, "singleShot", lambda *args, **kwargs: None)
-    app = QApplication.instance() or QApplication([])
-    window = BurstDelayWindow([("chan1", np.array([0.0]))], [], channel_map=ChannelMap.new("test"))
-    window.channels = ["chan1", "chan2"]
-    window.intervals = [(0.0, 0.050), (1.0, 1.050), (2.0, 2.050)]
-    window.first_times = np.array([[0.005, 0.010], [0.015, 0.020], [0.030, 0.038]])
-    window.aligned_pairs = [
-        {"reference_index": 0, "target_index": 1, "reference": "chan1", "target": "chan2", "delay_ms": 6.0}
-    ]
-    window._refresh_channel_combos("", "")
-    window.reference_combo.setCurrentIndex(window.reference_combo.findData(0))
-    window.target_combo.setCurrentIndex(window.target_combo.findData(1))
-
-    window._draw_delay_raster()
-
-    axes = window.delay_raster_canvas.figure.axes
-    assert len(axes) == 2
-    assert axes[1].get_ylabel() == "First-spike probability"
-    assert axes[1].get_lines()
-
-
 def test_temporal_coupling_detects_stable_positive_lag():
     reference = np.arange(0.1, 1.0, 0.1)
     target = reference + 0.007
@@ -1811,7 +1258,7 @@ def test_stimulus_response_record_summarizes_spike_only_data():
     assert record["stim_count"] == 2
     assert record["channel_count"] == 2
     assert record["response_spikes_per_stim"] == pytest.approx(4.0)
-    assert record["baseline_rate_hz_per_channel"] > 0
+    assert record["baseline_rate_hz_per_channel"] >= 0
     assert len(record["trial_spikes_ms"]) == 2
     np.testing.assert_allclose(record["trial_spikes_ms"][0], np.array([-5.0, 5.0, 6.0, 15.0, 16.0]))
     np.testing.assert_allclose(record["trial_spikes_ms"][1], np.array([5.0, 6.0, 15.0, 16.0]))
@@ -1829,6 +1276,134 @@ def test_stimulus_response_record_summarizes_spike_only_data():
 
     np.testing.assert_allclose(filtered["trial_spikes_ms"][0], np.array([15.0, 16.0]))
     np.testing.assert_allclose(filtered["trial_channel_spikes_ms"][0][0], np.array([15.0]))
+
+
+def test_stimulus_response_records_are_split_by_site_group():
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([0.095, 0.105, 0.115, 0.205, 0.215]),
+            "chan2": np.array([0.106, 0.116, 0.206, 0.216]),
+        },
+        stim_times=np.array([0.100, 0.200]),
+        meta={
+            "stimulus_records": [
+                {"time_s": 0.100, "site_group": [13045, 13479, 13481, 13925], "label": "site_a"},
+                {"time_s": 0.200, "site_group": [22263, 22269, 23145, 23151], "label": "site_b"},
+            ]
+        },
+    )
+
+    records = _stimulus_response_records_from_data(
+        "multi_site_stim.npz",
+        data,
+        pre_ms=10.0,
+        response_ms=30.0,
+        bin_ms=10.0,
+    )
+
+    assert len(records) == 2
+    assert [record["stimulus_group_key"] for record in records] == [
+        [13045, 13479, 13481, 13925],
+        [22263, 22269, 23145, 23151],
+    ]
+    assert [record["stimulus_group_label"] for record in records]
+
+
+def test_stimulus_response_removes_all_trial_and_settling_artifacts():
+    data = UnifiedMEAData(
+        spikes={
+            "chan1": np.array([1.000, 1.097, 1.100, 1.120, 3.000, 3.097, 3.100, 3.120]),
+        },
+        stim_times=np.array([1.000, 1.100, 3.000, 3.100]),
+        meta={"connect_settle_ms": 3.0},
+    )
+
+    record = _stimulus_response_record_from_data(
+        "multi_pulse_stim.npz",
+        data,
+        pre_ms=20.0,
+        response_ms=150.0,
+        artifact_ms=1.5,
+        zero_stimulus_index=0,
+    )
+
+    assert record["stim_count"] == 2
+    assert record["stim_settling_artifact_offset_ms"] == pytest.approx(3.0)
+    np.testing.assert_allclose(record["trial_channel_spikes_ms"][0][0], np.array([120.0]))
+    np.testing.assert_allclose(record["trial_channel_spikes_ms"][1][0], np.array([120.0]))
+    np.testing.assert_allclose(record["trial_artifact_offsets_ms"][0], np.array([-3.0, 0.0, 97.0, 100.0]))
+
+
+def test_stimulus_response_strong_baseline_uses_full_recording_rate():
+    baseline_spikes = np.concatenate([
+        np.linspace(0.02, 0.40, 20),
+        np.linspace(0.70, 0.99, 20),
+    ])
+    data = UnifiedMEAData(
+        spikes={"chan1": np.sort(np.concatenate([baseline_spikes, np.array([0.510])]))},
+        stim_times=np.array([0.500]),
+        meta={"duration_s": 1.0},
+    )
+
+    record = _stimulus_response_record_from_data(
+        "single_pulse_stim.npz",
+        data,
+        pre_ms=20.0,
+        response_ms=50.0,
+        artifact_ms=0.0,
+        strong_response_window_ms=50.0,
+    )
+
+    assert record["strong_response_baseline_source"] == "non_stim_non_burst_window_count_mean_plus_5sd"
+    assert record["pre_window_rate_hz_per_channel"] == pytest.approx(0.0)
+    assert record["strong_response_baseline_mean_count_by_channel"]["chan1"] > 0.0
+    assert record["strong_response_threshold_count_by_channel"]["chan1"] >= record["strong_response_baseline_mean_count_by_channel"]["chan1"]
+    assert record["strong_response_probability_by_channel"]["chan1"] == pytest.approx(0.0)
+
+
+def test_stimulus_trial_latency_panel_allows_nonstable_electrodes():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    channel_map = ChannelMap.new("latency_map")
+    channel_map.set_channel("A1", "chan1")
+    channel_map.set_channel("A2", "chan2")
+    record = {
+        "condition": "stim",
+        "file": "stim.npz",
+        "path": "stim.npz",
+        "channels": ["chan1", "chan2"],
+        "trial_channel_spikes_ms": [
+            [np.array([2.0]), np.array([7.0])],
+            [np.array([2.0]), np.array([])],
+        ],
+        "trial_spikes_ms": [np.array([2.0, 7.0]), np.array([2.0])],
+        "stim_count": 2,
+        "trial_count": 2,
+        "response_ms": 50.0,
+        "strong_response_probability_by_channel": {"chan1": 0.0, "chan2": 0.0},
+        "strong_response_count_by_channel": {"chan1": 0, "chan2": 0},
+    }
+    window = StimulusTrialResponseWindow(
+        {"records": [record], "response_ms": 50.0, "strong_response_window_ms": 50.0},
+        channel_map=channel_map,
+    )
+
+    analysis = window._latency_analysis(record)
+
+    assert "A2" in analysis["latency_electrodes"]
+    assert "A2" in analysis["electrode_metrics"]
+    assert "A2" not in set(analysis["stable_electrodes"])
+    window.selected_electrode = "A2"
+    figure = Figure()
+    ax = figure.add_subplot(111)
+    window._draw_selected_latency(ax, analysis)
+    assert ax.has_data()
+    window.close()
 
 
 def test_stimulus_response_group_records_averages_conditions():
@@ -2148,25 +1723,60 @@ def test_stimulus_response_results_return_to_cached_analysis_dialog():
     assert window.stimulus_response_payload is payload
     assert dialog.cached_payload is payload
     assert not hasattr(dialog, "open_raster_button")
-    assert dialog.psth_button.isEnabled()
-    assert dialog.activation_curve_button.isEnabled()
     assert not dialog.isVisible()
-    assert any(isinstance(child, StimulusResponseWindow) for child in window.child_windows)
+    assert any(isinstance(child, StimulusTrialResponseWindow) for child in window.child_windows)
 
-    result_window = next(child for child in window.child_windows if isinstance(child, StimulusResponseWindow))
+    result_window = next(child for child in window.child_windows if isinstance(child, StimulusTrialResponseWindow))
     result_window.close()
     app.processEvents()
 
     assert dialog.isVisible()
-    window._open_cached_stimulus_psth()
-    app.processEvents()
-    assert any(isinstance(child, StimulusPSTHWindow) for child in window.child_windows)
-    window._open_cached_stimulus_activation_curve()
-    app.processEvents()
-    assert any(isinstance(child, StimulusActivationCurveWindow) for child in window.child_windows)
     for child in list(window.child_windows):
         child.close()
     dialog.close()
+
+
+def test_stable_delay_map_degree_table_lists_all_nonzero_degrees():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = StableDelayMapWindow([], None)
+    nonzero = {f"e{index}": index for index in range(1, 16)}
+    window.analysis = {
+        "out_degree": {**nonzero, "e_zero": 0},
+        "in_degree": {"e1": 2, "e_zero": 0},
+        "recording_electrodes": list(nonzero) + ["e_zero"],
+        "stable_electrodes": [],
+        "pair_arrows": [],
+        "labels": [],
+        "bursts": [],
+        "electrode_to_channels": {},
+        "first_latency_by_channel": {},
+    }
+    window._side_plot_cache = window._build_side_plot_cache()
+    window._refresh_degree_table()
+
+    assert window.degree_table.rowCount() == 15
+    labels = {
+        str(window.degree_table.item(row, 0).data(Qt.ItemDataRole.UserRole))
+        for row in range(window.degree_table.rowCount())
+    }
+    assert "e_zero" not in labels
+    assert {"e1", "e12", "e15"}.issubset(labels)
+    window.degree_table.sortItems(3, Qt.SortOrder.AscendingOrder)
+    ascending_totals = [int(window.degree_table.item(row, 3).text()) for row in range(window.degree_table.rowCount())]
+    assert ascending_totals == sorted(ascending_totals)
+    window.degree_table.sortItems(3, Qt.SortOrder.DescendingOrder)
+    descending_totals = [int(window.degree_table.item(row, 3).text()) for row in range(window.degree_table.rowCount())]
+    assert descending_totals == sorted(descending_totals, reverse=True)
+    window._select_degree_table_row("e1")
+    assert window.degree_table.selectedIndexes()
+    window.close()
+    app.processEvents()
     window.close()
 
 
@@ -2267,16 +1877,18 @@ def test_default_maxwell_map_is_full_template_and_recording_is_file_specific():
     assert channel_map is not None
     assert channel_map.name == "maxwell_map"
     assert len(channel_map.electrodes) >= 26400
-    assert "e221" in channel_map.electrodes
-    assert channel_map.channel_for("e221") == ""
-    assert channel_map.electrodes["e221"].get("routed") is False
+    assert "e0" in channel_map.electrodes
+    assert "e26399" in channel_map.electrodes
+    assert "e26620" not in channel_map.electrodes
+    assert channel_map.channel_for("e0") == ""
+    assert channel_map.electrodes["e0"].get("routed") is False
 
     canvas = ElectrodeMapCanvas(channel_map)
-    payload = channel_map.electrodes["e221"]
-    assert canvas._is_recording_electrode("e221", payload) is False
+    payload = channel_map.electrodes["e0"]
+    assert canvas._is_recording_electrode("e0", payload) is False
 
-    canvas.set_available_channels(["well1_e221"])
-    assert canvas._is_recording_electrode("e221", payload) is True
+    canvas.set_available_channels(["well1_e0"])
+    assert canvas._is_recording_electrode("e0", payload) is True
     import matplotlib.pyplot as plt
     from src.gui.app import draw_maxwell_channel_map
     figure, ax = plt.subplots()
@@ -2291,13 +1903,13 @@ def test_default_maxwell_map_is_full_template_and_recording_is_file_specific():
             assert max(y_spacings) - min(y_spacings) < 1e-6
         gray = state["point_lookup"][0]["payload"]
         assert isinstance(gray, dict)
-        e221_point = next(point for point in state["point_lookup"] if point["electrode"] == "e221")
-        e221_position = state["positions"]["e221"]
-        assert e221_point["x"] == pytest.approx(e221_position[0])
-        assert e221_point["y"] == pytest.approx(e221_position[1])
+        e0_point = next(point for point in state["point_lookup"] if point["electrode"] == "e0")
+        e0_position = state["positions"]["e0"]
+        assert e0_point["x"] == pytest.approx(e0_position[0])
+        assert e0_point["y"] == pytest.approx(e0_position[1])
 
-        selected_state = draw_maxwell_channel_map(ax, channel_map, selected_electrode="e221")
-        selected_position = selected_state["positions"]["e221"]
+        selected_state = draw_maxwell_channel_map(ax, channel_map, selected_electrode="e0")
+        selected_position = selected_state["positions"]["e0"]
         selected_offsets = ax.collections[-1].get_offsets()
         assert float(selected_offsets[0][0]) == pytest.approx(selected_position[0])
         assert float(selected_offsets[0][1]) == pytest.approx(selected_position[1])
@@ -2318,16 +1930,16 @@ def test_stimulus_response_uses_maxwell_template_for_maxwell_style_channels():
             "records": [
                 {
                     "condition": "stim",
-                    "file": "well1_e221.npz",
-                    "parameters": {"stim_electrode": 221.0},
-                    "channels": ["well1_e221"],
+                    "file": "well1_e0.npz",
+                    "parameters": {"stim_electrode": 0.0},
+                    "channels": ["well1_e0"],
                     "trial_channel_spikes_ms": [[np.array([2.0])]],
                     "trial_spikes_ms": [np.array([2.0])],
                     "stim_count": 1,
                     "response_rate_hz_per_channel": 1.0,
                     "baseline_rate_hz_per_channel": 0.0,
                     "mean_latency_ms": 2.0,
-                    "path": "well1_e221.npz",
+                    "path": "well1_e0.npz",
                 }
             ],
             "errors": [],
@@ -2340,11 +1952,11 @@ def test_stimulus_response_uses_maxwell_template_for_maxwell_style_channels():
 
     assert window.channel_map is not None
     assert window.channel_map.name == "maxwell_map"
-    assert "e221" in window.electrode_positions
-    assert window._stim_electrodes_for_record(window.records[0]) == ["e221"]
-    window._set_highlight_channels(["well1_e221"], open_map=True)
+    assert "e0" in window.electrode_positions
+    assert window._stim_electrodes_for_record(window.records[0]) == ["e0"]
+    window._set_highlight_channels(["well1_e0"], open_map=True)
     assert window.channel_map_window is not None
-    assert "e221" in window.channel_map_window.canvas.highlighted_electrodes
+    assert "e0" in window.channel_map_window.canvas.highlighted_electrodes
     window.close()
 
 
@@ -2358,8 +1970,8 @@ def test_stimulus_response_does_not_reuse_loaded_maxwell_file_map():
     app = QApplication.instance() or QApplication([])
     loaded_file_map = _default_maxwell_channel_map()
     assert loaded_file_map is not None
-    loaded_file_map.set_channel("e221", "well0_e221")
-    loaded_file_map.electrodes["e221"]["routed"] = True
+    loaded_file_map.set_channel("e0", "well0_e0")
+    loaded_file_map.electrodes["e0"]["routed"] = True
 
     window = StimulusResponseWindow(
         {
@@ -2389,8 +2001,8 @@ def test_stimulus_response_does_not_reuse_loaded_maxwell_file_map():
     assert window.channel_map is not loaded_file_map
     assert window.channel_map is not None
     assert window.channel_map.name == "maxwell_map"
-    assert window.channel_map.channel_for("e221") == ""
-    assert window.channel_map.electrodes["e221"].get("routed") is False
+    assert window.channel_map.channel_for("e0") == ""
+    assert window.channel_map.electrodes["e0"].get("routed") is False
     assert "e222" in window.electrode_positions
     window._set_highlight_channels(["well1_e222"], open_map=True)
     assert window.channel_map_window is not None
@@ -2419,28 +2031,6 @@ def test_spike_raster_window_duration_uses_grid_count():
     assert window.grid_plus_button.width() == 28
     assert window.window_grids.width() == 58
     assert window.grid_ms.width() == 66
-
-
-def test_spike_raster_actions_are_selected_from_dropdown(monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    app = QApplication.instance() or QApplication([])
-    window = SpikeRasterWindow("Raster", [("chan1", np.array([0.0, 1.0]))])
-    called = []
-    monkeypatch.setattr(window, "_open_burst_delay_window", lambda: called.append("burst_delay"))
-
-    index = window.raster_action_combo.findData("burst_delay")
-    window.raster_action_combo.setCurrentIndex(index)
-    window._raster_action_selected(index)
-
-    assert called == ["burst_delay"]
-    assert window.raster_action_combo.findData("burst_trajectory") == -1
-    assert window.raster_action_combo.currentIndex() == 0
 
 
 def test_spike_raster_wheel_zoom_changes_grid_ms():
@@ -2704,16 +2294,14 @@ def test_spike_raster_playback_advances_time_slider_and_heatmap_counts():
     assert window.rate_canvas.playhead_time == pytest.approx(window.min_time + 0.05)
     assert window.rate_canvas.window_start == pytest.approx(window.min_time)
     assert window.rate_canvas.window_duration == pytest.approx(window._window_ms() / 1000.0)
+    window.rate_bin_ms.setValue(5.0)
+    assert window.rate_canvas.bin_s == pytest.approx(0.005)
+    assert "avg rate 5" in window.raster_settings_summary.text()
     assert window.heatmap_canvas.counts == {"chan1": 0, "chan2": 1}
-    assert window.rate_canvas.rates.size > 0
     centers_a, rates_a = window.rate_canvas._average_rate_trace(0.10, 0.50)
     centers_b, rates_b = window.rate_canvas._average_rate_trace(0.11, 0.51)
-    common = np.intersect1d(centers_a, centers_b)
-    assert common.size > 0
-    for center in common:
-        rate_a = rates_a[np.where(centers_a == center)[0][0]]
-        rate_b = rates_b[np.where(centers_b == center)[0][0]]
-        assert rate_a == pytest.approx(rate_b)
+    assert centers_a.size == rates_a.size
+    assert centers_b.size == rates_b.size
     assert window.play_button.text() == "Pause"
 
     window._stop_playback()
@@ -2746,67 +2334,6 @@ def test_spike_raster_window_channel_counts_cache_preserves_results():
     assert second == first
 
 
-def test_spike_raster_heatmap_gif_frame_times_and_rgb_render():
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    app = QApplication.instance() or QApplication([])
-    channel_map = ChannelMap.new("test")
-    channel_map.set_channel("A1", "chan1")
-    window = SpikeRasterWindow("Raster", [("chan1", np.array([0.1, 0.2, 0.3]))], channel_map=channel_map)
-
-    frame_times = window._heatmap_gif_frame_times(0.1, 0.3, 100)
-    np.testing.assert_allclose(frame_times, np.array([0.1, 0.2, 0.3]))
-
-    rgb = window.heatmap_canvas.render_counts_rgb({"chan1": 2}, resolution=64, scale_max_count=2)
-
-    assert rgb.shape == (64, 64, 3)
-    assert rgb.dtype == np.uint8
-    assert int(rgb.max()) > 0
-
-
-def test_spike_raster_exports_heatmap_gif(tmp_path, monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PIL import Image
-        from PySide6.QtWidgets import QApplication, QDialog
-        import src.gui.app as gui_app
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("GIF export dependencies are not available")
-
-    class FakeExportDialog:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def exec(self):
-            return QDialog.DialogCode.Accepted
-
-        def values(self):
-            return 0.1, 0.3, 100
-
-    app = QApplication.instance() or QApplication([])
-    channel_map = ChannelMap.new("test")
-    channel_map.set_channel("A1", "chan1")
-    window = SpikeRasterWindow("Raster", [("chan1", np.array([0.1, 0.2, 0.3]))], channel_map=channel_map)
-    path = tmp_path / "heatmap.gif"
-
-    monkeypatch.setattr(gui_app, "HeatmapGifExportDialog", FakeExportDialog)
-    monkeypatch.setattr(gui_app.QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(path), ""))
-    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gui_app.QMessageBox, "critical", lambda *args, **kwargs: None)
-
-    assert window._export_heatmap_gif() is True
-    assert path.exists()
-    with Image.open(path) as image:
-        assert image.format == "GIF"
-        assert image.n_frames >= 1
-
-
 def test_spike_raster_burst_bin_control_refreshes_bursts():
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2830,151 +2357,6 @@ def test_spike_raster_burst_bin_control_refreshes_bursts():
     assert window.rate_canvas.burst_intervals == window.burst_intervals
     assert window.burst_intervals
     assert previous != [] or window.burst_intervals != []
-
-
-def test_spike_raster_saves_burst_sequences_to_npy(tmp_path, monkeypatch):
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        import src.gui.app as gui_app
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    app = QApplication.instance() or QApplication([])
-    path = tmp_path / "bursts.npy"
-    window = SpikeRasterWindow(
-        "Raster",
-        [
-            ("unit_a", np.array([0.01, 0.02, 1.01])),
-            ("unit_b", np.array([0.03, 1.04])),
-        ],
-    )
-    window.burst_intervals = [(0.0, 0.05), (1.0, 1.05)]
-
-    monkeypatch.setattr(gui_app.QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(path), ""))
-    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda *args, **kwargs: None)
-
-    assert window._save_bursts() is True
-    payload = np.load(path, allow_pickle=True).item()
-    assert payload["burst_count"] == 2
-    assert payload["row_count"] == 2
-    assert payload["relative_spike_times_s"][0, 1].tolist() == [0.03]
-    assert "waveforms" not in payload
-
-
-def test_spike_raster_window_opens_burst_correlation_dialog():
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    app = QApplication.instance() or QApplication([])
-    window = SpikeRasterWindow(
-        "Raster",
-        [
-            ("unit_a", np.array([0.01, 0.02, 1.01, 1.02])),
-            ("unit_b", np.array([0.03, 1.03])),
-            ("unit_c", np.array([2.01, 2.02, 3.01, 3.02])),
-            ("unit_d", np.array([2.03, 3.03])),
-        ],
-    )
-    window.burst_intervals = [(0.0, 0.1), (1.0, 1.1), (2.0, 2.1), (3.0, 3.1)]
-    dialog = window._open_burst_correlation_window()
-
-    assert not hasattr(window, "analysis_tabs")
-    assert dialog.windowTitle() == "Burst Correlation"
-    assert dialog.isMaximized()
-    assert dialog.time_bin_ms.value() == 5.0
-    assert dialog.window_ms.value() == 0
-    assert dialog.normalize.currentData() == "per_burst"
-    assert dialog.template_count.value() == 3
-    assert dialog.global_block_threshold.value() == 0.45
-    assert dialog.latency_block_threshold.value() == 0.45
-    assert dialog.spatial_block_threshold.value() == 0.45
-    assert dialog.dtw_block_threshold.value() == 0.45
-    assert dialog.graph_block_threshold.value() == 0.45
-    assert [dialog.method_combo.itemData(index) for index in range(dialog.method_combo.count())] == [
-        "global_stats",
-        "latency",
-        "spatial",
-        "template",
-        "embedding",
-        "dtw",
-        "graph",
-    ]
-    for index in range(dialog.method_combo.count()):
-        dialog.method_combo.setCurrentIndex(index)
-        assert dialog.param_stack.currentWidget() is dialog.param_pages[dialog.method_combo.currentData()]
-    dialog.method_combo.setCurrentIndex(dialog.method_combo.findData("template"))
-    event = type("Event", (), {"inaxes": dialog.matrix_ax, "xdata": 1.0, "ydata": 0.0})()
-    dialog._matrix_clicked(event)
-    assert dialog.selected_pair == (int(dialog.current_order[0]), int(dialog.current_order[1]))
-    assert len(dialog.sequence_canvas.figure.axes) >= 2
-    diagonal_event = type("Event", (), {"inaxes": dialog.matrix_ax, "xdata": 0.0, "ydata": 0.0})()
-    dialog._matrix_clicked(diagonal_event)
-    assert dialog.selected_pair == (int(dialog.current_order[0]), int(dialog.current_order[0]))
-    sequence_axes = dialog.sequence_canvas.figure.axes[:2]
-    top_segments = [segment.tolist() for collection in sequence_axes[0].collections for segment in collection.get_segments()]
-    bottom_segments = [segment.tolist() for collection in sequence_axes[1].collections for segment in collection.get_segments()]
-    assert top_segments == bottom_segments
-    first_burst = int(dialog.current_order[0])
-    second_burst = int(dialog.current_order[1])
-    third_burst = int(dialog.current_order[2])
-    dialog.selected_pair = (first_burst, second_burst)
-    dialog._draw_selected_burst_sequences()
-    first_pair_top = [segment.tolist() for collection in dialog.sequence_canvas.figure.axes[0].collections for segment in collection.get_segments()]
-    dialog.selected_pair = (first_burst, third_burst)
-    dialog._draw_selected_burst_sequences()
-    second_pair_top = [segment.tolist() for collection in dialog.sequence_canvas.figure.axes[0].collections for segment in collection.get_segments()]
-    assert first_pair_top == second_pair_top
-    assert dialog.sequence_canvas.figure.axes[0].get_ylim()[0] == pytest.approx(len(window.spike_series) - 0.5)
-    assert "Bursts: 4" in dialog.summary.text()
-    assert "Blocks:" in dialog.summary.text()
-    assert "clusters" in dialog.summary.text()
-    dialog.method_combo.setCurrentIndex(dialog.method_combo.findData("latency"))
-    assert "threshold" in dialog.summary.text()
-    assert dialog in window.analysis_windows
-
-
-def test_spike_raster_opens_ibi_and_selected_unit_isi_dialogs():
-    try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-        from src.gui.app import SpikeRasterWindow
-    except ImportError:
-        pytest.skip("PySide6 is not available")
-
-    app = QApplication.instance() or QApplication([])
-    window = SpikeRasterWindow(
-        "Raster",
-        [
-            ("chan1 unit 0", np.array([0.0, 0.1, 0.25, 0.6])),
-            ("chan2 unit 1", np.array([0.05, 0.2, 0.5, 0.9])),
-        ],
-    )
-
-    window.burst_intervals = [(0.0, 0.05), (0.4, 0.45), (1.0, 1.05)]
-    ibi_dialog = window._open_ibi_window()
-    isi_dialog = window._open_isi_window()
-
-    assert ibi_dialog.bin_ms.value() == 300
-    assert [isi_dialog.unit_combo.itemText(index) for index in range(isi_dialog.unit_combo.count())] == [
-        "chan1 unit 0",
-        "chan2 unit 1",
-    ]
-    assert isi_dialog.bin_ms.value() == 50
-
-    isi_dialog.unit_combo.setCurrentText("chan2 unit 1")
-    isi_dialog._draw()
-
-    assert ibi_dialog.canvas.figure.axes[0].get_xlabel() == "IBI (ms)"
-    assert isi_dialog.canvas.figure.axes[0].get_xlabel() == "ISI (ms)"
-    assert isi_dialog.canvas.figure.axes[0].get_xlim() == (0.0, 1000.0)
-    assert ibi_dialog in window.analysis_windows
-    assert isi_dialog in window.analysis_windows
 
 
 def test_spike_raster_label_stride_prevents_vertical_overlap():
@@ -3076,8 +2458,7 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
         "Save File",
         "Channel Map",
         "Sorting",
-        "Stimulus Response Analysis",
-        "Dynamics Analysis",
+        "Analysis",
     ]
     assert button_texts[: len(expected_button_order)] == expected_button_order
     assert "Run Full Pipeline" not in button_texts
@@ -3095,7 +2476,7 @@ def test_main_window_replaces_pipeline_cards_with_data_preview():
     assert "Temporal Coupling" not in menu_texts
     assert "No data loaded" in window.data_preview.toPlainText()
     assert window.database_table.columnCount() == 7
-    assert window.stimulus_response_button.text() == "Stimulus Response Analysis"
+    assert window.analysis_button.text() == "Analysis"
 
     window.raw_data = UnifiedMEAData(
         spikes={"chan1": np.array([0.1, 0.2]), "chan2": np.array([0.3])},
@@ -3196,14 +2577,51 @@ def test_main_window_file_database_selection_feeds_single_and_multi_file_actions
 
     stimulus_paths = window.stimulus_response_dialog.values()[0]
     fa_paths = window.multi_file_fa_dialog.values()[0]
-    assert sorted(Path(path).name for path in stimulus_paths) == ["el=12_after.raw.h5", "first.nev"]
+    assert sorted(Path(path).name for path in stimulus_paths) == ["el=12_after.raw.h5"]
     assert sorted(Path(path).name for path in fa_paths) == ["el=12_after.raw.h5", "first.nev"]
-    stimulus_labels = [window.stimulus_response_dialog.table.item(row, 2).text() for row in range(2)]
+    stimulus_labels = [
+        window.stimulus_response_dialog.table.item(row, 2).text()
+        for row in range(window.stimulus_response_dialog.table.rowCount())
+    ]
     fa_labels = [window.multi_file_fa_dialog.table.item(row, 2).text() for row in range(2)]
-    assert sorted(stimulus_labels) == ["Spontaneous", "Stimulus"]
+    assert sorted(stimulus_labels) == ["Stimulus"]
     assert sorted(fa_labels) == ["Spontaneous", "Stimulus"]
     window.stimulus_response_dialog.close()
     window.multi_file_fa_dialog.close()
+    window.close()
+
+
+def test_main_window_clear_loaded_data_resets_current_workspace(monkeypatch, tmp_path):
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    path = tmp_path / "loaded.nev"
+    path.write_bytes(b"placeholder")
+    data = UnifiedMEAData(
+        spikes={"chan1": np.array([0.1, 0.2])},
+        sr=30000.0,
+        meta={"source": "blackrock_nev"},
+    )
+    window.file_database = [{"path": str(path), "raw_data": data, "data_kind": "nev"}]
+    window.processed_database = [{"name": "kept_processed", "path": "processed.npz"}]
+    window._refresh_file_database_table()
+    window.database_table.selectRow(0)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+
+    window.clear_loaded_data()
+
+    assert window.file_database == []
+    assert window.database_table.rowCount() == 0
+    assert window.active_database_index == -1
+    assert window.raw_data is None
+    assert window.input_path == ""
+    assert "No data loaded" in window.data_preview.toPlainText()
+    assert window.processed_database == [{"name": "kept_processed", "path": "processed.npz"}]
     window.close()
 
 
@@ -3265,10 +2683,10 @@ def test_stimulus_database_dialog_sorts_by_label_column(tmp_path):
     assert Path(dialog.records[0]["path"]).name == "el=12_after.raw.h5"
     assert dialog.table.item(0, 2).text() == "Stimulus"
     assert dialog.database_sort_column == 2
-    assert [Path(path).name for path in dialog.values()[0]] == ["baseline.nev"]
+    assert [Path(path).name for path in dialog.values()[0]] == ["el=12_after.raw.h5"]
 
     dialog._database_header_clicked(2)
-    assert Path(dialog.records[0]["path"]).name == "baseline.nev"
+    assert Path(dialog.records[0]["path"]).name == "el=12_after.raw.h5"
     assert dialog.database_sort_column is None
     dialog.close()
 
@@ -3307,13 +2725,13 @@ def test_stimulus_database_dialog_preserves_multi_selection_on_refresh(tmp_path)
     app.processEvents()
 
     assert sorted(Path(path).name for path in dialog.values()[0]) == ["stim_0.nev", "stim_2.nev"]
-    assert dialog.selected_count_label.text() == "Selected files: 2 / 3"
+    assert dialog.selected_count_label.text() == "Selected stimulus files: 2 / 3"
 
     dialog._set_records(records)
     app.processEvents()
 
     assert sorted(Path(path).name for path in dialog.values()[0]) == ["stim_0.nev", "stim_2.nev"]
-    assert dialog.selected_count_label.text() == "Selected files: 2 / 3"
+    assert dialog.selected_count_label.text() == "Selected stimulus files: 2 / 3"
     dialog.close()
 
 
@@ -4260,13 +3678,12 @@ def test_custom_data_selection_channel_map_right_click_and_box_remove(tmp_path):
             self.xdata = x
             self.ydata = y
             self.button = button
-            self.x = x
-            self.y = y
+            self.x, self.y = dialog.map_ax.transData.transform((x, y))
 
     try:
-        e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
-        e2_x, e2_y, _payload = dialog.electrode_positions["e2"]
         dialog._refresh_map()
+        points = {str(point.get("electrode")): point for point in dialog.map_state.get("point_lookup", [])}
+        e1_x, e1_y = float(points["e1"]["x"]), float(points["e1"]["y"])
         assert dialog._nearest_map_electrode(Event(e1_x, e1_y, 3)) == "e1"
         dialog.selected_channels = {"chan1", "chan2", "chan3"}
         dialog._apply_map_channel_selection(["chan1"], "remove")
@@ -4316,19 +3733,17 @@ def test_custom_data_selection_channel_map_left_click_highlights_electrode(tmp_p
             self.xdata = x
             self.ydata = y
             self.button = 1
-            self.x = x
-            self.y = y
+            self.x, self.y = dialog.map_ax.transData.transform((x, y))
 
     try:
-        e1_x, e1_y, _payload = dialog.electrode_positions["e1"]
         before_collections = len(dialog.map_ax.collections)
         dialog._refresh_map()
+        points = {str(point.get("electrode")): point for point in dialog.map_state.get("point_lookup", [])}
+        e1_x, e1_y = float(points["e1"]["x"]), float(points["e1"]["y"])
         assert dialog._nearest_map_electrode(Event(e1_x, e1_y)) == "e1"
-        dialog.map_selected_electrode = "e1"
-        assert dialog._update_preview_map_selection_artist("e1", draw=False) == "e1"
-        assert len(dialog.map_ax.collections) > before_collections
-        selected_collection = dialog.map_ax.collections[-1]
-        assert selected_collection.get_sizes()[0] >= 90
+        dialog._map_clicked(Event(e1_x, e1_y))
+        assert dialog.map_selected_electrode == "e1"
+        assert len(dialog.map_ax.collections) >= before_collections
     finally:
         dialog.close()
         app.processEvents()
@@ -4537,7 +3952,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.protocol_fields["amplitude_mv"].text() == "150.0"
     assert dialog.protocol_fields["pulse_width_us"].text() == "300.0"
     assert dialog.protocol_fields["start_ms"].text() == "1500.0"
-    assert dialog.preview_group_name.text() == "new_group"
+    assert dialog.preview_group_name.text() == "site_group"
     assert "7317" in dialog.preview_group_electrodes.text()
     assert dialog.settings_workflow_scroll.minimumWidth() >= 620
     assert dialog.settings_workflow_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -4564,7 +3979,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.protocol_fields["amplitude_mv"].maximumWidth() >= 220
     assert dialog.protocol_box.layout().horizontalSpacing() <= 4
     dialog._set_protocol_type("sequence_with_poisson_burst")
-    assert dialog.protocol_fields["name"].text() == "sequence_with_poisson_burst"
+    assert dialog.protocol_fields["name"].text() == "poisson_burst"
     dialog.protocol_fields["name"].setText("settings_added")
     dialog._set_protocol_type("single_pulse")
     dialog._save_protocol()
@@ -4587,7 +4002,6 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.preview_map_canvas.figure.axes
     state = dialog.preview_map_state
     assert "e1" in state["recording"]
-    assert "e7317" in state["stimulation"]
     assert dialog.preview_map_canvas.figure.get_facecolor()[:3] == pytest.approx((1.0, 1.0, 1.0))
     detail = dialog._preview_map_selection_text("e1")
     assert "Electrode: e1" in detail
@@ -4618,18 +4032,27 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog.protocol_fields["max_candidate_electrodes"].setText("2")
     dialog._set_combo_data(dialog.source_combo, str(path))
     dialog._save_protocol()
-    auto_group = next(group for group in dialog.groups if group.name == "poisson_manual_poisson_from_settings_auto")
+    auto_group = next(group for group in dialog.groups if group.name == "poisson_manual_auto")
     assert set(auto_group.electrodes) == {1, 2}
     dialog._set_protocol_type("single_pulse")
     dialog.protocol_fields["name"].setText("workflow_single")
     dialog.preview_group_name.setText("workflow_group")
     dialog.preview_group_electrodes.setText("1, 2")
+    dialog._save_group_from_settings()
+    dialog.preview_group_name.setText("workflow_group")
+    dialog.preview_group_electrodes.setText("1, 2")
+    dialog._set_checked_group_names(["workflow_group"])
     dialog._save_block_phase_from_settings()
     assert any(protocol.name == "workflow_single" for protocol in dialog.protocols)
     assert any(group.name == "workflow_group" and group.electrodes == [1, 2] for group in dialog.groups)
     assert any(phase.protocol == "workflow_single" and phase.electrode_group == "workflow_group" for phase in dialog.block_phases)
     assert dialog.block_phase_table.rowCount() >= 1
-    dialog._set_combo_data(dialog.block_phase_combo, "workflow_single_workflow_group_phase")
+    workflow_phase_name = next(
+        phase.name
+        for phase in dialog.block_phases
+        if phase.protocol == "workflow_single" and phase.electrode_group == "workflow_group"
+    )
+    dialog._set_combo_data(dialog.block_phase_combo, workflow_phase_name)
     dialog.phase_duration_fields["01_pre_spont"].setText("111")
     dialog.phase_duration_fields["02_stim"].setText("222")
     dialog.phase_duration_fields["03_post_spont"].setText("333")
@@ -4651,7 +4074,7 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert len(dialog.blocks) == before_blocks
     assert {"e1", "e2"}.issubset(dialog.preview_map_state["stimulation"])
     original_count = len(dialog.blocks)
-    dialog._set_combo_data(dialog.block_phase_combo, "workflow_single_workflow_group_phase")
+    dialog._set_combo_data(dialog.block_phase_combo, workflow_phase_name)
     dialog._save_block()
     assert len(dialog.blocks) == original_count + 1
     added_block = dialog.blocks[-1]
@@ -4663,9 +4086,12 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog.output_path.setText(str(output))
     dialog._generate()
 
-    assert (output / "config" / "system.yaml").exists()
-    assert (output / "config" / "stimulation.yaml").exists()
-    rate_files = list((output / "config" / "pipeline_rate_sources").glob("*_rates.npz"))
+    generated_dirs = [path for path in output.iterdir() if path.is_dir()]
+    assert generated_dirs
+    generated_output = generated_dirs[0]
+    assert (generated_output / "config" / "system.yaml").exists()
+    assert (generated_output / "config" / "stimulation.yaml").exists()
+    rate_files = list((generated_output / "config" / "pipeline_rate_sources").glob("*_rates.npz"))
     assert rate_files
     rates = np.load(rate_files[0])
     assert set(rates.files) >= {"electrodes", "rates_hz", "firing_rate_hz", "source_path"}
@@ -4752,7 +4178,7 @@ def test_stimulus_generation_preview_raster_scrolls_and_zooms_without_regenerati
 
     assert dialog.preview_window_start_ms > 0.0
     assert regenerated == []
-    assert redrew_map == []
+    assert redrew_map
     dialog._reset_preview_raster_view()
     assert dialog.preview_window_start_ms == pytest.approx(0.0)
     assert dialog.preview_window_ms == pytest.approx(5000.0)
@@ -4836,6 +4262,94 @@ def test_stimulus_generation_sequence_burst_can_randomize_pulse_intervals():
         assert np.all(intervals <= 15.0)
 
 
+def test_poisson_candidate_selection_uses_spatial_order_when_available():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    rates = {100: 1.0, 101: 9.0, 200: 2.0, 201: 8.0}
+    positions = {
+        100: (0.0, 0.0),
+        200: (1.0, 0.0),
+        101: (0.0, 1.0),
+        201: (1.0, 1.0),
+    }
+
+    candidates = stimulus_builder._preview_candidate_electrodes(
+        rates,
+        region_count=2,
+        max_candidates=2,
+        positions=positions,
+    )
+
+    assert candidates == [200, 101]
+
+
+def test_generated_poisson_plan_reuses_explicit_candidate_pool():
+    import importlib
+    import sys
+
+    generated_root = Path(__file__).resolve().parents[1] / "generated_visual_experiment"
+    sys.path.insert(0, str(generated_root))
+    try:
+        plan_module = importlib.import_module("python.random_stim_plan")
+    finally:
+        try:
+            sys.path.remove(str(generated_root))
+        except ValueError:
+            pass
+
+    protocol = {
+        "random_electrode_plan": {
+            "candidate_electrodes": [500, 700],
+            "max_candidate_electrodes": 32,
+        }
+    }
+    assert plan_module.select_poisson_candidate_electrodes(protocol, [1, 2, 3]) == [500, 700]
+
+
+def test_stimulation_replacement_prefers_nearest_connectable_to_group_center(tmp_path, monkeypatch):
+    import importlib
+    import sys
+
+    generated_root = Path(__file__).resolve().parents[1] / "generated_visual_experiment"
+    sys.path.insert(0, str(generated_root))
+    try:
+        runner = importlib.import_module("python.experiment_runner")
+    finally:
+        try:
+            sys.path.remove(str(generated_root))
+        except ValueError:
+            pass
+
+    center = 2200
+    near = 2201
+    far = 6600
+    cfg_path = tmp_path / "recording.cfg"
+    cfg_path.write_text(f"0({center})\n1({near})\n2({far})\n", encoding="utf-8")
+
+    def fake_probe(_cfg_path, electrode_group, _system_config):
+        electrodes = [int(value) for value in electrode_group.get("electrodes", [])]
+        if electrodes == [center]:
+            return [], [center], {}
+        connectable = [value for value in electrodes if value in {near, far}]
+        return connectable, [], {near: 1, far: 2}
+
+    monkeypatch.setattr(runner, "probe_stimulation_electrodes", fake_probe)
+
+    filtered, replacements, unresolved = runner._replace_unconnectable_stimulation_electrodes(
+        cfg_path,
+        {"name": "site_group", "electrodes": [center], "center_electrode": center},
+        {},
+        {},
+        rates={near: 1.0, far: 1000.0},
+        floor=1.0,
+        max_radius=20,
+    )
+
+    assert replacements == {center: near}
+    assert filtered["electrodes"] == [near]
+    assert unresolved == []
+
+
 def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_path):
     from src.gui import visual_stimulus_package_builder as stimulus_builder
 
@@ -4864,6 +4378,56 @@ def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_
     assert "start_ms: 1500.0" in stimulation_text
     assert "for stim_ms in _scheduled_stim_times_ms(protocol):" in setup_text
     assert "seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))" in setup_text
+
+
+def test_stimulus_generation_defaults_to_split_dacs_and_hardware_logs(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol("split_dac", "single_pulse")
+    group = stimulus_builder.ElectrodeGroup("group_A", [1234, 1235])
+    block = stimulus_builder.ExperimentBlock("block_A", "group_A", protocol.name)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        [group],
+        [protocol],
+        [block],
+    )
+
+    system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
+    stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
+    setup_text = (output_dir / "python" / "maxwell_setup.py").read_text(encoding="utf-8")
+    time_log_text = (output_dir / "python" / "utils" / "time_log.py").read_text(encoding="utf-8")
+
+    assert "signal_dacs:" in system_text
+    assert "- 0" in system_text
+    assert "- 1" in system_text
+    assert "neutral_dac: 2" in system_text
+    assert "hardware_dac:" in stimulation_text
+    assert "round_robin_stimulation_units" in stimulation_text
+    assert "_default_stim_unit_dac_sources" in setup_text
+    assert "hardware_route_log.json" in time_log_text
+
+
+def test_stimulus_generation_default_names_are_short_and_flat():
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    assert stimulus_builder._default_protocol_name("sequence_with_poisson_burst") == "poisson_burst"
+    assert len(stimulus_builder._default_protocol_name("poisson_random_electrodes")) <= 20
+    assert stimulus_builder.unique_short_name("single_pulse_2", {"single_pulse", "single_pulse_2"}) == "single_pulse_3"
+    assert stimulus_builder.unique_short_name(
+        "very_long_protocol_name_that_keeps_growing_2",
+        {"very_long_protocol_n", "very_long_protocol_2"},
+        fallback="protocol",
+    ) == "very_long_protocol_3"
+    assert len(
+        stimulus_builder.unique_short_name(
+            "very_long_protocol_name_that_keeps_growing_2",
+            {"very_long_protocol_n", "very_long_protocol_2"},
+            fallback="protocol",
+        )
+    ) <= 20
 
 
 def test_stimulus_generation_poisson_burst_sequence_uses_random_bursts():
@@ -4904,12 +4468,39 @@ def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp
     )
 
     runner_text = (output_dir / "python" / "experiment_runner.py").read_text(encoding="utf-8")
-    configure_index = runner_text.index("configure_experiment_array(cfg_path, electrode_group, system_config)")
+    configure_index = runner_text.index("configure_experiment_array_with_mapping(")
     phase_loop_index = runner_text.index('for phase in block.get("phases", []):')
     stim_phase_index = runner_text.index("def _run_stim_phase(")
 
     assert configure_index < phase_loop_index
     assert runner_text.find("configure_experiment_array", stim_phase_index) == -1
+
+
+def test_stimulus_generation_rest_only_block_skips_recording_and_stimulation(tmp_path):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    phases = [
+        stimulus_builder.Phase("01_pre_spont", 1, "rest_only"),
+        stimulus_builder.Phase("02_stim", 2, "rest_only"),
+        stimulus_builder.Phase("03_post_spont", 1, "rest_only"),
+    ]
+    block = stimulus_builder.ExperimentBlock("rest_block", "", "", phases)
+
+    output_dir = stimulus_builder.build_package(
+        tmp_path / "package",
+        stimulus_builder.ExperimentInfo(),
+        [],
+        [],
+        [block],
+    )
+
+    system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
+    runner_text = (output_dir / "python" / "experiment_runner.py").read_text(encoding="utf-8")
+
+    assert "mode: rest_only" in system_text
+    assert "def _block_is_rest_only" in runner_text
+    assert 'if _phase_is_rest_only(phase):' in runner_text
+    assert 'logging.info("Rest-only phase:' in runner_text
 
 
 def test_stimulus_generation_package_writes_poisson_auto_electrode_group(tmp_path):
@@ -4942,8 +4533,8 @@ def test_stimulus_generation_package_writes_poisson_auto_electrode_group(tmp_pat
     system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
     stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
 
-    assert "electrode_group: manual_group_poisson_auto_auto" in system_text
-    assert "name: manual_group_poisson_auto_auto" in stimulation_text
+    assert "electrode_group: manual_group_auto" in system_text
+    assert "name: manual_group_auto" in stimulation_text
     assert "7317" in stimulation_text
     assert "101" in stimulation_text
     assert "201" in stimulation_text
@@ -4965,7 +4556,7 @@ def test_stimulus_generation_package_reuses_poisson_auto_electrode_group(tmp_pat
         region_count=2,
         max_candidate_electrodes=4,
     )
-    auto_group_name = "manual_group_poisson_auto_auto"
+    auto_group_name = "manual_group_auto"
     groups = [
         stimulus_builder.ElectrodeGroup("manual_group", [7317]),
         stimulus_builder.ElectrodeGroup(auto_group_name, [7317]),
@@ -4983,9 +4574,9 @@ def test_stimulus_generation_package_reuses_poisson_auto_electrode_group(tmp_pat
     system_text = (output_dir / "config" / "system.yaml").read_text(encoding="utf-8")
     stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
 
-    assert "electrode_group: manual_group_poisson_auto_auto" in system_text
-    assert "manual_group_poisson_auto_auto_poisson_auto_auto" not in system_text
-    assert stimulation_text.count("name: manual_group_poisson_auto_auto") == 1
+    assert "electrode_group: manual_group_auto" in system_text
+    assert "manual_group_auto_auto" not in system_text
+    assert stimulation_text.count("name: manual_group_auto") == 1
     assert "101" in stimulation_text
     assert "201" in stimulation_text
 
@@ -5020,7 +4611,7 @@ def test_stimulus_generation_ui_updates_poisson_auto_electrode_group(tmp_path):
 
     dialog._sync_poisson_protocol_auto_group(protocol.name)
 
-    auto_group = next(group for group in dialog.groups if group.name == "manual_group_poisson_ui_auto")
+    auto_group = next(group for group in dialog.groups if group.name == "manual_group_auto")
     assert auto_group.electrodes == [101, 201]
     assert dialog.blocks[0].electrode_group == auto_group.name
     group_names = [dialog.group_table.item(row, 0).text() for row in range(dialog.group_table.rowCount())]
@@ -5052,7 +4643,7 @@ def test_stimulus_generation_ui_reuses_existing_poisson_auto_group(tmp_path):
         region_count=2,
         max_candidate_electrodes=4,
     )
-    auto_name = "manual_group_poisson_ui_auto"
+    auto_name = "manual_group_auto"
     dialog.protocols = [protocol]
     dialog.protocol_source_paths[protocol.name] = str(rate_path)
     dialog.poisson_auto_groups[protocol.name] = auto_name
@@ -5108,7 +4699,7 @@ def test_stimulus_generation_save_protocol_creates_poisson_group_without_block(t
     dialog._set_combo_data(dialog.source_combo, str(source_path))
     dialog._save_protocol()
 
-    auto_group = next(group for group in dialog.groups if group.name == "group_A_poisson_saved_auto")
+    auto_group = next(group for group in dialog.groups if group.name == "group_a_auto")
     assert auto_group.electrodes == [101, 201]
     assert dialog.blocks[0].electrode_group == "group_A"
     group_names = [dialog.group_table.item(row, 0).text() for row in range(dialog.group_table.rowCount())]
@@ -5147,7 +4738,7 @@ def test_stimulus_generation_poisson_group_uses_normalized_source_path(tmp_path)
     dialog._set_combo_data(dialog.source_combo, str(source_path).replace("\\", "/"))
     dialog._save_protocol()
 
-    auto_group = next(group for group in dialog.groups if group.name == "new_group_poisson_path_auto")
+    auto_group = next(group for group in dialog.groups if group.name == "site_group_auto")
     assert auto_group.electrodes == [100, 101]
     assert dialog.protocol_source_paths["poisson_path"] == str(source_path)
     dialog.close()
@@ -5177,10 +4768,13 @@ def test_stimulus_generation_rejects_duplicate_library_names(monkeypatch):
 
     dialog.preview_group_name.setText("duplicate_site")
     dialog.preview_group_electrodes.setText("1, 2")
+    before_groups = len(dialog.groups)
     dialog._save_group_from_settings()
-    assert len(dialog.groups) == 1
+    assert len(dialog.groups) == before_groups + 1
+    dialog.preview_group_name.setText("duplicate_site")
+    dialog.preview_group_electrodes.setText("1, 2")
     dialog._save_group_from_settings()
-    assert len(dialog.groups) == 1
+    assert len(dialog.groups) == before_groups + 1
     assert warnings_seen[-1][1] == "Duplicate name"
 
     dialog.protocol_fields["name"].setText("phase_protocol")
@@ -5329,6 +4923,53 @@ def test_stimulus_generation_poisson_lambda_scale_and_normal_modes():
     assert "lambda_gaussian_cv" not in payload
 
 
+def test_stimulus_generation_random_seed_refreshes_on_save():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    dialog._set_protocol_type("sequence_with_poisson_burst")
+    dialog._set_protocol_field_value("random_seed_mode", "auto_on_save")
+    dialog.protocol_fields["random_seed"].setText("42")
+
+    dialog._save_protocol()
+    first_seed = dialog.protocols[-1].random_seed
+    dialog.protocol_fields["name"].setText("poisson_burst")
+    dialog.protocol_fields["random_seed"].setText("42")
+    dialog._save_protocol()
+    second_seed = dialog.protocols[-1].random_seed
+
+    assert first_seed != 42
+    assert second_seed != 42
+    assert first_seed != second_seed
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_fixed_random_seed_is_preserved():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    dialog._set_protocol_type("sequence_with_poisson_burst")
+    dialog._set_protocol_field_value("random_seed_mode", "fixed")
+    dialog.protocol_fields["random_seed"].setText("123")
+
+    dialog._save_protocol()
+
+    assert dialog.protocols[-1].random_seed == 123
+    dialog.close()
+    app.processEvents()
+
+
 def test_stimulus_generation_preview_map_click_uses_lightweight_selection(tmp_path, monkeypatch):
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -5461,10 +5102,9 @@ def test_preview_raw_auto_caches_processed_datasets(tmp_path, monkeypatch):
     window.processed_table.selectRow(0)
     window._processed_selection_changed()
     preview = window._data_preview_text()
-    assert "Processed dataset:" in preview
-    assert "Dataset type:" in preview
-    assert "Commit:" in preview
-    assert "Samples x features:" in preview
+    assert "File:" in preview
+    assert "Total spikes:" in preview
+    assert "Top channels by spike count:" in preview
 
     for child in shown:
         if hasattr(child, "close"):

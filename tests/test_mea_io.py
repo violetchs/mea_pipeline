@@ -4,6 +4,7 @@ import pytest
 import numpy as np
 from pathlib import Path
 import struct
+import json
 
 from src.mea_io import (
     MEAReader,
@@ -17,6 +18,7 @@ from src.mea_io import (
     read_unified_npz,
     save_unified_npz,
 )
+from src.mea_io.spike_readers import _load_maxwell_stim_sidecar, _prefer_site_rich_stimulus_records
 
 
 class TestMEAReader:
@@ -26,6 +28,62 @@ class TestMEAReader:
         """Test MEAReader initialization."""
         reader = MEAReader("data.npy")
         assert reader.filepath == "data.npy"
+
+    def test_maxwell_segment_sidecar_reads_stim_rows_and_prefers_site_records(self, tmp_path):
+        segment_dir = tmp_path / "02_stim"
+        segment_dir.mkdir()
+        h5_path = segment_dir / "recording.raw.h5"
+        h5_path.write_bytes(b"placeholder")
+        (segment_dir / "segment_time_meta.json").write_text(
+            json.dumps(
+                {
+                    "stim_rows": [
+                        {
+                            "offset_sec": 0.005465984,
+                            "label": "1",
+                            "stim_electrodes": [13045, 13479, 13481, 13925],
+                            "pulse_index": 1,
+                        },
+                        {
+                            "offset_sec": 2.010002851,
+                            "label": "2",
+                            "stim_electrodes": [22263, 22269, 23145, 23151],
+                            "pulse_index": 2,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (segment_dir / "stim_times.txt").write_text(
+            "0.005465984\n2.010002851\n",
+            encoding="utf-8",
+        )
+
+        sidecar = _load_maxwell_stim_sidecar(h5_path)
+
+        assert len(sidecar["stim_times"]) == 2
+        assert len(sidecar["stimulus_records"]) == 2
+        assert all(record["electrodes"] for record in sidecar["stimulus_records"])
+        assert [record["label"] for record in sidecar["stimulus_records"]] == ["1", "2"]
+
+    def test_site_rich_stim_records_are_not_lost_to_time_only_rows(self):
+        time_only = [
+            {"time_s": 1.0, "label": "A"},
+            {"time_s": 2.0, "label": "B"},
+        ]
+        site_rich = [
+            {"time_s": 1.0002, "site_group": [13045, 13479, 13481, 13925], "label": "A"},
+            {"time_s": 2.0002, "event_group_electrodes": [22263, 22269, 23145, 23151], "label": "B"},
+        ]
+
+        merged = _prefer_site_rich_stimulus_records(time_only, site_rich)
+
+        assert [record["electrodes"] for record in merged] == [
+            [13045, 13479, 13481, 13925],
+            [22263, 22269, 23145, 23151],
+        ]
+        assert [record["label"] for record in merged] == ["A", "B"]
 
     def test_read_write_npy(self, tmp_path, sample_data):
         path = tmp_path / "sample.npy"
