@@ -17,6 +17,8 @@ from python.maxwell_setup import (
     create_experiment_saving,
     get_stim_times_for_protocol,
     initialize_maxlab,
+    prepare_recording_only,
+    record_channels_excluding,
     probe_stimulation_electrodes,
 )
 from python.random_stim_plan import build_poisson_random_plan
@@ -91,11 +93,13 @@ def _hardware_mapping_payload(
     return {
         "routing_mode": routing_mode,
         "initial_connect": bool(initial_connect),
+        "execution_mode": "d21_host_per_pulse",
+        "connect_timing": "switch_before_host_deadline_wait",
         "connect_settle_ms": float(connect_settle_ms),
         "signal_dacs": [int(value) for value in signal_dacs],
         "neutral_dac": int(neutral_dac),
         "sync_dual_dac": bool(sync_dual_dac),
-        "dac_allocation": "round_robin_stimulation_units",
+        "dac_allocation": "round_robin_electrode_order",
         "electrode_to_stim_unit": {
             str(int(electrode)): int(stim_unit)
             for electrode, stim_unit in sorted(stim_unit_by_electrode.items())
@@ -105,6 +109,7 @@ def _hardware_mapping_payload(
             for stim_unit, dac_source in sorted(stim_unit_to_dac.items())
         },
     }
+
 
 
 def _row_electrodes(row: dict[str, Any]) -> list[int]:
@@ -263,6 +268,11 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
         raise ValueError("No experiment.blocks configured")
     recording_prefix = system_config.get("experiment", {}).get("recording_name_prefix") or system_config.get("experiment", {}).get("name", "recording")
     cfg_path = Path(system_config.get("electrode_map", {}).get("cfg_path", ""))
+    if not dry_run:
+        cfg_electrodes = _cfg_recording_electrodes(cfg_path)
+        id_mapping = _normalize_stimulation_ids_for_cfg(groups, protocols, cfg_electrodes)
+        if id_mapping:
+            logging.warning("Normalized stimulation electrode IDs to CFG namespace: %s", ",".join(f"{source}->{target}" for source, target in sorted(id_mapping.items())))
     logging.info("Experiment start: run_dir=%s dry_run=%s blocks=%d cfg=%s", run_dir, dry_run, len(blocks), cfg_path)
     audit.mark_event(
         "experiment_config_loaded",
@@ -286,7 +296,7 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
             )
             audit.mark_event("cfg_preflight_ok", "", "", "", extra=preflight)
             audit.mark_event("hardware_initialize_start", "", "", "")
-            initialize_maxlab()
+            initialize_maxlab(system_config)
             audit.mark_event("hardware_initialize_done", "", "", "")
             logging.info("MaxLab initialized")
         except Exception as exc:
@@ -356,39 +366,6 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                             "No connectable replacement found for stimulation electrode(s): "
                             + ",".join(str(item) for item in unresolved_electrodes)
                         )
-                    audit.mark_event(
-                        "array_configure_start",
-                        block_name,
-                        "",
-                        "",
-                        extra={
-                            "protocol": protocol.get("name", ""),
-                            "protocol_type": protocol.get("type", ""),
-                            "electrode_group": electrode_group.get("name", ""),
-                            "electrode_count": len(electrode_group.get("electrodes", [])),
-                        },
-                    )
-                    (
-                        _array,
-                        prepared_stim_unit_by_electrode,
-                        prepared_stim_unit_to_dac,
-                    ) = configure_experiment_array_with_mapping(
-                        cfg_path,
-                        electrode_group,
-                        hardware_system_config,
-                        initial_connect=True,
-                    )
-                    audit.mark_event(
-                        "array_configure_done",
-                        block_name,
-                        "",
-                        "",
-                        extra={
-                            "stim_unit_count": len(set(prepared_stim_unit_by_electrode.values())),
-                            "stim_unit_to_dac_source": prepared_stim_unit_to_dac,
-                        },
-                    )
-                    logging.info("Array configured: block=%s electrodes=%d", block_name, len(electrode_group.get("electrodes", [])))
             else:
                 hardware_system_config = system_config
                 prepared_stim_unit_by_electrode = {}
@@ -430,8 +407,9 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                         hardware_system_config=hardware_system_config,
                     )
                 elif not dry_run:
+                    prepare_recording_only(cfg_path, system_config)
                     audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": phase.get("mode", "")})
-                    saving = create_experiment_saving(phase_dir, segment_name)
+                    saving = create_experiment_saving(phase_dir, segment_name, record_channels_excluding(cfg_path, []))
                     time.sleep(duration_s)
                     saving.stop_recording()
                     saving.stop_file()
@@ -456,6 +434,7 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
         audit.mark_event("experiment_end", "", "", "")
         audit.save()
         logging.info("Experiment end: %s", run_dir)
+
 
 
 def _phase_is_record_only(phase: dict[str, Any]) -> bool:
@@ -559,6 +538,64 @@ def _normalize_site_switch_center(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _cfg_electrode_id(value: Any, cfg_electrodes: set[int]) -> tuple[int, int | None]:
+    """Keep the electrode ID from the H5/CFG mapping unchanged."""
+    return int(value), None
+
+
+def _normalize_stimulation_ids_for_cfg(
+    groups: dict[str, dict[str, Any]],
+    protocols: dict[str, dict[str, Any]],
+    cfg_electrodes: set[int],
+) -> dict[int, int]:
+    """Normalize all configured stimulation references before planning/routing."""
+    mapping: dict[int, int] = {}
+
+    def normalize_values(values: Any) -> list[int]:
+        normalized: list[int] = []
+        for value in _event_group_values(values):
+            target, source = _cfg_electrode_id(value, cfg_electrodes)
+            normalized.append(target)
+            if source is not None:
+                mapping[source] = target
+        return _unique_ints(normalized)
+
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        if "electrodes" in group:
+            group["electrodes"] = normalize_values(group.get("electrodes"))
+        if group.get("center_electrode") is not None:
+            center, source = _cfg_electrode_id(group["center_electrode"], cfg_electrodes)
+            group["center_electrode"] = center
+            if source is not None:
+                mapping[source] = center
+
+    for protocol in protocols.values():
+        if not isinstance(protocol, dict):
+            continue
+        switch_cfg = protocol.get("site_switch")
+        if isinstance(switch_cfg, dict):
+            event_groups = switch_cfg.get("event_groups") or []
+            switch_cfg["event_groups"] = [normalize_values(raw_group) for raw_group in event_groups]
+            centers = []
+            for raw_center in switch_cfg.get("event_group_centers") or []:
+                center = _normalize_site_switch_center(raw_center)
+                if center is None:
+                    centers.append(None)
+                    continue
+                normalized, source = _cfg_electrode_id(center, cfg_electrodes)
+                centers.append(normalized)
+                if source is not None:
+                    mapping[source] = normalized
+            if centers:
+                switch_cfg["event_group_centers"] = centers
+        pool_cfg = protocol.get("electrode_pool_sequence")
+        if isinstance(pool_cfg, dict) and "event_groups" in pool_cfg:
+            pool_cfg["event_groups"] = [normalize_values(raw_group) for raw_group in pool_cfg.get("event_groups") or []]
+    return mapping
 
 
 def _event_group_values(raw_group: Any) -> list[int]:
@@ -791,7 +828,8 @@ def _run_stim_phase(
         for key, value in (prepared_stim_unit_to_dac or {}).items()
     }
     effective_hardware_config = hardware_system_config or _hardware_system_config(system_config, protocol)
-    connect_settle_ms = _plan_connect_settle_ms(protocol)
+    connect_settle_ms = 0.0  # D21 switches on the host before waiting for the pulse.
+    sequence = None
     if dry_run:
         segment_log = SegmentStimLog(block_name, phase_id, segment_name, segment_start)
         sequence_start_offset = _recording_settle_s(system_config, protocol)
@@ -843,8 +881,12 @@ def _run_stim_phase(
                 },
             )
             logging.info("Plan-based array configured: block=%s stim_units=%d", block_name, len(set(stim_unit_by_electrode.values())))
+        else:
+            _array, stim_unit_by_electrode, stim_unit_to_dac = configure_experiment_array_with_mapping(
+                cfg_path, filtered_group, effective_hardware_config, initial_connect=True,
+            )
         audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": "stimulation"})
-        saving = create_experiment_saving(phase_dir, segment_name)
+        saving = create_experiment_saving(phase_dir, segment_name, record_channels_excluding(cfg_path, filtered_group.get("electrodes", [])))
         record_start_epoch = time.time()
         audit.mark_event("recording_file_started", block_name, phase_id, segment_name, epoch_sec=record_start_epoch)
         logging.info("Recording started: block=%s phase=%s segment=%s", block_name, phase_id, segment_name)
@@ -948,13 +990,16 @@ def _run_stim_phase(
         ),
         signal_dacs=_hardware_dac_config(effective_hardware_config)[0],
     )
+    if sequence is not None:
+        route_records = sequence.route_records
     for index, stim_time in enumerate(stim_times, start=1):
         plan_row = plan_rows[index - 1] if plan_rows else {}
-        epoch_sec = sequence_start_epoch + stim_time
+        epoch_sec = (sequence.sent_epochs[index - 1] if sequence is not None
+                     else sequence_start_epoch + stim_time)
         route_record = route_records[index - 1] if index <= len(route_records) else {}
         stim_extra = {
             "stim_index": index,
-            "stim_time_sec": stim_time + sequence_start_offset,
+            "stim_time_sec": epoch_sec - segment_log.record_start_epoch,
             "plan_time_sec": stim_time,
             "amplitude_mv": plan_row.get("amplitude_mv", protocol.get("amplitude_mv", "")),
             "electrodes": _plan_row_electrodes_text(plan_row, electrode_group),
@@ -994,6 +1039,7 @@ def _run_stim_phase(
         },
     )
     logging.info("Stim logs written: block=%s phase=%s pulses=%d", block_name, phase_id, len(stim_times))
+
 
 
 def _planned_electrodes(plan_rows: list[dict[str, Any]], electrode_group: dict[str, Any]) -> set[int]:
@@ -1235,41 +1281,14 @@ def _replace_unconnectable_stimulation_electrodes(
 
     search_radii = _replacement_search_radii(max_radius)
     used = set(primary_electrodes)
-    used_stim_units = {int(stim_unit_by_electrode[electrode]) for electrode in primary_electrodes if electrode in stim_unit_by_electrode}
     missing_set = set(unresolved_targets)
     cfg_electrodes = _cfg_recording_electrodes(cfg_path)
     center_electrode = _group_center_electrode(electrode_group)
     center_lookup = {int(key): int(value) for key, value in (electrode_center_lookup or {}).items()}
-    center_pool = sorted(set(center_lookup.values()) | ({center_electrode} if center_electrode is not None else set()))
-    if center_pool:
-        neighbor_pool = sorted(
-            (candidate for candidate in cfg_electrodes if candidate not in missing_set),
-            key=lambda candidate: (
-                min(_electrode_grid_distance(center, candidate) for center in center_pool),
-                candidate,
-            ),
-        )
-    else:
-        neighbor_pool = sorted(
-            {
-                candidate
-                for electrode in unresolved_targets
-                for candidate in _electrode_neighbors(electrode, max_radius)
-                if candidate not in missing_set and candidate in cfg_electrodes
-            }
-        )
-    probe_group = dict(electrode_group)
-    probe_group["electrodes"] = neighbor_pool
-    if neighbor_pool:
-        connectable_neighbors, _skipped_neighbors, neighbor_stim_units = probe_stimulation_electrodes(
-            cfg_path,
-            probe_group,
-            system_config,
-        )
-        connectable_neighbor_set = set(connectable_neighbors)
-    else:
-        connectable_neighbor_set = set()
-        neighbor_stim_units = {}
+    try:
+        candidate_limit = max(1, int(maxwell_cfg.get("replacement_max_candidates", 128) or 128))
+    except (TypeError, ValueError):
+        candidate_limit = 128
 
     replacements: dict[int, int] = {}
     unresolved: list[int] = []
@@ -1278,7 +1297,7 @@ def _replace_unconnectable_stimulation_electrodes(
         target_center = center_lookup.get(int(electrode), center_electrode)
         for radius in ([None] if target_center is not None else search_radii):
             if target_center is not None:
-                radius_candidates = neighbor_pool
+                radius_candidates = cfg_electrodes
             else:
                 radius_candidates = _electrode_neighbors(electrode, radius)
             ranked = sorted(
@@ -1286,9 +1305,9 @@ def _replace_unconnectable_stimulation_electrodes(
                     candidate
                     for candidate in radius_candidates
                     if (
-                        candidate in connectable_neighbor_set
+                        candidate in cfg_electrodes
                         and candidate not in used
-                        and int(neighbor_stim_units.get(candidate, -1)) not in used_stim_units
+                        and candidate not in missing_set
                     )
                 ),
                 key=lambda candidate: (
@@ -1296,23 +1315,37 @@ def _replace_unconnectable_stimulation_electrodes(
                     -float(rate_map.get(candidate, floor)),
                     candidate,
                 ),
-            )
-            if ranked:
-                replacement = ranked[0]
+            )[:candidate_limit]
+            for candidate in ranked:
+                # Stimulation-unit allocation is stateful. Validate the
+                # candidate together with every electrode already selected;
+                # a unit observed in a separate probe Array is not reusable
+                # evidence for the final route.
+                trial_electrodes = _unique_ints([*primary_electrodes, *replacements.values(), candidate])
+                trial_group = dict(electrode_group)
+                trial_group["electrodes"] = trial_electrodes
+                trial_connected, trial_missing, trial_units = probe_stimulation_electrodes(
+                    cfg_path,
+                    trial_group,
+                    system_config,
+                )
+                if trial_missing or set(trial_connected) != set(trial_electrodes):
+                    continue
+                if len(set(trial_units.values())) != len(trial_electrodes):
+                    continue
+                replacement = candidate
+                break
+            if replacement is not None:
                 break
         if replacement is None:
             unresolved.append(electrode)
             continue
         replacements[electrode] = replacement
         used.add(replacement)
-        used_stim_units.add(int(neighbor_stim_units[replacement]))
 
-    resolved_electrodes: list[int] = []
-    for electrode in original_electrodes:
-        if electrode in primary_electrodes:
-            resolved_electrodes.append(electrode)
-        elif electrode in replacements:
-            resolved_electrodes.append(replacements[electrode])
+    # Preserve the exact connection order used by the successful incremental
+    # trials; changing it can cause Maxwell to choose a different allocation.
+    resolved_electrodes = _unique_ints([*primary_electrodes, *replacements.values()])
     filtered = dict(electrode_group)
     filtered["electrodes"] = _unique_ints(resolved_electrodes)
     if not filtered["electrodes"]:

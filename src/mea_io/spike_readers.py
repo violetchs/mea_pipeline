@@ -1851,7 +1851,18 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
     if run_records:
         used_files.extend(run_files)
         summary.update(run_summary)
+    # The run-root table may only describe the pulse timing.  Same-segment
+    # plan rows carry the actual local scan site and must take precedence.
+    aligned_records = _aligned_local_stim_plan_records(parsed_sources)
+    if aligned_records and run_records:
+        unique_records = _prefer_site_rich_stimulus_records(aligned_records, run_records)
+    elif aligned_records:
+        unique_records = _unique_stim_sidecar_records(aligned_records)
+    elif run_records:
         unique_records = _unique_stim_sidecar_records(run_records)
+    else:
+        unique_records = []
+    if unique_records:
         finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
         result = {
             "stim_times": np.asarray(finite_times, dtype=float),
@@ -1867,7 +1878,6 @@ def _load_maxwell_stim_sidecar(path: Path) -> Dict[str, Any]:
             result["connect_settle_ms"] = float(connect_settle_ms)
         return result
 
-    aligned_records = _aligned_local_stim_plan_records(parsed_sources)
     if aligned_records:
         unique_records = _unique_stim_sidecar_records(aligned_records)
         finite_times = [float(record["time_s"]) for record in unique_records if _is_finite_number(record.get("time_s"))]
@@ -2288,6 +2298,9 @@ def _record_time_s(record: Dict[str, Any]) -> Optional[float]:
         "time_s",
         "time_sec",
         "stim_time_sec",
+        "pulse_time_s",
+        "record_time_s",
+        "actual_time_s",
         "plan_time_sec",
         "offset_sec",
         "epoch_sec",
@@ -2404,6 +2417,9 @@ def _normalize_stim_sidecar_record(raw: Any) -> Dict[str, Any]:
         "time_s",
         "time_sec",
         "stim_time_sec",
+        "pulse_time_s",
+        "record_time_s",
+        "actual_time_s",
         "stim_times_sec",
         "offset_sec",
         "plan_time_sec",
@@ -2415,7 +2431,9 @@ def _normalize_stim_sidecar_record(raw: Any) -> Dict[str, Any]:
     if time_value is None:
         return {}
     electrodes: List[int] = []
-    for key in (*_STIM_RECORD_ELECTRODE_KEYS, "candidate_electrodes", *_STIM_RECORD_SITE_KEYS):
+    # A scan's candidate_electrodes is a global pool, not the site for one
+    # pulse. Treating it as a pulse site collapses every scan into one group.
+    for key in (*_STIM_RECORD_ELECTRODE_KEYS, *_STIM_RECORD_SITE_KEYS):
         if key in record:
             if key in _STIM_RECORD_SITE_KEYS:
                 electrodes.extend(_parse_stim_site_value(record.get(key)))
@@ -3154,6 +3172,18 @@ def read_unified_npz(path: str | Path) -> UnifiedMEAData:
                 sorting.setdefault(channel, {})["embedding"] = np.asarray(npz[key], dtype=np.float32)
 
     meta = _augment_stim_metadata_from_sidecar(path, meta, stim_times)
+    # Lightweight spike-only NPZ files are commonly exported to a separate
+    # ``spike_data2`` directory. Their metadata still points to the source H5;
+    # use that path to recover scan plan/segment sidecars that live beside the
+    # recording, while keeping the NPZ itself read-only.
+    source_path = meta.get("file") or meta.get("source_file") or meta.get("source_path")
+    if source_path:
+        try:
+            source = Path(str(source_path))
+            if source.is_file() and source.resolve() != path.resolve():
+                meta = _augment_stim_metadata_from_sidecar(source, meta, stim_times)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
     if "stim_times_from_sidecar" in meta and stim_times.size == 0:
         stim_times = np.asarray(meta.get("stim_times_from_sidecar", []), dtype=float)
     return UnifiedMEAData(
@@ -3170,7 +3200,6 @@ def read_unified_npz(path: str | Path) -> UnifiedMEAData:
 def _augment_stim_metadata_from_sidecar(path: Path, meta: Dict[str, Any], stim_times: np.ndarray) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         meta = {}
-    has_sites = bool(meta.get("stim_electrodes")) or bool(meta.get("stimulus_records"))
     sidecar_stim = _load_maxwell_stim_sidecar(path)
     sidecar_records = list(sidecar_stim.get("stimulus_records", []) or [])
     sidecar_electrodes = list(sidecar_stim.get("stim_electrodes", []) or [])
@@ -3181,10 +3210,23 @@ def _augment_stim_metadata_from_sidecar(path: Path, meta: Dict[str, Any], stim_t
     meta["stimulus_sidecar_summary"] = sidecar_stim.get("summary", {})
     if _is_finite_number(sidecar_stim.get("connect_settle_ms")):
         meta["connect_settle_ms"] = float(sidecar_stim.get("connect_settle_ms"))
-    if not has_sites and (sidecar_records or sidecar_electrodes):
+    if not any(_record_stim_electrodes(record) for record in sidecar_records):
+        fallback_sites = _record_stim_electrodes({"electrodes": meta.get("stim_electrodes", [])})
+        if len(fallback_sites) > 1 and np.asarray(stim_times, dtype=float).size:
+            synthesized = _synthesize_missing_scan_sidecars(path, stim_times, fallback_sites)
+            if synthesized:
+                sidecar_records = synthesized
+                meta["stimulus_sidecar_synthesized"] = True
+    # Maxwell H5 metadata may contain a generic stimulus electrode list (or
+    # timestamp-only event rows) even when the run sidecar has the per-pulse
+    # scan sites. Always merge available sidecar rows so scan experiments can
+    # be grouped by their actual stimulation point.
+    if sidecar_records or sidecar_electrodes:
         existing_events = list(meta.get("event_records", []) or [])
+        if not existing_events:
+            existing_events = list(meta.get("stimulus_records", []) or [])
         merged_records = _prefer_site_rich_stimulus_records(sidecar_records, existing_events)
-        if sidecar_electrodes:
+        if sidecar_electrodes and not meta.get("stim_electrodes"):
             meta["stim_electrodes"] = sidecar_electrodes
         if merged_records:
             meta["stimulus_records"] = merged_records
@@ -3193,6 +3235,79 @@ def _augment_stim_metadata_from_sidecar(path: Path, meta: Dict[str, Any], stim_t
         meta["stim_times_from_sidecar"] = sidecar_times.tolist()
         meta.setdefault("event_count", int(sidecar_times.size))
     return meta
+
+
+def _synthesize_missing_scan_sidecars(
+    h5_path: Path,
+    stim_times: np.ndarray,
+    electrodes: List[int],
+) -> List[Dict[str, Any]]:
+    """Create a conservative sidecar for legacy scan runs missing plan files.
+
+    Legacy scan packages routed the resolved scan pool as one static group. In
+    that case the only defensible reconstruction is one event containing the
+    complete stimulation pool; preserving that fact prevents analysis from
+    inventing per-site assignments.
+    """
+    values = [float(value) for value in np.asarray(stim_times, dtype=float) if np.isfinite(value)]
+    sites = _unique_sidecar_ints(electrodes)
+    if not values or len(sites) < 2:
+        return []
+    records = [
+        {
+            "stim_index": index,
+            "time_s": round(time_s, 6),
+            "stim_time_sec": round(time_s, 6),
+            "electrodes": list(sites),
+            "stim_site_source": "synthesized_legacy_scan_static_group",
+        }
+        for index, time_s in enumerate(values, start=1)
+    ]
+    folder = h5_path.parent
+    try:
+        (folder / "stim_plan.json").write_text(
+            json.dumps(
+                {
+                    "candidate_electrodes": sites,
+                    "random_config": {"source": "synthesized_legacy_scan_static_group"},
+                    "stimuli": [
+                        {"time_sec": item["time_s"], "electrode": sites[0], "electrodes": sites, "pulses_per_stimulus": 1}
+                        for item in records
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        with (folder / "stim_plan.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["time_sec", "electrode", "electrodes", "pulses_per_stimulus"])
+            writer.writeheader()
+            for item in records:
+                writer.writerow({
+                    "time_sec": item["time_s"],
+                    "electrode": sites[0],
+                    "electrodes": ",".join(str(site) for site in sites),
+                    "pulses_per_stimulus": 1,
+                })
+        (folder / "segment_time_meta.json").write_text(
+            json.dumps(
+                {
+                    "stim_times_sec": values,
+                    "stim_records": records,
+                    "pulse_count": len(records),
+                    "stimulus_sidecar_synthesized": True,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError):
+        # Analysis can still use the in-memory records when the source folder
+        # is read-only or the H5 is inside an archive.
+        pass
+    return records
 
 
 def save_unified_npz(data: UnifiedMEAData, path: str | Path, *, include_waveforms: bool = True) -> Path:

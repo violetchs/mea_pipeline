@@ -25,6 +25,8 @@ from src.gui.app import (
     GenericAnalysisWindow,
     StimulusPSTHWindow,
     StimulusDatabaseAnalysisDialog,
+    StimulusGroupStatisticsWindow,
+    StimulusPreStatePredictionWindow,
     StimulusGenerationDialog,
     StimulusResponseWindow,
     StimulusTrialResponseWindow,
@@ -48,6 +50,7 @@ from src.gui.app import (
     _spike_trains_from_unified,
     _extract_stimulus_parameters,
     _stimulus_parameter_label,
+    _stimulus_group_statistics,
     _stimulus_response_group_records,
     _stimulus_response_record_from_data,
     _stimulus_response_records_from_data,
@@ -76,6 +79,82 @@ from src.gui.app import (
     _unit_spike_trains_from_unified,
 )
 from src.gui.channel_map import ChannelMap
+
+
+def test_pre_state_feature_combinations_are_unique_and_rate_windows_are_exclusive():
+    feature_names = StimulusPreStatePredictionWindow._feature_names(1000.0)
+    combinations = StimulusPreStatePredictionWindow._feature_combinations(feature_names)
+
+    assert feature_names == [
+        "Rate full pre",
+        "Rate last 500 ms",
+        "Rate last 200 ms",
+        "Rate last 100 ms",
+        "Rate last 50 ms",
+        "Previous burst gap",
+    ]
+    assert len(combinations) == len(set(combinations))
+    assert all(len(set(combination)) == len(combination) for combination in combinations)
+    assert all(
+        sum(name.startswith("Rate ") for name in combination) <= 1
+        for combination in combinations
+    )
+    assert any(
+        "Rate full pre" in combination and len(combination) > 1
+        for combination in combinations
+    )
+
+
+def test_pre_state_prediction_shows_only_best_model_per_feature_combination():
+    results = [
+        {"features": ("Previous burst gap",), "model": "Ridge linear", "mean_random_ratio": 0.9},
+        {"features": ("Previous burst gap",), "model": "Random forest", "mean_random_ratio": 0.7},
+        {"features": ("Rate last 50 ms",), "model": "Gradient boosting", "mean_random_ratio": 0.8},
+    ]
+
+    best = StimulusPreStatePredictionWindow._best_results_by_feature_combination(results)
+
+    assert len(best) == 2
+    assert next(item for item in best if item["features"] == ("Previous burst gap",))["model"] == "Random forest"
+
+
+def test_pre_state_rate_features_are_50_ms_vectors():
+    feature_names = StimulusPreStatePredictionWindow._feature_names(1000.0)
+    columns = StimulusPreStatePredictionWindow._feature_column_indices(feature_names, 1000.0)
+    trial = np.array([-975.0, -925.0, -475.0, -25.0], dtype=float)
+
+    row = StimulusPreStatePredictionWindow._pre_state_feature_row(trial, 1000.0, feature_names, 275.0)
+
+    assert len(columns["Rate full pre"]) == 20
+    assert len(columns["Rate last 500 ms"]) == 10
+    assert len(columns["Rate last 200 ms"]) == 4
+    assert len(columns["Rate last 100 ms"]) == 2
+    assert len(columns["Rate last 50 ms"]) == 1
+    assert row.size == 38
+    full_rate = row[columns["Rate full pre"]]
+    assert np.count_nonzero(full_rate) == 4
+    assert np.all(full_rate[full_rate > 0.0] == pytest.approx(20.0))
+    assert row[columns["Rate last 50 ms"]][0] == pytest.approx(20.0)
+    assert row[columns["Previous burst gap"]][0] == pytest.approx(275.0)
+
+
+def test_pre_state_random_pairing_baseline_uses_five_permutations_and_five_folds():
+    x = np.arange(20, dtype=float).reshape(10, 2)
+    y = np.column_stack([np.arange(10, dtype=float), np.arange(10, dtype=float) ** 2])
+    folds = []
+    for start in range(0, 10, 2):
+        validation = np.arange(start, start + 2)
+        train = np.setdiff1d(np.arange(10), validation)
+        folds.append((train, validation))
+    factory = StimulusPreStatePredictionWindow._models()[0][1]
+
+    baseline = StimulusPreStatePredictionWindow._random_pairing_rmse(
+        x, y, folds, factory, np.random.default_rng(7), permutation_count=5
+    )
+
+    assert baseline.shape == (2,)
+    assert np.all(np.isfinite(baseline))
+    assert np.all(baseline >= 0.0)
 from src.mea_io import UnifiedMEAData
 from src.pipeline import PipelineConfig
 
@@ -1307,6 +1386,249 @@ def test_stimulus_response_records_are_split_by_site_group():
         [22263, 22269, 23145, 23151],
     ]
     assert [record["stimulus_group_label"] for record in records]
+
+
+def test_stimulus_response_records_split_spike_train_npz_parallel_group_metadata():
+    data = UnifiedMEAData(
+        spikes={"chan1": np.array([0.095, 0.105, 0.205, 0.215])},
+        stim_times=np.array([0.100, 0.200]),
+        meta={
+            "trial_stimulus_group_keys": [
+                [13045, 13479],
+                [22263, 22269],
+            ]
+        },
+    )
+
+    records = _stimulus_response_records_from_data(
+        "recording_raw_spike_train_artifact_removed.npz",
+        data,
+        pre_ms=10.0,
+        response_ms=30.0,
+        bin_ms=10.0,
+    )
+
+    assert [record["stimulus_group_key"] for record in records] == [
+        [13045, 13479],
+        [22263, 22269],
+    ]
+
+
+def test_stimulus_response_npz_group_metadata_enriches_timestamp_only_records():
+    data = UnifiedMEAData(
+        spikes={"chan1": np.array([0.095, 0.105, 0.205, 0.215])},
+        stim_times=np.array([0.100, 0.200]),
+        meta={
+            "event_records": [
+                {"time_s": 0.100},
+                {"time_s": 0.200},
+            ],
+            "stimulus_group_keys": [
+                [101, 102],
+                [201, 202],
+            ],
+        },
+    )
+
+    records = _stimulus_response_records_from_data(
+        "recording_raw_spike_train.npz",
+        data,
+        pre_ms=10.0,
+        response_ms=30.0,
+        bin_ms=10.0,
+    )
+
+    assert [record["stimulus_group_key"] for record in records] == [[101, 102], [201, 202]]
+
+
+def test_stimulus_group_statistics_drops_trials_active_before_stimulus():
+    record = {
+        "stimulus_group_label": "site_a",
+        "pre_ms": 100.0,
+        "channel_count": 1,
+        "trial_spikes_ms": [
+            np.array([-20.0, -10.0, 40.0]),
+            np.array([-50.0, 40.0]),
+            np.array([-75.0, 60.0]),
+        ],
+    }
+
+    stats = _stimulus_group_statistics(record, response_window_ms=100.0, bin_ms=5.0)
+
+    assert stats["original_trial_count"] == 3
+    assert stats["excluded_trial_count"] == 1
+    assert stats["excluded_trial_indices"] == [0]
+    assert stats["trial_count"] == 2
+    assert stats["active_trial_count"] == 1
+    assert stats["prefilter_window_ms"] == pytest.approx(10.0)
+    assert stats["psth_pre_context_ms"] == pytest.approx(10.0)
+    assert np.min(stats["psth_centers_ms"]) >= -10.0
+    assert stats["trial_psth_rates_hz"].shape[0] == 2
+    assert stats["active_trial_psth_rates_hz"].shape[0] == 1
+
+
+def test_selected_trial_preview_uses_one_ms_psth_line():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    data = UnifiedMEAData(
+        spikes={"chan1": np.array([0.995, 1.002, 1.006, 1.012])},
+        stim_times=np.array([1.0]),
+        meta={},
+    )
+    record = {"path": "stim_trial.h5", "raw_data": data}
+    dialog = StimulusDatabaseAnalysisDialog([record])
+    plan = dialog._preview_plan(record)
+    dialog._draw_trial_preview(record, plan)
+
+    global_axis = dialog.preview_canvas.figure.axes[1]
+    psth_line = next(line for line in global_axis.lines if line.get_label() == "Selected trial PSTH")
+    assert global_axis.get_title().startswith("Selected trial PSTH | bin 1 ms")
+    assert psth_line.get_drawstyle() == "default"
+    np.testing.assert_allclose(np.diff(psth_line.get_xdata()), 1.0)
+    dialog.close()
+
+
+def test_stimulus_group_psth_marks_plotted_trial_count():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    record = {
+        "stimulus_group_label": "site_a",
+        "pre_ms": 100.0,
+        "channel_count": 1,
+        "trial_spikes_ms": [
+            np.array([-20.0, -10.0, 40.0]),
+            np.array([-50.0, 40.0]),
+            np.array([-75.0, 60.0]),
+        ],
+    }
+    window = StimulusGroupStatisticsWindow({"records": [record]})
+
+    clean_texts = [text.get_text() for text in window.canvas.figure.axes[0].texts]
+    active_texts = [text.get_text() for text in window.canvas.figure.axes[1].texts]
+    assert "Trials plotted: 2/3" in clean_texts
+    assert "Trials plotted: 1/3" in active_texts
+    assert window.canvas.figure.axes[0].get_title().startswith("No pre-stim activity")
+    assert window.canvas.figure.axes[1].get_title().startswith("Pre-stim activity")
+    window.close()
+
+
+def test_stimulus_group_psth_splits_local_and_propagated_responses_on_both_sides():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    record = {
+        "stimulus_group_label": "site_b",
+        "pre_ms": 100.0,
+        "channel_count": 8,
+        "trial_spikes_ms": [
+            np.array([-50.0, 2.0, 4.0]),
+            np.array([-50.0, 2.0, 31.0, 31.5, 32.0, 36.0]),
+            np.array([-5.0, 2.0, 4.0]),
+            np.array([-5.0, 2.0, 31.0, 31.5, 32.0, 36.0]),
+        ],
+    }
+
+    stats = _stimulus_group_statistics(record, response_window_ms=100.0, bin_ms=5.0)
+    assert stats["local_trial_count"] == 1
+    assert stats["propagated_trial_count"] == 1
+    assert stats["active_local_trial_count"] == 1
+    assert stats["active_propagated_trial_count"] == 1
+    assert stats["combined_local_trial_count"] == 2
+    assert stats["combined_propagated_trial_count"] == 2
+    assert stats["propagation_boundary_ms"] == pytest.approx(10.0)
+
+    window = StimulusGroupStatisticsWindow({"records": [record]})
+    axes = window.canvas.figure.axes
+    assert len(axes) == 5
+    assert [axis.get_title().split(" | ")[0] for axis in axes[:2]] == [
+        "No pre-stim activity",
+        "Pre-stim activity",
+    ]
+    for axis in axes[:2]:
+        labels = [line.get_label() for line in axis.lines]
+        assert "Mean PSTH (n=2)" in labels
+        assert len(axis.collections) == 1
+        assert len(axis.collections[0].get_colors()) == 2
+    assert axes[2].get_title() == "Propagated global responses"
+    assert axes[3].get_title() == "Transient local responses"
+    assert axes[4].get_title() == "Global-response integral distribution"
+    assert axes[4].get_xlabel().startswith("Integral of global rate (Hz/channel), 1 ms bins")
+    assert "Global mean (n=2)" in [line.get_label() for line in axes[2].lines]
+    assert "Local mean (n=2)" in [line.get_label() for line in axes[3].lines]
+    global_colors = axes[2].collections[0].get_colors()
+    local_colors = axes[3].collections[0].get_colors()
+    assert len(global_colors) == 2
+    assert len(local_colors) == 2
+    assert global_colors[0][1] > global_colors[0][0]
+    assert global_colors[-1][0] > global_colors[-1][1]
+    assert local_colors[0][2] > local_colors[0][0]
+    assert local_colors[-1][0] > local_colors[-1][1]
+    assert all(axis.get_title() != "Trial-level activation probabilities" for axis in axes)
+
+    window.highlight_trial_combo.setCurrentIndex(window.highlight_trial_combo.findData(1))
+    axes = window.canvas.figure.axes
+    for axis_index in (0, 2):
+        selected_lines = [
+            line for line in axes[axis_index].lines
+            if line.get_label() == "Selected trial 2"
+        ]
+        assert len(selected_lines) == 1
+        assert selected_lines[0].get_color() == "#000000"
+        assert selected_lines[0].get_linewidth() == pytest.approx(3.0)
+    for axis_index in (1, 3):
+        assert "Selected trial 2" not in [line.get_label() for line in axes[axis_index].lines]
+    window.close()
+
+
+def test_global_response_integral_is_per_channel_spike_count():
+    record = {
+        "stimulus_group_label": "site_integral",
+        "pre_ms": 100.0,
+        "channel_count": 2,
+        "trial_spikes_ms": [
+            np.asarray([2.0, 3.0, 20.1, 20.2, 20.3, 30.1, 40.1]),
+            np.asarray([2.1, 3.1, 20.4, 20.5, 20.6, 30.4, 40.4]),
+        ],
+    }
+    stats = _stimulus_group_statistics(record, response_window_ms=50.0, bin_ms=5.0)
+
+    assert stats["combined_propagated_trial_count"] == 2
+    assert stats["global_response_integral_bin_ms"] == pytest.approx(1.0)
+    np.testing.assert_allclose(stats["global_response_integrals_spikes_per_channel"], [3.5, 3.5])
+
+
+def test_stimulus_group_response_shape_uses_global_population_activity_only():
+    record = {
+        "stimulus_group_label": "site_spread",
+        "pre_ms": 100.0,
+        "channel_count": 6,
+        "trial_spikes_ms": [
+            np.array([-50.0, 2.0, 4.0, 40.0]),
+            np.array([-50.0, 2.0, 31.0, 31.5, 32.0, 32.5, 36.0]),
+        ],
+    }
+
+    stats = _stimulus_group_statistics(record, response_window_ms=100.0, bin_ms=5.0)
+
+    # Classification depends only on the merged population response: a single
+    # late spike remains local, while a larger response spanning multiple bins
+    # is classified as propagated/global.
+    assert stats["local_trial_count"] == 1
+    assert stats["propagated_trial_count"] == 1
 
 
 def test_stimulus_response_removes_all_trial_and_settling_artifacts():
@@ -3950,10 +4272,10 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.groups == []
     assert dialog.protocol_fields["name"].text() == "single_pulse"
     assert dialog.protocol_fields["amplitude_mv"].text() == "150.0"
-    assert dialog.protocol_fields["pulse_width_us"].text() == "300.0"
+    assert dialog.protocol_fields["pulse_width_us"].text() == "200.0"
     assert dialog.protocol_fields["start_ms"].text() == "1500.0"
     assert dialog.preview_group_name.text() == "site_group"
-    assert "7317" in dialog.preview_group_electrodes.text()
+    assert dialog.preview_group_center_electrode.text() == "1"
     assert dialog.settings_workflow_scroll.minimumWidth() >= 620
     assert dialog.settings_workflow_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert dialog.protocol_table.minimumHeight() >= 146
@@ -3965,9 +4287,12 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     assert dialog.generate_button.maximumWidth() <= 132
     assert dialog.settings_protocol_add_button.text() == "Add"
     assert dialog.settings_protocol_remove_button.text() == "Remove"
+    assert dialog.settings_protocol_new_button.text() == "New"
     assert not hasattr(dialog, "settings_protocol_update_button")
     assert dialog.settings_site_add_button.text() == "Add"
     assert dialog.settings_site_remove_button.text() == "Remove"
+    assert dialog.settings_site_new_button.text() == "New"
+    assert dialog.settings_event_group_new_button.text() == "New"
     assert not hasattr(dialog, "settings_site_update_button")
     assert dialog.settings_preview_button.text() == "Preview"
     assert dialog.settings_save_block_phase_button.text() == "Save block phase"
@@ -3985,9 +4310,10 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog._save_protocol()
     assert any(protocol.name == "settings_added" for protocol in dialog.protocols)
     dialog.preview_group_name.setText("settings_site")
-    dialog.preview_group_electrodes.setText("1, 2")
+    dialog.preview_group_center_electrode.setText("1")
+    dialog.preview_group_multi_electrode.setCurrentIndex(0)
     dialog._save_group_from_settings()
-    assert any(group.name == "settings_site" and group.electrodes == [1, 2] for group in dialog.groups)
+    assert any(group.name == "settings_site" and group.electrodes == [1] for group in dialog.groups)
     fixed = stimulus_builder.StimulusProtocol("feedback_single_150mV", "single_pulse", amplitude_mv=150.0)
     dialog.protocols.append(fixed)
     dialog.groups.append(stimulus_builder.ElectrodeGroup("group_A", [7317]))
@@ -4037,14 +4363,15 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog._set_protocol_type("single_pulse")
     dialog.protocol_fields["name"].setText("workflow_single")
     dialog.preview_group_name.setText("workflow_group")
-    dialog.preview_group_electrodes.setText("1, 2")
+    dialog.preview_group_center_electrode.setText("1")
+    dialog.preview_group_multi_electrode.setCurrentIndex(0)
     dialog._save_group_from_settings()
     dialog.preview_group_name.setText("workflow_group")
-    dialog.preview_group_electrodes.setText("1, 2")
+    dialog.preview_group_center_electrode.setText("1")
     dialog._set_checked_group_names(["workflow_group"])
     dialog._save_block_phase_from_settings()
     assert any(protocol.name == "workflow_single" for protocol in dialog.protocols)
-    assert any(group.name == "workflow_group" and group.electrodes == [1, 2] for group in dialog.groups)
+    assert any(group.name == "workflow_group" and group.electrodes == [1] for group in dialog.groups)
     assert any(phase.protocol == "workflow_single" and phase.electrode_group == "workflow_group" for phase in dialog.block_phases)
     assert dialog.block_phase_table.rowCount() >= 1
     workflow_phase_name = next(
@@ -4067,12 +4394,13 @@ def test_main_window_tools_open_stimulus_generation_with_pipeline_source(tmp_pat
     dialog.protocol_fields["name"].setText("preview_only_single")
     dialog._set_protocol_type("single_pulse")
     dialog.preview_group_name.setText("preview_only_group")
-    dialog.preview_group_electrodes.setText("1, 2")
+    dialog.preview_group_center_electrode.setText("1")
+    dialog.preview_group_multi_electrode.setCurrentIndex(0)
     dialog._preview_settings_workflow()
     assert len(dialog.protocols) == before_protocols
     assert len(dialog.groups) == before_groups
     assert len(dialog.blocks) == before_blocks
-    assert {"e1", "e2"}.issubset(dialog.preview_map_state["stimulation"])
+    assert "e1" in dialog.preview_map_state["stimulation"]
     original_count = len(dialog.blocks)
     dialog._set_combo_data(dialog.block_phase_combo, workflow_phase_name)
     dialog._save_block()
@@ -4331,7 +4659,10 @@ def test_stimulation_replacement_prefers_nearest_connectable_to_group_center(tmp
         if electrodes == [center]:
             return [], [center], {}
         connectable = [value for value in electrodes if value in {near, far}]
-        return connectable, [], {near: 1, far: 2}
+        return connectable, [], {
+            electrode: {near: 1, far: 2}[electrode]
+            for electrode in connectable
+        }
 
     monkeypatch.setattr(runner, "probe_stimulation_electrodes", fake_probe)
 
@@ -4348,6 +4679,87 @@ def test_stimulation_replacement_prefers_nearest_connectable_to_group_center(tmp
     assert replacements == {center: near}
     assert filtered["electrodes"] == [near]
     assert unresolved == []
+
+
+def test_stimulation_route_queries_final_shared_array_state(tmp_path, monkeypatch):
+    from generated_visual_experiment.python import maxwell_setup
+
+    class FakeArray:
+        def __init__(self):
+            self.connected = []
+
+        def reset(self):
+            self.connected.clear()
+
+        def clear_selected_electrodes(self):
+            pass
+
+        def load_config(self, _path):
+            pass
+
+        def connect_electrode_to_stimulation(self, electrode):
+            self.connected.append(int(electrode))
+
+        def query_stimulation_at_electrode(self, electrode):
+            if int(electrode) == 1:
+                return 3 if self.connected == [1] else 8
+            return 9
+
+    class FakeMaxlab:
+        def Array(self, _name):
+            return FakeArray()
+
+    monkeypatch.setattr(maxwell_setup, "_MX", FakeMaxlab())
+    cfg_path = tmp_path / "recording.cfg"
+    cfg_path.write_text("cfg", encoding="utf-8")
+
+    _array, connected, _skipped, mapping = maxwell_setup.resolve_experiment_array(
+        cfg_path,
+        {"electrodes": [1, 2]},
+        {},
+        probe_only=True,
+        return_stim_units=True,
+    )
+
+    assert connected == [1, 2]
+    assert mapping == {1: 8, 2: 9}
+
+
+def test_stimulation_route_rejects_duplicate_final_units(tmp_path, monkeypatch):
+    from generated_visual_experiment.python import maxwell_setup
+
+    class FakeArray:
+        def reset(self):
+            pass
+
+        def clear_selected_electrodes(self):
+            pass
+
+        def load_config(self, _path):
+            pass
+
+        def connect_electrode_to_stimulation(self, _electrode):
+            pass
+
+        def query_stimulation_at_electrode(self, _electrode):
+            return 4
+
+    class FakeMaxlab:
+        def Array(self, _name):
+            return FakeArray()
+
+    monkeypatch.setattr(maxwell_setup, "_MX", FakeMaxlab())
+    cfg_path = tmp_path / "recording.cfg"
+    cfg_path.write_text("cfg", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unique stimulation unit"):
+        maxwell_setup.resolve_experiment_array(
+            cfg_path,
+            {"electrodes": [1, 2]},
+            {},
+            probe_only=True,
+            return_stim_units=True,
+        )
 
 
 def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_path):
@@ -4376,8 +4788,8 @@ def test_stimulus_generation_package_hardware_sequence_uses_scheduled_times(tmp_
     stimulation_text = (output_dir / "config" / "stimulation.yaml").read_text(encoding="utf-8")
 
     assert "start_ms: 1500.0" in stimulation_text
-    assert "for stim_ms in _scheduled_stim_times_ms(protocol):" in setup_text
-    assert "seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))" in setup_text
+    assert "for value in _scheduled_stim_times_ms(protocol)" in setup_text
+    assert "time.sleep(max(0.0, deadline - time.time()))" in setup_text
 
 
 def test_stimulus_generation_defaults_to_split_dacs_and_hardware_logs(tmp_path):
@@ -4405,7 +4817,7 @@ def test_stimulus_generation_defaults_to_split_dacs_and_hardware_logs(tmp_path):
     assert "- 1" in system_text
     assert "neutral_dac: 2" in system_text
     assert "hardware_dac:" in stimulation_text
-    assert "round_robin_stimulation_units" in stimulation_text
+    assert "round_robin_electrode_order" in stimulation_text
     assert "_default_stim_unit_dac_sources" in setup_text
     assert "hardware_route_log.json" in time_log_text
 
@@ -4452,7 +4864,30 @@ def test_stimulus_generation_poisson_burst_sequence_uses_random_bursts():
     assert times[4] >= times[2]
 
 
-def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp_path):
+@pytest.mark.parametrize("distribution", ["poisson", "uniform"])
+def test_random_burst_default_minimum_interval_is_100_ms(distribution):
+    from src.gui import visual_stimulus_package_builder as stimulus_builder
+
+    protocol = stimulus_builder.StimulusProtocol(
+        "random_bursts",
+        "random",
+        start_ms=0.0,
+        pulses_per_burst=1,
+        random_distribution=distribution,
+        random_lambda_hz=1000.0,
+        random_interval_max_ms=120.0,
+        random_duration_s=0.6,
+        random_seed=7,
+    )
+
+    starts = stimulus_builder._random_burst_starts_ms(protocol)
+    intervals = np.diff(np.asarray(starts, dtype=float))
+    assert protocol.random_interval_min_ms == pytest.approx(100.0)
+    assert intervals.size
+    assert np.all(intervals >= 100.0)
+
+
+def test_stimulus_generation_package_configures_array_at_stim_phase(tmp_path):
     from src.gui import visual_stimulus_package_builder as stimulus_builder
 
     protocol = stimulus_builder.StimulusProtocol("delayed_single", "single_pulse")
@@ -4472,8 +4907,9 @@ def test_stimulus_generation_package_configures_array_before_pre_spontaneous(tmp
     phase_loop_index = runner_text.index('for phase in block.get("phases", []):')
     stim_phase_index = runner_text.index("def _run_stim_phase(")
 
-    assert configure_index < phase_loop_index
-    assert runner_text.find("configure_experiment_array", stim_phase_index) == -1
+    assert configure_index > phase_loop_index
+    assert runner_text.find("configure_experiment_array", stim_phase_index) > stim_phase_index
+    assert "prepare_recording_only(cfg_path, system_config)" in runner_text
 
 
 def test_stimulus_generation_rest_only_block_skips_recording_and_stimulation(tmp_path):
@@ -4846,6 +5282,11 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     dialog._update_protocol_type_fields()
     assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
     assert not dialog.protocol_fields["randomize_burst_pulse_intervals"].isHidden()
+    assert dialog.protocol_fields["randomize_burst_pulse_intervals"].currentData() == "false"
+    assert dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
+    assert dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
+    dialog._set_protocol_field_value("randomize_burst_pulse_intervals", "true")
+    dialog._update_protocol_type_fields()
     assert not dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
     assert not dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
     assert not dialog.protocol_fields["burst_count"].isHidden()
@@ -4858,6 +5299,10 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     assert not dialog.protocol_fields["randomize_burst_pulse_intervals"].isHidden()
     assert not dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
     assert not dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
+    dialog._set_protocol_field_value("randomize_burst_pulse_intervals", "false")
+    dialog._update_protocol_type_fields()
+    assert dialog.protocol_fields["burst_pulse_interval_min_ms"].isHidden()
+    assert dialog.protocol_fields["burst_pulse_interval_max_ms"].isHidden()
     assert not dialog.protocol_fields["burst_count"].isHidden()
     assert not dialog.protocol_fields["burst_frequency_hz"].isHidden()
 
@@ -4885,11 +5330,140 @@ def test_stimulus_generation_protocol_fields_follow_selected_type():
     assert dialog.protocol_fields["lambda_scale"].isHidden()
     assert not dialog.protocol_fields["lambda_mean_hz"].isHidden()
     assert not dialog.protocol_fields["lambda_std_hz"].isHidden()
+    dialog._set_protocol_type("random")
+    dialog._set_protocol_field_value("random_distribution", "poisson")
+    dialog._update_protocol_type_fields()
+    assert dialog.protocol_fields["random_interval_min_ms"].text() == "100.0"
+    assert not dialog.protocol_fields["random_interval_min_ms"].isHidden()
+    assert dialog.protocol_fields["random_interval_max_ms"].isHidden()
+    dialog._set_protocol_field_value("random_distribution", "uniform")
+    dialog._update_protocol_type_fields()
+    assert not dialog.protocol_fields["random_interval_min_ms"].isHidden()
+    assert not dialog.protocol_fields["random_interval_max_ms"].isHidden()
     dialog._set_protocol_type("sequence_with_poisson_burst")
     dialog._update_protocol_type_fields()
     assert not dialog.protocol_fields["burst_count"].isHidden()
     assert not dialog.protocol_fields["burst_frequency_hz"].isHidden()
     assert not dialog.protocol_fields["pulses_per_burst"].isHidden()
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_new_creates_unique_copy_names():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from src.gui import visual_stimulus_package_builder as stimulus_builder
+        from src.gui.app import StimulusEventGroup
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    protocol = stimulus_builder.StimulusProtocol("custom_protocol", "single_pulse")
+    group = stimulus_builder.ElectrodeGroup("custom_site", [17], center_electrode=17)
+    event_group = StimulusEventGroup(
+        "custom_event",
+        "custom_site",
+        electrode_groups=["custom_site"],
+        event_groups=[[17]],
+        event_group_centers=[17],
+    )
+    dialog.protocols = [protocol]
+    dialog.groups = [group]
+    dialog.event_groups = [event_group]
+    dialog._refresh_all()
+
+    dialog._fill_protocol_form(protocol)
+    dialog._new_protocol_from_current()
+    assert dialog.protocol_fields["name"].text() == "custom_protocol_2"
+
+    dialog._fill_group_form(group)
+    dialog._new_group_from_current()
+    assert dialog.group_name.text() == "custom_site_2"
+    assert dialog.preview_group_name.text() == "custom_site_2"
+
+    dialog._fill_event_group_form(event_group)
+    dialog._new_event_group_from_current()
+    assert dialog.event_group_name.text() == "custom_event_2"
+    dialog.close()
+    app.processEvents()
+
+
+def test_stimulus_generation_loads_existing_system_and_stimulation_config():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    app = QApplication.instance() or QApplication([])
+    dialog = StimulusGenerationDialog([], channel_map=None)
+    dialog._apply_existing_package_config(
+        {
+            "culture": {"id": "culture-7", "div": "21"},
+            "experiment": {
+                "name": "loaded_experiment",
+                "date": "2026-09-23",
+                "recording_name_prefix": "loaded_recording",
+                "blocks": [
+                    {
+                        "name": "block_1",
+                        "electrode_group": "event_group_1",
+                        "protocol": "random_1",
+                        "phases": [
+                            {"id": "01_pre_spont", "duration_s": 12, "mode": "open_loop"},
+                            {"id": "02_stim", "duration_s": 34, "mode": "open_loop"},
+                            {"id": "03_post_spont", "duration_s": 56, "mode": "open_loop"},
+                        ],
+                    }
+                ],
+            },
+            "electrode_map": {"cfg_path": "/home/maxwell/configs/260923/12h00m00s.cfg"},
+            "data": {"root": "./data"},
+            "maxwell": {"device": "maxone", "event_threshold": 9.0, "amplifier_gain": 512},
+        },
+        {
+            "electrode_groups": [
+                {"name": "site_a", "electrodes": [101, 102], "center_electrode": 101, "multi_electrode": True, "electrode_count": 2},
+                {"name": "site_b", "electrodes": [201], "center_electrode": 201},
+            ],
+            "protocols": [
+                {
+                    "name": "random_1",
+                    "type": "random",
+                    "amplitude_mv": 120.0,
+                    "pulse_width_us": 200.0,
+                    "random": {
+                        "distribution": "uniform",
+                        "lambda_hz": 4.0,
+                        "interval_min_ms": 100.0,
+                        "interval_max_ms": 300.0,
+                        "duration_s": 12.0,
+                    },
+                    "hardware_dac": {"signal_dacs": [0, 1], "neutral_dac": 2, "sync_dual_dac": True},
+                    "site_switch": {
+                        "enabled": True,
+                        "selection_mode": "sequence_groups",
+                        "event_groups": [[101, 102], [201]],
+                        "event_group_counts": [4, 4],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert dialog.info.name == "loaded_experiment"
+    assert dialog.info.cfg_path.endswith("12h00m00s.cfg")
+    assert [group.name for group in dialog.groups] == ["site_a", "site_b"]
+    assert dialog.protocols[0].random_distribution == "uniform"
+    assert dialog.protocols[0].random_interval_min_ms == pytest.approx(100.0)
+    assert dialog.protocols[0].signal_dacs == [0, 1]
+    assert len(dialog.event_groups) == 1
+    assert dialog.event_groups[0].electrode_groups == ["site_a", "site_b"]
+    assert dialog.event_groups[0].event_groups == [[101, 102], [201]]
+    assert dialog.blocks[0].name == "block_1"
+    assert dialog.blocks[0].phases[1].duration_s == 34
     dialog.close()
     app.processEvents()
 
@@ -6137,3 +6711,45 @@ def test_spinbox_style_keeps_arrow_rules_visible():
     assert "up-arrow" in style
     assert "down-arrow" in style
     assert "height: 14px" in style
+
+
+def test_channel_forecast_response_window_draws_shared_spatial_scale():
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        pytest.skip("PySide6 is not available")
+
+    from src.analysis import ChannelForecastSummary
+    from src.gui.app import ChannelForecastResponseWindow
+
+    app = QApplication.instance() or QApplication([])
+    summary = ChannelForecastSummary(
+        path=Path("forecast.npz"),
+        predicted_rate=np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32),
+        observed_rate=np.array([[4.0, 3.0, 2.0, 1.0]], dtype=np.float32),
+        observed_global_rate=np.array([[1.0, 2.0, 3.0, 4.0, 5.0]], dtype=np.float32),
+        predicted_global_rate=np.array([[7.0, 8.0]], dtype=np.float32),
+        channel_xy=np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.float32),
+        history_bin_count=3,
+        forecast_bin_count=2,
+        sample_labels=("1 | 0.000 s",),
+        stimulation_electrodes=((13045,),),
+        stimulus_at_forecast_start=np.array([True]),
+        first_stimulus_bin=np.array([0], dtype=np.int16),
+    )
+    window = ChannelForecastResponseWindow(summary)
+
+    assert window.canvas.figure.axes[0].get_title() == "Predicted future response"
+    assert window.canvas.figure.axes[1].get_title() == "Observed future response"
+    assert window.canvas.figure.axes[2].get_title() == "Global channel response"
+    assert "3 history + 2 forecast" in window.sample_label.text()
+    assert "Forecast starts at actual stimulation" in window.sample_label.text()
+    assert len(window.canvas.figure.axes[0].collections) == 3
+    assert window.canvas.figure.axes[0].collections[1].norm.vmin == 0.0
+    assert window.canvas.figure.axes[0].collections[1].norm.vmax == 100.0
+    assert "Spatial weighted r =" in window.metrics_label.text()
+    assert "Wasserstein =" in window.metrics_label.text()
+    assert "Centroid distance =" in window.metrics_label.text()
+    assert not window.canvas.figure.axes[0].texts
+    window.close()

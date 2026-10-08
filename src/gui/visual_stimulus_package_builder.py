@@ -17,6 +17,9 @@ PROTOCOL_TYPES = (
     "single_pulse",
     "individual_burst",
     "sequence_with_burst",
+    "random",
+    # Kept for loading older generated packages. New protocols use `random`
+    # with an explicit inter-burst distribution.
     "sequence_with_poisson_burst",
     "custom_sequence",
     "poisson_random_electrodes",
@@ -24,26 +27,32 @@ PROTOCOL_TYPES = (
 )
 PROTOCOL_TYPE_GROUPS = (
     ("Basic", ("single_pulse",)),
-    ("Burst", ("individual_burst", "sequence_with_burst", "sequence_with_poisson_burst")),
-    ("Data-driven", ("poisson_random_electrodes",)),
+    ("Burst", ("individual_burst", "sequence_with_burst", "random")),
+    ("Data-driven", ("electrode_pool_sequence",)),
     ("Custom", ("custom_sequence",)),
 )
 PROTOCOL_TYPE_LABELS = {
     "single_pulse": "Single pulse",
     "individual_burst": "Individual burst",
     "sequence_with_burst": "Sequence burst",
-    "sequence_with_poisson_burst": "Poisson burst sequence",
-    "poisson_random_electrodes": "Poisson random electrodes",
+    "random": "Random burst",
+    "sequence_with_poisson_burst": "Legacy: Poisson burst sequence",
+    "poisson_random_electrodes": "Legacy: Poisson random electrodes",
     "electrode_pool_sequence": "Pulse switch electrode pool",
     "custom_sequence": "Custom sequence",
 }
 PHASES = ("01_pre_spont", "02_stim", "03_post_spont")
 MAX_DEFAULT_NAME_LENGTH = 20
+# MaxOne supports at most 32 stimulation units in one routed stimulation
+# array. Keep this available to the GUI-side package validation as well as the
+# generated runtime templates.
+MAX_STIMULATION_UNITS_PER_ROUTE = 32
 _TRAILING_NUMBER_SUFFIX_RE = re.compile(r"(?:_\d+)+$")
 _PROTOCOL_DEFAULT_NAMES = {
     "single_pulse": "single_pulse",
     "individual_burst": "ind_burst",
     "sequence_with_burst": "seq_burst",
+    "random": "random",
     "sequence_with_poisson_burst": "poisson_burst",
     "custom_sequence": "custom_seq",
     "poisson_random_electrodes": "poisson_rand",
@@ -129,6 +138,8 @@ class ElectrodeGroup:
     name: str
     electrodes: list[int]
     center_electrode: int | None = None
+    multi_electrode: bool = False
+    electrode_count: int = 1
     site_switch_enabled: bool = False
     pool_event_count: int = 10
     pool_event_interval_ms: float = 1000.0
@@ -140,6 +151,8 @@ class ElectrodeGroup:
         data: dict[str, Any] = {"name": self.name, "electrodes": self.electrodes}
         if self.center_electrode is not None:
             data["center_electrode"] = int(self.center_electrode)
+        data["multi_electrode"] = bool(self.multi_electrode)
+        data["electrode_count"] = max(1, int(self.electrode_count))
         if self.site_switch_enabled:
             data["site_switch"] = {
                 "enabled": True,
@@ -155,7 +168,7 @@ class StimulusProtocol:
     name: str
     type: str = "single_pulse"
     amplitude_mv: float = 150.0
-    pulse_width_us: float = 300.0
+    pulse_width_us: float = 200.0
     inter_phase_interval_us: float = 0.0
     pulse_frequency_hz: float = 20.0
     pulses_per_burst: int = 5
@@ -193,6 +206,16 @@ class StimulusProtocol:
     pool_selection_mode: str = "balanced_random_groups"
     pool_event_groups: list[list[int]] = field(default_factory=list)
     pool_event_group_centers: list[int | None] = field(default_factory=list)
+    pool_event_group_counts: list[int] = field(default_factory=list)
+    random_distribution: str = "poisson"
+    random_lambda_hz: float = 5.0
+    random_interval_min_ms: float = 100.0
+    random_interval_max_ms: float = 1000.0
+    random_duration_s: float = 60.0
+    scan_mode: str = "off"
+    scan_local_electrodes: int = 1
+    scan_band_width: str = "full"
+    scan_selection_mode: str = "random"
     notes: str = ""
 
     def to_yaml(self) -> dict[str, Any]:
@@ -201,14 +224,21 @@ class StimulusProtocol:
             "type": self.type,
             "amplitude_mv": self.amplitude_mv,
             "pulse_width_us": self.pulse_width_us,
-            "inter_phase_interval_us": self.inter_phase_interval_us,
+            "inter_phase_interval_us": 0.0,
+            "execution_mode": "d21_host_per_pulse",
+            "tail_wait_sec": 0.5,
             "hardware_dac": {
                 "signal_dacs": [int(value) for value in self.signal_dacs] or [0, 1],
                 "neutral_dac": int(self.neutral_dac),
                 "sync_dual_dac": bool(self.sync_dual_dac),
-                "allocation": "round_robin_stimulation_units",
+                "allocation": "round_robin_electrode_order",
             },
         }
+        if str(self.spontaneous_data_path or "").strip():
+            data["stimulation_rate_filter"] = {
+                "source_path": str(self.spontaneous_data_path),
+                "threshold_mode": "median",
+            }
         if self.type != "poisson_random_electrodes":
             data.update(
                 {
@@ -224,6 +254,17 @@ class StimulusProtocol:
                     "random_seed": self.random_seed,
                 }
             )
+        if self.type == "random":
+            data["random"] = {
+                "distribution": str(self.random_distribution or "poisson").strip().lower(),
+                "lambda_hz": float(self.random_lambda_hz),
+                "interval_min_ms": float(self.random_interval_min_ms),
+                "interval_max_ms": float(self.random_interval_max_ms),
+                "duration_s": float(self.random_duration_s),
+                "random_seed": int(self.random_seed),
+            }
+            data["duration_s"] = float(self.random_duration_s)
+            data["total_duration_s"] = protocol_total_duration_s(self)
         if self.site_switch_enabled and self.type != "poisson_random_electrodes":
             data["site_switch"] = {
                 "enabled": True,
@@ -235,6 +276,8 @@ class StimulusProtocol:
                 data["site_switch"]["event_groups"] = self.pool_event_groups
                 if self.pool_event_group_centers:
                     data["site_switch"]["event_group_centers"] = self.pool_event_group_centers
+                if self.pool_event_group_counts:
+                    data["site_switch"]["event_group_counts"] = self.pool_event_group_counts
         if self.type == "electrode_pool_sequence":
             data["electrode_pool_sequence"] = {
                 "event_count": self.pool_event_count,
@@ -248,6 +291,27 @@ class StimulusProtocol:
                 data["electrode_pool_sequence"]["event_groups"] = self.pool_event_groups
                 if self.pool_event_group_centers:
                     data["electrode_pool_sequence"]["event_group_centers"] = self.pool_event_group_centers
+                if self.pool_event_group_counts:
+                    data["electrode_pool_sequence"]["event_group_counts"] = self.pool_event_group_counts
+        legacy_scan_mode = str(self.scan_mode or "off").strip().lower()
+        configured_band = str(self.scan_band_width or "full").strip().lower()
+        scan_mode = configured_band if configured_band not in {"", "full"} or legacy_scan_mode in {"off", "none", "0"} else legacy_scan_mode
+        if scan_mode in {"full", "all"} and legacy_scan_mode in {"off", "none", "0"}:
+            scan_mode = "off"
+        if scan_mode not in {"", "off", "none", "0"}:
+            data["scan"] = {
+                "mode": scan_mode,
+                "band_width": scan_mode,
+                "local_electrodes": max(1, min(3, int(self.scan_local_electrodes))),
+                "selection_mode": "scan_band_sequence",
+                "random_seed": int(self.random_seed),
+            }
+            data["site_switch"] = {
+                "enabled": True,
+                "selection_mode": "scan_band_sequence",
+                "random_seed": int(self.random_seed),
+                "connect_settle_ms": float(self.connect_settle_ms),
+            }
         if self.type == "custom_sequence":
             data["custom_points"] = self.custom_points
         if self.type == "poisson_random_electrodes":
@@ -435,7 +499,7 @@ def preview_raster_series(
     spontaneous_rates: dict[int, float] | None = None,
     electrode_pool: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    if protocol.type in {"single_pulse", "individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
+    if protocol.type in {"single_pulse", "individual_burst", "sequence_with_burst", "random", "sequence_with_poisson_burst"}:
         if _protocol_uses_site_switch(protocol):
             return _site_switch_preview_raster_series(protocol, preview_limit_ms, electrode_pool)
         return [{
@@ -544,6 +608,8 @@ def pulse_starts_ms(protocol: StimulusProtocol) -> list[tuple[float, float]]:
         return _burst_pulse_starts(protocol, poisson=False)
     if protocol.type == "sequence_with_poisson_burst":
         return _burst_pulse_starts(protocol, poisson=True)
+    if protocol.type == "random":
+        return _random_burst_pulse_starts(protocol)
     if protocol.type == "custom_sequence":
         return [(point["time_ms"], point["amplitude_mv"]) for point in protocol.custom_points]
     if protocol.type == "poisson_random_electrodes":
@@ -635,7 +701,7 @@ def site_switch_event_groups_for_count(protocol: StimulusProtocol, electrode_poo
 
 def _site_switch_pulses_per_event(protocol: StimulusProtocol) -> int:
     protocol_type = str(getattr(protocol, "type", ""))
-    if protocol_type in {"individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
+    if protocol_type in {"individual_burst", "sequence_with_burst", "random", "sequence_with_poisson_burst"}:
         return max(1, int(getattr(protocol, "pulses_per_burst", 1) or 1))
     return 1
 
@@ -678,6 +744,12 @@ def _balanced_site_switch_groups(
         rng = random.Random(int(random_seed))
         rng.shuffle(expanded)
         return expanded
+    if mode in {"scan_band_sequence", "band_sequence"}:
+        return [
+            list(group)
+            for group, quota in zip(groups, quotas)
+            for _repeat in range(quota)
+        ]
     ordered: list[list[int]] = []
     used = [0] * len(groups)
     while len(ordered) < target:
@@ -813,6 +885,11 @@ def _protocol_seed(protocol: StimulusProtocol) -> int:
             "start_ms": protocol.start_ms,
             "burst_count": protocol.burst_count,
             "burst_frequency_hz": protocol.burst_frequency_hz,
+            "random_distribution": getattr(protocol, "random_distribution", "poisson"),
+            "random_lambda_hz": getattr(protocol, "random_lambda_hz", 5.0),
+            "random_interval_min_ms": getattr(protocol, "random_interval_min_ms", 100.0),
+            "random_interval_max_ms": getattr(protocol, "random_interval_max_ms", 1000.0),
+            "random_duration_s": getattr(protocol, "random_duration_s", 60.0),
             "pulses_per_burst": protocol.pulses_per_burst,
             "pulse_frequency_hz": protocol.pulse_frequency_hz,
             "randomize_burst_pulse_intervals": bool(protocol.randomize_burst_pulse_intervals),
@@ -865,6 +942,74 @@ def _burst_pulse_starts(protocol: StimulusProtocol, *, poisson: bool) -> list[tu
     ]
 
 
+def _random_burst_starts_ms(protocol: StimulusProtocol) -> list[float]:
+    """Generate burst starts for the user-facing random burst protocol."""
+    start_ms = float(getattr(protocol, "start_ms", 0.0))
+    duration_s = max(0.0, float(getattr(protocol, "random_duration_s", 0.0)))
+    if duration_s <= 0.0:
+        return [start_ms]
+    stop_ms = start_ms + duration_s * 1000.0
+    distribution = str(getattr(protocol, "random_distribution", "poisson") or "poisson").strip().lower()
+    minimum = max(0.0, float(getattr(protocol, "random_interval_min_ms", 100.0)))
+    rng = random.Random(_protocol_seed(protocol))
+    starts = [start_ms]
+    current_ms = start_ms
+    for _index in range(200_000):
+        if distribution in {"poisson", "exponential"}:
+            lambda_hz = max(float(getattr(protocol, "random_lambda_hz", 5.0)), 1e-9)
+            interval_ms = minimum + rng.expovariate(lambda_hz) * 1000.0
+        elif distribution in {"uniform", "flat"}:
+            maximum = max(minimum, float(getattr(protocol, "random_interval_max_ms", 1000.0)))
+            interval_ms = rng.uniform(minimum, maximum)
+        else:
+            raise ValueError(f"Unsupported random burst distribution: {distribution}")
+        current_ms += max(0.001, interval_ms)
+        if current_ms > stop_ms:
+            break
+        starts.append(current_ms)
+    return starts
+
+
+def _random_burst_pulse_starts(protocol: StimulusProtocol) -> list[tuple[float, float]]:
+    starts = _random_burst_starts_ms(protocol)
+    if _randomize_burst_pulse_intervals(protocol):
+        rng = random.Random(_protocol_seed(protocol))
+        offsets_by_burst = [_burst_pulse_offsets_ms(protocol, rng) for _ in starts]
+    else:
+        offsets = _burst_pulse_offsets_ms(protocol)
+        offsets_by_burst = [offsets for _ in starts]
+    return [
+        (burst_start + offset_ms, protocol.amplitude_mv)
+        for burst_start, offsets in zip(starts, offsets_by_burst)
+        for offset_ms in offsets
+    ]
+
+
+def protocol_total_duration_s(protocol: StimulusProtocol) -> float:
+    """Return the complete protocol duration including the final pulse width."""
+    starts = [float(time_ms) for time_ms, _amplitude in pulse_starts_ms(protocol)]
+    if not starts:
+        return max(0.0, float(getattr(protocol, "start_ms", 0.0))) / 1000.0
+    width_ms = max(0.0, float(getattr(protocol, "pulse_width_us", 0.0))) / 1000.0
+    return max(starts) / 1000.0 + width_ms / 1000.0
+
+
+def scan_stimulation_duration_s(protocol: StimulusProtocol, extra_s: float = 10.0) -> int:
+    """Return a recording-safe duration for a scan stimulation phase."""
+    starts = [float(time_ms) for time_ms, _amplitude in pulse_starts_ms(protocol)]
+    if not starts:
+        return max(1, int(math.ceil(float(extra_s))))
+    duration_s = protocol_total_duration_s(protocol)
+    if protocol.type in {"individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
+        # The scan phase covers the full event cadence. Pulse width is already
+        # contained in the hardware command and should not round a 600 s plan
+        # up to 601 s when the requested cadence is 300 events x 2 s.
+        duration_s = max(starts) / 1000.0 + _burst_interval_ms(protocol) / 1000.0
+    elif protocol.type == "electrode_pool_sequence":
+        duration_s += max(0.0, float(protocol.pool_event_interval_ms)) / 1000.0
+    return max(1, int(math.ceil(duration_s + max(0.0, float(extra_s)))))
+
+
 def _preview_lambda_hz(firing_rate_hz: float, protocol: StimulusProtocol, rng: random.Random) -> float:
     floor = max(protocol.lambda_floor_hz, 0.001)
     base = max(float(firing_rate_hz), 0.0)
@@ -915,6 +1060,11 @@ def _protocol_seed(protocol: StimulusProtocol) -> int:
             "start_ms": protocol.start_ms,
             "burst_count": protocol.burst_count,
             "burst_frequency_hz": protocol.burst_frequency_hz,
+            "random_distribution": getattr(protocol, "random_distribution", "poisson"),
+            "random_lambda_hz": getattr(protocol, "random_lambda_hz", 5.0),
+            "random_interval_min_ms": getattr(protocol, "random_interval_min_ms", 100.0),
+            "random_interval_max_ms": getattr(protocol, "random_interval_max_ms", 1000.0),
+            "random_duration_s": getattr(protocol, "random_duration_s", 60.0),
             "pulses_per_burst": protocol.pulses_per_burst,
             "pulse_frequency_hz": protocol.pulse_frequency_hz,
             "randomize_burst_pulse_intervals": bool(protocol.randomize_burst_pulse_intervals),
@@ -995,11 +1145,15 @@ def distribution_preview_specs(
     specs: list[dict[str, Any]] = []
     protocol_type = str(getattr(protocol, "type", ""))
 
-    if protocol_type in {"individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
+    if protocol_type in {"individual_burst", "sequence_with_burst", "random", "sequence_with_poisson_burst"}:
         if _randomize_burst_pulse_intervals(protocol):
             rng = random.Random(_protocol_seed(protocol))
             intervals_ms: list[float] = []
-            for _start_ms in _burst_starts_ms(protocol, poisson=(protocol_type == "sequence_with_poisson_burst")):
+            if protocol_type == "random":
+                burst_starts = _random_burst_starts_ms(protocol)
+            else:
+                burst_starts = _burst_starts_ms(protocol, poisson=(protocol_type == "sequence_with_poisson_burst"))
+            for _start_ms in burst_starts:
                 offsets = _burst_pulse_offsets_ms(protocol, rng)
                 intervals_ms.extend(
                     max(0.0, float(next_offset) - float(previous_offset))
@@ -1042,6 +1196,41 @@ def distribution_preview_specs(
                     "mean": _burst_interval_ms(protocol),
                     "label": "Expected Poisson interval",
                 },
+            }
+        )
+
+    if protocol_type == "random":
+        starts = _random_burst_starts_ms(protocol)
+        intervals_ms = [
+            max(0.0, float(next_start) - float(previous_start))
+            for previous_start, next_start in zip(starts, starts[1:])
+        ]
+        distribution = str(getattr(protocol, "random_distribution", "poisson") or "poisson").strip().lower()
+        if distribution in {"poisson", "exponential"}:
+            minimum = max(0.0, float(getattr(protocol, "random_interval_min_ms", 100.0)))
+            expected = {
+                "kind": "exponential",
+                "mean": 1000.0 / max(float(getattr(protocol, "random_lambda_hz", 5.0)), 1e-9),
+                "min": minimum,
+                "label": "Expected Poisson interval",
+            }
+        else:
+            minimum = max(0.0, float(getattr(protocol, "random_interval_min_ms", 100.0)))
+            maximum = max(minimum, float(getattr(protocol, "random_interval_max_ms", 1000.0)))
+            expected = {
+                "kind": "uniform",
+                "min": minimum,
+                "max": maximum,
+                "label": "Expected uniform interval",
+            }
+        specs.append(
+            {
+                "title": "Random burst interval",
+                "x_label": "Interval (ms)",
+                "y_label": "Density",
+                "actual": intervals_ms,
+                "actual_label": "Generated burst intervals",
+                "expected": expected,
             }
         )
 
@@ -1104,6 +1293,22 @@ def build_package(
     output_dir = output_dir.expanduser().resolve()
     _validate(info, groups, protocols, blocks)
     groups, blocks = _with_plan_electrode_groups(groups, protocols, blocks)
+    protocol_lookup = {protocol.name: protocol for protocol in protocols}
+    adjusted_blocks: list[ExperimentBlock] = []
+    for block in blocks:
+        protocol = protocol_lookup.get(block.protocol)
+        phases = [Phase(phase.id, phase.duration_s, phase.mode) for phase in block.phases]
+        if protocol is not None and str(getattr(protocol, "scan_mode", "off") or "off").lower() not in {"", "off", "none", "0"}:
+            phases = [
+                Phase(
+                    phase.id,
+                    scan_stimulation_duration_s(protocol) if phase.id == "02_stim" else phase.duration_s,
+                    phase.mode,
+                )
+                for phase in phases
+            ]
+        adjusted_blocks.append(ExperimentBlock(block.name, block.electrode_group, block.protocol, phases))
+    blocks = adjusted_blocks
 
     for rel in ["config", "python/utils", "scripts", "data"]:
         (output_dir / rel).mkdir(parents=True, exist_ok=True)
@@ -1144,11 +1349,36 @@ def _validate(
         raise ValueError("At least one block is required")
     group_names = {group.name for group in groups}
     protocol_names = {protocol.name for protocol in protocols}
+    for group in groups:
+        if group.multi_electrode and group.center_electrode is None and not all_non_stim:
+            raise ValueError(f"Multi-electrode group {group.name} needs a center electrode")
+        if int(group.electrode_count) < 1 or int(group.electrode_count) > MAX_STIMULATION_UNITS_PER_ROUTE:
+            raise ValueError(
+                f"Electrode group {group.name} electrode count must be between 1 and {MAX_STIMULATION_UNITS_PER_ROUTE}"
+            )
+        if not group.multi_electrode and int(group.electrode_count) != 1:
+            raise ValueError(f"Electrode group {group.name} must use electrode count 1 when multi-electrode stimulation is off")
     for protocol in protocols:
         if protocol.type not in PROTOCOL_TYPES:
             raise ValueError(f"Unsupported protocol type: {protocol.type}")
         if protocol.type == "custom_sequence" and not protocol.custom_points:
             raise ValueError(f"Custom protocol {protocol.name} needs at least one point")
+        if protocol.type == "random":
+            distribution = str(getattr(protocol, "random_distribution", "poisson") or "poisson").strip().lower()
+            if distribution not in {"poisson", "exponential", "uniform", "flat"}:
+                raise ValueError(f"Protocol {protocol.name} needs Poisson or uniform random burst distribution")
+            if float(getattr(protocol, "random_duration_s", 0.0)) <= 0.0:
+                raise ValueError(f"Protocol {protocol.name} needs random duration > 0 s")
+            minimum = float(getattr(protocol, "random_interval_min_ms", 100.0))
+            if minimum < 0.0:
+                raise ValueError(f"Protocol {protocol.name} needs interval min >= 0 ms")
+            if distribution in {"poisson", "exponential"}:
+                if float(getattr(protocol, "random_lambda_hz", 0.0)) <= 0.0:
+                    raise ValueError(f"Protocol {protocol.name} needs lambda > 0 Hz")
+            else:
+                maximum = float(getattr(protocol, "random_interval_max_ms", 0.0))
+                if minimum < 0.0 or maximum < minimum or maximum <= 0.0:
+                    raise ValueError(f"Protocol {protocol.name} needs 0 <= interval min <= interval max and max > 0 ms")
         if protocol.randomize_burst_pulse_intervals:
             if protocol.burst_pulse_interval_min_ms < 0:
                 raise ValueError(f"Protocol {protocol.name} needs burst pulse interval min >= 0 ms")
@@ -1211,7 +1441,13 @@ def _with_plan_electrode_groups(
     protocol_lookup = {protocol.name: protocol for protocol in protocols}
     group_lookup = {group.name: group for group in groups}
     resolved_groups = [
-        ElectrodeGroup(group.name, list(group.electrodes), center_electrode=group.center_electrode)
+        ElectrodeGroup(
+            group.name,
+            list(group.electrodes),
+            center_electrode=group.center_electrode,
+            multi_electrode=bool(group.multi_electrode),
+            electrode_count=max(1, int(group.electrode_count)),
+        )
         for group in groups
     ]
     resolved_group_lookup = {group.name: group for group in resolved_groups}
@@ -1251,7 +1487,13 @@ def _with_plan_electrode_groups(
             if target_group in resolved_group_lookup:
                 resolved_group_lookup[target_group].electrodes = target_electrodes
             else:
-                auto_group = ElectrodeGroup(target_group, target_electrodes, center_electrode=group.center_electrode)
+                auto_group = ElectrodeGroup(
+                    target_group,
+                    target_electrodes,
+                    center_electrode=group.center_electrode,
+                    multi_electrode=bool(group.multi_electrode),
+                    electrode_count=max(1, int(group.electrode_count)),
+                )
                 resolved_groups.append(auto_group)
                 resolved_group_lookup[target_group] = auto_group
         resolved_blocks.append(
@@ -1297,7 +1539,7 @@ def _system_yaml(info: ExperimentInfo, blocks: list[ExperimentBlock]) -> dict[st
                 "signal_dacs": [0, 1],
                 "neutral_dac": 2,
                 "sync_dual_dac": True,
-                "allocation": "round_robin_stimulation_units",
+                "allocation": "round_robin_electrode_order",
             },
         },
         "burst_detection": {"bin_ms": 10, "smooth_sigma_ms": 300, "k_rms": 1.2},
@@ -1356,9 +1598,23 @@ def _readme(
 ) -> str:
     group_lines = "\n".join(f"- `{group.name}`: {group.electrodes}" for group in groups)
     protocol_lines = "\n".join(
-        f"- `{protocol.name}`: `{protocol.type}`, amplitude={protocol.amplitude_mv} mV, width={protocol.pulse_width_us} us"
+        (
+            f"- `{protocol.name}`: `{protocol.type}`, amplitude={protocol.amplitude_mv} mV, "
+            f"width={protocol.pulse_width_us} us"
+            + (
+                f", distribution={protocol.random_distribution}, "
+                f"total_duration_s={protocol_total_duration_s(protocol):.3f}"
+                if protocol.type == "random"
+                else ""
+            )
+        )
         for protocol in protocols
     )
+    rate_source_lines = "\n".join(
+        f"- `{protocol.name}`: `config/pipeline_rate_sources/*_rates.npz` (strictly above the finite-channel median)"
+        for protocol in protocols
+        if str(protocol.spontaneous_data_path or "").strip()
+    ) or "- No spontaneous firing-rate source selected."
     block_lines = "\n".join(
         f"- `{block.name}`: group=`{block.electrode_group}`, protocol=`{block.protocol}`"
         for block in blocks
@@ -1385,6 +1641,17 @@ Generated MaxWell experiment package.
 
 {protocol_lines}
 
+## Stimulation Electrode Activity Filter
+
+{rate_source_lines}
+
+When a spontaneous source is selected, the GUI writes one NPZ rate table per
+source into `config/pipeline_rate_sources/`. Runtime electrode selection keeps
+the existing CFG/unit and spatial constraints, then accepts only candidates
+whose firing rate is strictly above the finite-channel median. If a center or
+replacement electrode fails that activity check, it is re-selected using the
+same spatial search and unit-uniqueness validation.
+
 ## Blocks
 
 {block_lines}
@@ -1405,7 +1672,7 @@ For real hardware runs, install the MaxWell Python API or set `MAXLAB_PYTHON_PAT
 
 Each `main.py` execution creates `data/{{YYYYMMDD_HHMMSS}}_data/`. Every block has fixed `01_pre_spont`, `02_stim`, and `03_post_spont` phases. Stimulating blocks record spontaneous/stimulation data as configured. A `rest_only` block uses the three durations as quiet recovery waits and does not start recording, configure stimulation, or write a stimulation segment file.
 
-Stimulation uses signal DACs 0 and 1 by default, with DAC 2 held at neutral. Stimulation units are assigned to signal DACs round-robin. Each stimulation phase writes `hardware_mapping.json`, `hardware_route_log.json`, and includes the same mapping in `segment_time_meta.json`; these files record electrode-to-unit, unit-to-DAC, route switches, connect timing, and settling time for each pulse.
+Stimulation uses signal DACs 0 and 1 by default, with DAC 2 held at neutral. Stimulation units are assigned to signal DACs in electrode order. Each pulse is sent separately from the host, following the D21 connection and waveform flow. For switching plans, DACs are zeroed and every active unit is configured before waiting for the next pulse, including repeated groups. `connect_settle_ms` is retained as plan metadata and does not control hardware switching; logs contain measured host connection and send times. Pulses have two contiguous phases, with no inter-phase gap. Hardware event timestamps remain the source for precise acquisition alignment. Each stimulation phase writes `hardware_mapping.json`, `hardware_route_log.json`, and includes the same mapping in `segment_time_meta.json`; these files record electrode-to-unit, unit-to-DAC, route switches, connect timing, and settling time for each pulse.
 """
 
 
@@ -1537,7 +1804,9 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import re
+import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -1546,12 +1815,18 @@ from python.maxwell_setup import (
     build_poisson_random_sequence,
     build_stim_sequence,
     configure_poisson_experiment_array,
+    resolve_experiment_array,
+    _default_stim_unit_dac_sources,
     configure_experiment_array,
     configure_experiment_array_with_mapping,
     create_experiment_saving,
     get_stim_times_for_protocol,
+    enable_stimulation_power,
     initialize_maxlab,
+    prepare_recording_only,
+    record_channels_excluding,
     probe_stimulation_electrodes,
+    scan_cfg_stimulation_units,
 )
 from python.random_stim_plan import build_poisson_random_plan
 from python.random_stim_plan import build_electrode_pool_sequence_plan
@@ -1560,6 +1835,7 @@ from python.random_stim_plan import electrode_pool_event_groups
 from python.random_stim_plan import site_switch_event_groups_for_count
 from python.random_stim_plan import poisson_rates_for_electrodes
 from python.random_stim_plan import select_poisson_candidate_electrodes
+from python.random_stim_plan import load_spontaneous_rates
 from python.utils.time_log import ExternalTimeLog, SegmentStimLog
 
 PLAN_PROTOCOL_TYPES = {"poisson_random_electrodes", "electrode_pool_sequence"}
@@ -1625,11 +1901,13 @@ def _hardware_mapping_payload(
     return {
         "routing_mode": routing_mode,
         "initial_connect": bool(initial_connect),
+        "execution_mode": "d21_host_per_pulse",
+        "connect_timing": "switch_before_host_deadline_wait",
         "connect_settle_ms": float(connect_settle_ms),
         "signal_dacs": [int(value) for value in signal_dacs],
         "neutral_dac": int(neutral_dac),
         "sync_dual_dac": bool(sync_dual_dac),
-        "dac_allocation": "round_robin_stimulation_units",
+        "dac_allocation": "round_robin_electrode_order",
         "electrode_to_stim_unit": {
             str(int(electrode)): int(stim_unit)
             for electrode, stim_unit in sorted(stim_unit_by_electrode.items())
@@ -1764,6 +2042,11 @@ def _hardware_route_records(
 
 
 def _protocol_requires_dynamic_site_switch(protocol: dict[str, Any]) -> bool:
+    # CFG-driven scan plans are resolved to one local spatial site per event
+    # at runtime, so they must use the host-side dynamic switching path even
+    # before explicit event_groups have been materialized.
+    if _scan_mode_enabled(protocol):
+        return True
     switch_cfg = protocol.get("site_switch", {}) or {}
     if not switch_cfg.get("enabled", False):
         return False
@@ -1790,6 +2073,11 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
         raise ValueError("No experiment.blocks configured")
     recording_prefix = system_config.get("experiment", {}).get("recording_name_prefix") or system_config.get("experiment", {}).get("name", "recording")
     cfg_path = Path(system_config.get("electrode_map", {}).get("cfg_path", ""))
+    if not dry_run:
+        cfg_electrodes = _cfg_recording_electrodes(cfg_path)
+        id_mapping = _normalize_stimulation_ids_for_cfg(groups, protocols, cfg_electrodes)
+        if id_mapping:
+            logging.warning("Normalized stimulation electrode IDs to CFG namespace: %s", ",".join(f"{source}->{target}" for source, target in sorted(id_mapping.items())))
     logging.info("Experiment start: run_dir=%s dry_run=%s blocks=%d cfg=%s", run_dir, dry_run, len(blocks), cfg_path)
     audit.mark_event(
         "experiment_config_loaded",
@@ -1802,20 +2090,89 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
     if dry_run:
         logging.info("Dry run enabled: hardware calls skipped")
         audit.mark_event("hardware_skipped_dry_run", "", "", "")
+        runtime_stim_unit_by_electrode: dict[int, int] = {}
+        runtime_stim_unit_diagnostics: list[dict[str, Any]] = []
     else:
         try:
+            audit.mark_event("hardware_initialize_start", "", "", "")
+            requires_unit_scan = any(
+                bool(groups.get(str(block.get("electrode_group", "")), {}).get("multi_electrode", False))
+                or _group_center_electrode(groups.get(str(block.get("electrode_group", "")), {})) is not None
+                or _protocol_uses_plan(protocols.get(str(block.get("protocol", "")), {}))
+                or _protocol_has_stimulation_rate_source(protocols.get(str(block.get("protocol", "")), {}))
+                or _scan_mode_enabled(protocols.get(str(block.get("protocol", "")), {}))
+                for block in blocks
+                if not _block_has_record_only_stim(block) and not _block_is_rest_only(block)
+            )
+            # The Maxwell probe utility resolves CFG electrode units before
+            # stimulation power is enabled. Match that order here because
+            # enabling power can change the temporary stimulation-array state.
+            initialize_maxlab(system_config, power_up_stimulation=not requires_unit_scan)
+            audit.mark_event("hardware_initialize_done", "", "", "")
+            logging.info("MaxLab initialized")
+            if requires_unit_scan:
+                runtime_stim_unit_by_electrode, unresolved_cfg_units, runtime_stim_unit_diagnostics = scan_cfg_stimulation_units(
+                    cfg_path,
+                    cfg_electrodes,
+                    system_config,
+                )
+            else:
+                runtime_stim_unit_by_electrode, unresolved_cfg_units, runtime_stim_unit_diagnostics = {}, [], []
+            if requires_unit_scan:
+                enable_stimulation_power()
+                audit.mark_event("stimulation_power_enabled", "", "", "")
+            (run_dir / "stimulation_unit_scan.json").write_text(
+                json.dumps(
+                    {
+                        "cfg_path": str(cfg_path),
+                        "cfg_recording_electrode_count": len(cfg_electrodes),
+                        "mapped_count": len(runtime_stim_unit_by_electrode),
+                        "unresolved_count": len(unresolved_cfg_units),
+                        "results": runtime_stim_unit_diagnostics,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            status_counts: dict[str, int] = {}
+            for detail in runtime_stim_unit_diagnostics:
+                status = str(detail.get("status", "unknown"))
+                status_counts[status] = status_counts.get(status, 0) + 1
+            logging.info(
+                "CFG stimulation-unit scan complete: mapped=%d unresolved=%d statuses=%s",
+                len(runtime_stim_unit_by_electrode),
+                len(unresolved_cfg_units),
+                status_counts,
+            )
+            audit.mark_event(
+                "cfg_stimulation_unit_scan_done",
+                "",
+                "",
+                "",
+                extra={
+                    "mapped_count": len(runtime_stim_unit_by_electrode),
+                    "unresolved_count": len(unresolved_cfg_units),
+                    "status_counts": status_counts,
+                    "diagnostics_path": str(run_dir / "stimulation_unit_scan.json"),
+                },
+            )
+            # Scan-mode site selection depends on the CFG stimulation-unit map,
+            # so validate requested sites only after that map has been loaded.
             audit.mark_event("cfg_preflight_start", "", "", "", extra={"cfg_path": str(cfg_path)})
-            preflight = _validate_cfg_stimulation_sites(cfg_path, blocks, groups, protocols)
+            preflight = _validate_cfg_stimulation_sites(
+                cfg_path,
+                blocks,
+                groups,
+                protocols,
+                cfg_electrodes=cfg_electrodes,
+                stim_unit_by_electrode=runtime_stim_unit_by_electrode,
+            )
             logging.info(
                 "CFG preflight OK: cfg electrodes=%d requested stimulation electrodes=%d",
                 preflight["cfg_electrode_count"],
                 preflight["requested_electrode_count"],
             )
             audit.mark_event("cfg_preflight_ok", "", "", "", extra=preflight)
-            audit.mark_event("hardware_initialize_start", "", "", "")
-            initialize_maxlab()
-            audit.mark_event("hardware_initialize_done", "", "", "")
-            logging.info("MaxLab initialized")
         except Exception as exc:
             logging.exception("Experiment startup failed")
             audit.mark_event("experiment_startup_failed", "", "", "", extra={"error": str(exc)})
@@ -1857,7 +2214,37 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                 },
             )
             if protocol and electrode_group:
-                electrode_group = _effective_electrode_group(protocol, electrode_group)
+                reserved_units: set[int] = set()
+                stimulation_rates, stimulation_rate_threshold, rate_filter_info = _stimulation_rate_filter(
+                    protocol,
+                    system_config,
+                )
+                if rate_filter_info.get("enabled"):
+                    logging.info(
+                        "Stimulation rate filter: block=%s threshold=%.6g Hz source=%s rates=%d",
+                        block_name,
+                        float(rate_filter_info.get("threshold_hz", 0.0)),
+                        rate_filter_info.get("source_path", ""),
+                        int(rate_filter_info.get("rate_count", 0)),
+                    )
+                    audit.mark_event(
+                        "stimulation_rate_filter_ready",
+                        block_name,
+                        "",
+                        "",
+                        extra=rate_filter_info,
+                    )
+                electrode_group = _effective_electrode_group(
+                    protocol,
+                    electrode_group,
+                    cfg_electrodes=cfg_electrodes if not dry_run else None,
+                    stim_unit_by_electrode=runtime_stim_unit_by_electrode if not dry_run else None,
+                    reserved_units=reserved_units,
+                    recording_rates=stimulation_rates,
+                    rate_threshold=stimulation_rate_threshold,
+                    cfg_path=cfg_path if not dry_run else None,
+                    system_config=system_config if not dry_run else None,
+                )
                 hardware_system_config = _hardware_system_config(system_config, protocol)
                 prepared_stim_unit_by_electrode: dict[int, int] = {}
                 prepared_stim_unit_to_dac: dict[int, int] = {}
@@ -1867,6 +2254,8 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                         electrode_group,
                         system_config,
                         protocol,
+                        rates=stimulation_rates,
+                        rate_threshold=stimulation_rate_threshold,
                     )
                     if replacements:
                         replacement_text = ",".join(f"{source}->{target}" for source, target in replacements.items())
@@ -1883,39 +2272,6 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                             "No connectable replacement found for stimulation electrode(s): "
                             + ",".join(str(item) for item in unresolved_electrodes)
                         )
-                    audit.mark_event(
-                        "array_configure_start",
-                        block_name,
-                        "",
-                        "",
-                        extra={
-                            "protocol": protocol.get("name", ""),
-                            "protocol_type": protocol.get("type", ""),
-                            "electrode_group": electrode_group.get("name", ""),
-                            "electrode_count": len(electrode_group.get("electrodes", [])),
-                        },
-                    )
-                    (
-                        _array,
-                        prepared_stim_unit_by_electrode,
-                        prepared_stim_unit_to_dac,
-                    ) = configure_experiment_array_with_mapping(
-                        cfg_path,
-                        electrode_group,
-                        hardware_system_config,
-                        initial_connect=True,
-                    )
-                    audit.mark_event(
-                        "array_configure_done",
-                        block_name,
-                        "",
-                        "",
-                        extra={
-                            "stim_unit_count": len(set(prepared_stim_unit_by_electrode.values())),
-                            "stim_unit_to_dac_source": prepared_stim_unit_to_dac,
-                        },
-                    )
-                    logging.info("Array configured: block=%s electrodes=%d", block_name, len(electrode_group.get("electrodes", [])))
             else:
                 hardware_system_config = system_config
                 prepared_stim_unit_by_electrode = {}
@@ -1955,10 +2311,13 @@ def run_experiment(system_config: dict[str, Any], stimulation_config: dict[str, 
                         prepared_stim_unit_by_electrode=prepared_stim_unit_by_electrode,
                         prepared_stim_unit_to_dac=prepared_stim_unit_to_dac,
                         hardware_system_config=hardware_system_config,
+                        stimulation_rates=stimulation_rates,
+                        stimulation_rate_threshold=stimulation_rate_threshold,
                     )
                 elif not dry_run:
+                    prepare_recording_only(cfg_path, system_config)
                     audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": phase.get("mode", "")})
-                    saving = create_experiment_saving(phase_dir, segment_name)
+                    saving = create_experiment_saving(phase_dir, segment_name, record_channels_excluding(cfg_path, []))
                     time.sleep(duration_s)
                     saving.stop_recording()
                     saving.stop_file()
@@ -2010,8 +2369,11 @@ def _validate_cfg_stimulation_sites(
     blocks: list[dict[str, Any]],
     groups: dict[str, dict[str, Any]],
     protocols: dict[str, dict[str, Any]],
+    *,
+    cfg_electrodes: set[int] | None = None,
+    stim_unit_by_electrode: dict[int, int] | None = None,
 ) -> dict[str, int]:
-    cfg_electrodes = _cfg_recording_electrodes(cfg_path)
+    cfg_electrodes = cfg_electrodes if cfg_electrodes is not None else _cfg_recording_electrodes(cfg_path)
     requested: list[int] = []
     missing_references: list[str] = []
     for block in blocks:
@@ -2028,8 +2390,25 @@ def _validate_cfg_stimulation_sites(
         if electrode_group is None:
             missing_references.append(f"{block_name}: electrode_group {group_name!r}")
             continue
-        effective_group = _effective_electrode_group(protocol, electrode_group)
-        _validate_stimulation_unit_pool_size(protocol, effective_group, context=f"block {block_name}")
+        effective_group = _effective_electrode_group(
+            protocol,
+            electrode_group,
+            cfg_electrodes=sorted(cfg_electrodes),
+            stim_unit_by_electrode=stim_unit_by_electrode,
+            cfg_path=cfg_path,
+        )
+        if _scan_mode_enabled(protocol):
+            route_groups = [
+                {"name": f"{block_name}:scan_route_{index + 1}", "electrodes": list(route)}
+                for index, route in enumerate(effective_group.get("scan_route_groups", []) or [])
+                if route
+            ]
+            if not route_groups:
+                raise RuntimeError(f"block {block_name}: scan mode did not produce any route groups")
+            for route_group in route_groups:
+                _validate_stimulation_unit_pool_size(protocol, route_group, context=f"block {block_name}")
+        else:
+            _validate_stimulation_unit_pool_size(protocol, effective_group, context=f"block {block_name}")
         requested.extend(int(item) for item in effective_group.get("electrodes", []))
     if missing_references:
         raise RuntimeError("Invalid block references before experiment run: " + "; ".join(missing_references))
@@ -2088,6 +2467,63 @@ def _normalize_site_switch_center(value: Any) -> int | None:
         return None
 
 
+def _cfg_electrode_id(value: Any, cfg_electrodes: set[int]) -> tuple[int, int | None]:
+    """Keep the electrode ID from the H5/CFG mapping unchanged."""
+    return int(value), None
+
+
+def _normalize_stimulation_ids_for_cfg(
+    groups: dict[str, dict[str, Any]],
+    protocols: dict[str, dict[str, Any]],
+    cfg_electrodes: set[int],
+) -> dict[int, int]:
+    """Normalize configured stimulation references before planning/routing."""
+    mapping: dict[int, int] = {}
+
+    def normalize_values(values: Any) -> list[int]:
+        normalized = []
+        for value in _event_group_values(values):
+            target, source = _cfg_electrode_id(value, cfg_electrodes)
+            normalized.append(target)
+            if source is not None:
+                mapping[source] = target
+        return _unique_ints(normalized)
+
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        if "electrodes" in group:
+            group["electrodes"] = normalize_values(group.get("electrodes"))
+        if group.get("center_electrode") is not None:
+            center, source = _cfg_electrode_id(group["center_electrode"], cfg_electrodes)
+            group["center_electrode"] = center
+            if source is not None:
+                mapping[source] = center
+
+    for protocol in protocols.values():
+        if not isinstance(protocol, dict):
+            continue
+        switch_cfg = protocol.get("site_switch")
+        if isinstance(switch_cfg, dict):
+            switch_cfg["event_groups"] = [normalize_values(raw) for raw in switch_cfg.get("event_groups") or []]
+            centers = []
+            for raw_center in switch_cfg.get("event_group_centers") or []:
+                center = _normalize_site_switch_center(raw_center)
+                if center is None:
+                    centers.append(None)
+                    continue
+                normalized, source = _cfg_electrode_id(center, cfg_electrodes)
+                centers.append(normalized)
+                if source is not None:
+                    mapping[source] = normalized
+            if centers:
+                switch_cfg["event_group_centers"] = centers
+        pool_cfg = protocol.get("electrode_pool_sequence")
+        if isinstance(pool_cfg, dict) and "event_groups" in pool_cfg:
+            pool_cfg["event_groups"] = [normalize_values(raw) for raw in pool_cfg.get("event_groups") or []]
+    return mapping
+
+
 def _event_group_values(raw_group: Any) -> list[int]:
     if raw_group is None:
         return []
@@ -2121,6 +2557,89 @@ def _cfg_recording_electrodes(cfg_path: Path) -> set[int]:
     return electrodes
 
 
+def _resolve_runtime_rate_source(path_text: str) -> Path:
+    source = Path(str(path_text or "")).expanduser()
+    if source.is_file():
+        return source
+    candidates = []
+    if not source.is_absolute():
+        candidates.extend((Path.cwd() / source, Path(__file__).resolve().parents[1] / source))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return source
+
+
+def _stimulation_rate_filter(
+    protocol: dict[str, Any],
+    system_config: dict[str, Any] | None = None,
+) -> tuple[dict[int, float], float | None, dict[str, Any]]:
+    """Load recording rates and derive the minimum stimulation rate.
+
+    Generated packages store a rate table from the selected spontaneous
+    recording.  The default policy is deliberately explicit: a candidate must
+    have a rate strictly above the finite-channel median.  Older packages that
+    do not contain a rate source keep the historical unit/distance-only logic.
+    """
+    config = protocol.get("stimulation_rate_filter", {}) if isinstance(protocol, dict) else {}
+    if not isinstance(config, dict):
+        config = {}
+    random_config = protocol.get("random_electrode_plan", {}) if isinstance(protocol, dict) else {}
+    if not isinstance(random_config, dict):
+        random_config = {}
+    source_text = str(
+        config.get("source_path")
+        or protocol.get("recording_rate_source", "")
+        or random_config.get("spontaneous_data_path", "")
+        or ""
+    ).strip()
+    if not source_text:
+        return {}, None, {"enabled": False, "reason": "no_rate_source"}
+    source_path = _resolve_runtime_rate_source(source_text)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Stimulation rate source not found: {source_text}")
+    rates = {
+        int(electrode): float(rate)
+        for electrode, rate in load_spontaneous_rates(source_path).items()
+        if math.isfinite(float(rate))
+    }
+    if not rates:
+        raise RuntimeError(f"Stimulation rate source contains no finite channel rates: {source_path}")
+    mode = str(config.get("threshold_mode", "median") or "median").strip().lower()
+    explicit = config.get("threshold_hz")
+    if mode in {"none", "off", "disabled"}:
+        threshold = None
+    elif explicit is not None:
+        threshold = float(explicit)
+    elif mode == "median":
+        threshold = float(statistics.median(rates.values()))
+    else:
+        raise ValueError(f"Unsupported stimulation rate threshold mode: {mode}")
+    return rates, threshold, {
+        "enabled": threshold is not None,
+        "source_path": str(source_path),
+        "threshold_mode": mode,
+        "threshold_hz": threshold,
+        "rate_count": len(rates),
+    }
+
+
+def _protocol_has_stimulation_rate_source(protocol: dict[str, Any]) -> bool:
+    if not isinstance(protocol, dict):
+        return False
+    config = protocol.get("stimulation_rate_filter", {})
+    random_config = protocol.get("random_electrode_plan", {})
+    return bool(
+        isinstance(config, dict)
+        and str(config.get("source_path", "") or "").strip()
+    ) or bool(
+        str(protocol.get("recording_rate_source", "") or "").strip()
+    ) or bool(
+        isinstance(random_config, dict)
+        and str(random_config.get("spontaneous_data_path", "") or "").strip()
+    )
+
+
 def _run_stim_phase(
     cfg_path: Path,
     system_config: dict[str, Any],
@@ -2137,7 +2656,14 @@ def _run_stim_phase(
     prepared_stim_unit_by_electrode: dict[int, int] | None = None,
     prepared_stim_unit_to_dac: dict[int, int] | None = None,
     hardware_system_config: dict[str, Any] | None = None,
+    stimulation_rates: dict[int, float] | None = None,
+    stimulation_rate_threshold: float | None = None,
 ) -> None:
+    # Runtime candidate selection is the executable stimulation definition.
+    # Keep the original protocol for metadata, but feed this resolved copy to
+    # every plan builder so center-only event groups are never routed by
+    # accident.
+    plan_protocol = _protocol_with_runtime_plan_groups(protocol, electrode_group)
     protocol_type = str(protocol.get("type", ""))
     protocol_name = str(protocol.get("name", ""))
     routing_mode = _protocol_routing_mode(protocol)
@@ -2180,6 +2706,8 @@ def _run_stim_phase(
                 electrode_group,
                 system_config,
                 protocol,
+                rates=stimulation_rates,
+                rate_threshold=stimulation_rate_threshold,
             )
             audit.mark_event(
                 "poisson_electrode_probe_done",
@@ -2213,8 +2741,12 @@ def _run_stim_phase(
                 raise RuntimeError("No stimulation unit can connect to any poisson candidate electrode")
         else:
             filtered_group["electrodes"] = [int(item) for item in electrode_group.get("electrodes", [])]
+        plan_protocol = dict(plan_protocol)
+        random_cfg = dict(plan_protocol.get("random_electrode_plan", {}) or {})
+        random_cfg["candidate_electrodes"] = [int(item) for item in filtered_group.get("electrodes", [])]
+        plan_protocol["random_electrode_plan"] = random_cfg
         plan_rows = build_poisson_random_plan(
-            protocol=protocol,
+            protocol=plan_protocol,
             phase_dir=phase_dir,
             duration_s=duration_s,
             fallback_electrodes=[int(item) for item in filtered_group.get("electrodes", [])],
@@ -2226,7 +2758,7 @@ def _run_stim_phase(
         if not filtered_group["electrodes"]:
             raise ValueError("Electrode pool sequence needs a non-empty site group")
         plan_rows = build_electrode_pool_sequence_plan(
-            protocol=protocol,
+            protocol=plan_protocol,
             phase_dir=phase_dir,
             duration_s=duration_s,
             fallback_electrodes=filtered_group["electrodes"],
@@ -2239,7 +2771,7 @@ def _run_stim_phase(
             raise ValueError("Site switching needs a non-empty site group")
         base_stim_times = get_stim_times_for_protocol(protocol, duration_s)
         plan_rows = build_site_switch_plan(
-            protocol=protocol,
+            protocol=plan_protocol,
             phase_dir=phase_dir,
             duration_s=duration_s,
             fallback_electrodes=filtered_group["electrodes"],
@@ -2249,8 +2781,13 @@ def _run_stim_phase(
     else:
         plan_rows = []
         stim_times = get_stim_times_for_protocol(protocol, duration_s)
-    if not dry_run and _protocol_uses_plan(protocol) and protocol.get("type") != "poisson_random_electrodes":
-        plan_electrodes = sorted(_planned_electrodes(plan_rows, filtered_group))
+    if not dry_run and _protocol_uses_plan(protocol) and protocol.get("type") != "poisson_random_electrodes" and not _scan_mode_enabled(protocol):
+        # Preserve the exact order that passed cumulative unit validation.
+        # Maxwell may revise unit allocation when connection order changes.
+        plan_electrodes = _unique_ints([
+            *[int(item) for item in filtered_group.get("electrodes", [])],
+            *[int(item) for row in plan_rows for item in _planned_electrodes([row], filtered_group)],
+        ])
         electrode_center_lookup = _planned_electrode_centers(plan_rows, filtered_group)
         probe_group = dict(filtered_group)
         probe_group["electrodes"] = plan_electrodes
@@ -2259,6 +2796,8 @@ def _run_stim_phase(
             probe_group,
             system_config,
             protocol,
+            rates=stimulation_rates,
+            rate_threshold=stimulation_rate_threshold,
             electrode_center_lookup=electrode_center_lookup,
         )
         if replacements:
@@ -2279,11 +2818,12 @@ def _run_stim_phase(
                 + ",".join(str(item) for item in unresolved_electrodes)
             )
     planned_electrodes = _planned_electrodes(plan_rows, filtered_group)
-    _validate_stimulation_unit_pool_size(
-        protocol,
-        {"name": filtered_group.get("name", ""), "electrodes": sorted(planned_electrodes)},
-        context=f"block {block_name} phase {phase_id}",
-    )
+    if not _scan_mode_enabled(protocol):
+        _validate_stimulation_unit_pool_size(
+            protocol,
+            {"name": filtered_group.get("name", ""), "electrodes": sorted(planned_electrodes)},
+            context=f"block {block_name} phase {phase_id}",
+        )
     audit.mark_event(
         "stim_plan_ready",
         block_name,
@@ -2318,7 +2858,8 @@ def _run_stim_phase(
         for key, value in (prepared_stim_unit_to_dac or {}).items()
     }
     effective_hardware_config = hardware_system_config or _hardware_system_config(system_config, protocol)
-    connect_settle_ms = _plan_connect_settle_ms(protocol)
+    connect_settle_ms = 0.0  # D21 switches on the host before waiting for the pulse.
+    sequence = None
     if dry_run:
         segment_log = SegmentStimLog(block_name, phase_id, segment_name, segment_start)
         sequence_start_offset = _recording_settle_s(system_config, protocol)
@@ -2350,15 +2891,80 @@ def _run_stim_phase(
                     "initial_connect": False,
                 },
             )
-            (
-                _array,
-                stim_unit_by_electrode,
-                stim_unit_to_dac,
-            ) = configure_poisson_experiment_array(
-                cfg_path,
-                filtered_group,
-                effective_hardware_config,
-            )
+            if _scan_mode_enabled(protocol):
+                scan_map = {
+                    int(key): int(value)
+                    for key, value in (filtered_group.get("scan_stim_unit_by_electrode", {}) or {}).items()
+                }
+                scan_route_groups = [
+                    [int(value) for value in group]
+                    for group in (filtered_group.get("scan_route_groups", []) or [])
+                    if group
+                ]
+                if not scan_route_groups:
+                    raise RuntimeError("Scan mode did not produce any hardware route groups")
+
+                def configure_scan_route_hardware(route_index: int) -> None:
+                    candidates = list(scan_route_groups[route_index])
+                    for _attempt in range(len(candidates) + 1):
+                        configure_group = dict(filtered_group)
+                        configure_group["electrodes"] = candidates
+                        (
+                            _array,
+                            _connected,
+                            _skipped,
+                            configured_units,
+                            configured_unit_to_dac,
+                        ) = resolve_experiment_array(
+                            cfg_path,
+                            configure_group,
+                            effective_hardware_config,
+                            return_hardware_mapping=True,
+                            initial_connect=False,
+                            require_unique_units=False,
+                        )
+                        unit_to_electrodes: dict[int, list[int]] = {}
+                        for electrode in candidates:
+                            if electrode in configured_units:
+                                unit_to_electrodes.setdefault(int(configured_units[electrode]), []).append(electrode)
+                        conflicts = {
+                            unit: values for unit, values in unit_to_electrodes.items() if len(values) > 1
+                        }
+                        if conflicts:
+                            keep: list[int] = []
+                            seen_units: set[int] = set()
+                            for electrode in candidates:
+                                unit = configured_units.get(electrode)
+                                if unit is None or int(unit) in seen_units:
+                                    continue
+                                keep.append(electrode)
+                                seen_units.add(int(unit))
+                            if len(keep) == len(candidates):
+                                raise RuntimeError(
+                                    "Scan route hardware returned unresolved stimulation-unit conflicts: "
+                                    + "; ".join(f"unit {unit}: {values}" for unit, values in sorted(conflicts.items()))
+                                )
+                            candidates = keep
+                            continue
+                        scan_route_groups[route_index] = candidates
+                        stim_unit_by_electrode.clear()
+                        stim_unit_by_electrode.update({int(key): int(value) for key, value in configured_units.items()})
+                        stim_unit_to_dac.clear()
+                        stim_unit_to_dac.update({int(key): int(value) for key, value in configured_unit_to_dac.items()})
+                        return
+                    raise RuntimeError(f"Could not resolve a unique stimulation-unit route for scan band {route_index + 1}")
+
+                configure_scan_route_hardware(0)
+            else:
+                (
+                    _array,
+                    stim_unit_by_electrode,
+                    stim_unit_to_dac,
+                ) = configure_poisson_experiment_array(
+                    cfg_path,
+                    filtered_group,
+                    effective_hardware_config,
+                )
             audit.mark_event(
                 "array_configure_done",
                 block_name,
@@ -2370,8 +2976,12 @@ def _run_stim_phase(
                 },
             )
             logging.info("Plan-based array configured: block=%s stim_units=%d", block_name, len(set(stim_unit_by_electrode.values())))
+        else:
+            _array, stim_unit_by_electrode, stim_unit_to_dac = configure_experiment_array_with_mapping(
+                cfg_path, filtered_group, effective_hardware_config, initial_connect=True,
+            )
         audit.mark_event("recording_file_start", block_name, phase_id, segment_name, extra={"phase_mode": "stimulation"})
-        saving = create_experiment_saving(phase_dir, segment_name)
+        saving = create_experiment_saving(phase_dir, segment_name, record_channels_excluding(cfg_path, filtered_group.get("electrodes", [])))
         record_start_epoch = time.time()
         audit.mark_event("recording_file_started", block_name, phase_id, segment_name, epoch_sec=record_start_epoch)
         logging.info("Recording started: block=%s phase=%s segment=%s", block_name, phase_id, segment_name)
@@ -2399,12 +3009,38 @@ def _run_stim_phase(
             audit.mark_event("recording_settle_done", block_name, phase_id, segment_name, extra={"recording_settle_s": recording_settle_s})
         if _protocol_uses_plan(protocol):
             audit.mark_event("stim_sequence_build_start", block_name, phase_id, segment_name, extra={"protocol_type": protocol_type})
+            scan_route_groups = [
+                [int(value) for value in group]
+                for group in (filtered_group.get("scan_route_groups", []) or [])
+                if group
+            ]
+            def configure_scan_route(event_electrodes, previous_route_key=None):
+                if not scan_route_groups:
+                    return previous_route_key
+                event_set = {int(value) for value in event_electrodes}
+                route_index = next(
+                    (index for index, group in enumerate(scan_route_groups) if event_set.intersection(group)),
+                    0,
+                )
+                if previous_route_key == route_index:
+                    return previous_route_key
+                configure_scan_route_hardware(route_index)
+                audit.mark_event(
+                    "scan_route_configure",
+                    block_name,
+                    phase_id,
+                    segment_name,
+                    extra={"route_index": route_index, "electrode_count": len(scan_route_groups[route_index])},
+                )
+                return route_index
+
             sequence = build_poisson_random_sequence(
                 protocol,
                 plan_rows,
                 stim_unit_by_electrode,
                 stim_unit_to_dac,
                 effective_hardware_config,
+                route_configurator=configure_scan_route if scan_route_groups else None,
             )
             audit.mark_event("stim_sequence_build_done", block_name, phase_id, segment_name, extra={"stim_count": len(stim_times)})
             sequence_start_epoch = time.time()
@@ -2475,13 +3111,16 @@ def _run_stim_phase(
         ),
         signal_dacs=_hardware_dac_config(effective_hardware_config)[0],
     )
+    if sequence is not None:
+        route_records = sequence.route_records
     for index, stim_time in enumerate(stim_times, start=1):
         plan_row = plan_rows[index - 1] if plan_rows else {}
-        epoch_sec = sequence_start_epoch + stim_time
+        epoch_sec = (sequence.sent_epochs[index - 1] if sequence is not None
+                     else sequence_start_epoch + stim_time)
         route_record = route_records[index - 1] if index <= len(route_records) else {}
         stim_extra = {
             "stim_index": index,
-            "stim_time_sec": stim_time + sequence_start_offset,
+            "stim_time_sec": epoch_sec - segment_log.record_start_epoch,
             "plan_time_sec": stim_time,
             "amplitude_mv": plan_row.get("amplitude_mv", protocol.get("amplitude_mv", "")),
             "electrodes": _plan_row_electrodes_text(plan_row, electrode_group),
@@ -2600,18 +3239,316 @@ def _recording_settle_s(system_config: dict[str, Any], protocol: dict[str, Any])
         return 2.0
 
 
-def _effective_electrode_group(protocol: dict[str, Any], electrode_group: dict[str, Any]) -> dict[str, Any]:
+def _runtime_group_electrodes(
+    electrode_group: dict[str, Any],
+    cfg_electrodes: list[int],
+    stim_unit_by_electrode: dict[int, int] | None,
+    reserved_units: set[int] | None = None,
+    recording_rates: dict[int, float] | None = None,
+    rate_threshold: float | None = None,
+    cfg_path: Path | None = None,
+    system_config: dict[str, Any] | None = None,
+    selected_pool: list[int] | None = None,
+) -> list[int] | None:
+    # Keep this local guard for packages generated by older app versions that
+    # may not have emitted the module-level constant.
+    max_route_units = int(globals().get("MAX_STIMULATION_UNITS_PER_ROUTE", 32))
+    if "center_electrode" not in electrode_group:
+        return None
+    center = _group_center_electrode(electrode_group)
+    if center is None:
+        raise RuntimeError(f"Stimulation group {electrode_group.get('name', '')!r} has no center_electrode")
+    count = max(1, int(electrode_group.get("electrode_count", 1) or 1))
+    if not bool(electrode_group.get("multi_electrode", False)):
+        count = 1
+    if count > max_route_units:
+        raise RuntimeError(f"Stimulation group {electrode_group.get('name', '')!r} requests {count} electrodes; MaxOne supports at most {max_route_units} per route")
+    if stim_unit_by_electrode is None:
+        return [center]
+    unit_map = {int(key): int(value) for key, value in stim_unit_by_electrode.items()}
+    reserved = set(reserved_units or set())
+    candidates = sorted(
+        (
+            int(electrode)
+            for electrode in cfg_electrodes
+            if int(electrode) in unit_map
+            and (
+                recording_rates is None
+                or rate_threshold is None
+                or float(recording_rates.get(int(electrode), float("-inf"))) > float(rate_threshold)
+            )
+        ),
+        key=lambda electrode: (_electrode_grid_distance(center, electrode), electrode),
+    )
+    # The configured center is a spatial anchor, not a guarantee that the
+    # hardware exposes a stimulation unit for that electrode. If it is absent
+    # or already reserved, the nearest valid candidate becomes the first
+    # actual stimulation electrode.
+    selected: list[int] = []
+    used_units: set[int] = set()
+    joint_pool = selected_pool if selected_pool is not None else []
+    final_joint_units: dict[int, int] = {}
+    for electrode in candidates:
+        if electrode in joint_pool or electrode in selected:
+            continue
+        unit = unit_map[electrode]
+        if cfg_path is None and (unit in used_units or unit in reserved):
+            continue
+        if cfg_path is not None and system_config is not None:
+            trial_electrodes = _unique_ints([*joint_pool, *selected, electrode])
+            trial_group = {"name": electrode_group.get("name", ""), "electrodes": trial_electrodes}
+            trial_connected, trial_missing, trial_units = probe_stimulation_electrodes(
+                cfg_path,
+                trial_group,
+                system_config,
+            )
+            if trial_missing or trial_connected != trial_electrodes:
+                continue
+            if len(set(trial_units.values())) != len(trial_electrodes):
+                continue
+            final_joint_units = {int(key): int(value) for key, value in trial_units.items()}
+        selected.append(electrode)
+        used_units.add(final_joint_units.get(electrode, unit))
+        if len(selected) >= count:
+            break
+    if len(selected) != count:
+        rate_detail = ""
+        if recording_rates is not None and rate_threshold is not None:
+            rate_detail = f" and firing rate > {float(rate_threshold):.6g} Hz"
+        raise RuntimeError(
+            f"Stimulation group {electrode_group.get('name', '')!r} could only find {len(selected)} electrodes with unique units{rate_detail} near center {center}; requested {count}"
+        )
+    if reserved_units is not None:
+        if final_joint_units:
+            reserved_units.clear()
+            reserved_units.update(final_joint_units.values())
+        else:
+            reserved_units.update(used_units)
+    if selected_pool is not None:
+        selected_pool.extend(electrode for electrode in selected if electrode not in selected_pool)
+    return selected
+
+
+def _scan_mode_factor(scan_cfg: dict[str, Any]) -> int:
+    cfg = scan_cfg or {}
+    raw = str(cfg.get("band_width", cfg.get("mode", "off")) or "off").strip().lower().replace("×", "x")
+    if raw in {"", "off", "none", "0"}:
+        return 0
+    if raw in {"all", "full", "1", "1x"}:
+        return 1
+    if raw in {"2", "3", "4"}:
+        return int(raw)
+    match = re.fullmatch(r"([1-4])x", raw)
+    if match:
+        return max(1, min(4, int(match.group(1))))
+    raise ValueError(f"Unsupported scan band width {raw!r}; use full, 2, 3, 4, or off")
+
+
+def _scan_spatial_event_groups(
+    cfg_electrodes: list[int],
+    stim_unit_by_electrode: dict[int, int],
+    scan_cfg: dict[str, Any],
+) -> list[list[int]]:
+    """Build local multi-electrode sites over equal-width spatial bands."""
+    factor = _scan_mode_factor(scan_cfg)
+    if factor <= 0:
+        return []
+    local_count = max(1, min(3, int(scan_cfg.get("local_electrodes", scan_cfg.get("electrode_count", 1)) or 1)))
+    rows = 5
+    columns = {1: 6, 2: 3, 3: 2}[local_count]
+    candidates = sorted({int(value) for value in cfg_electrodes if int(value) in stim_unit_by_electrode})
+    if not candidates:
+        raise RuntimeError("Scan mode found no CFG electrodes with stimulation units")
+    row_values = [int(value) // 220 for value in candidates]
+    col_values = [int(value) % 220 for value in candidates]
+    row_min, row_max = min(row_values), max(row_values)
+    col_min, col_max = min(col_values), max(col_values)
+    row_span = max(1.0, float(row_max - row_min + 1))
+    col_span = max(1.0, float(col_max - col_min + 1))
+    used_electrodes: set[int] = set()
+    groups: list[list[int]] = []
+    for partition in range(factor):
+        # All sites in one band share a routed stimulation pool. Units may be
+        # reused only after the next band is configured.
+        used_partition_units: set[int] = set()
+        part_start = row_min + row_span * partition / factor
+        part_stop = row_min + row_span * (partition + 1) / factor
+        part_candidates = [value for value in candidates if part_start <= value // 220 < part_stop or (partition == factor - 1 and value // 220 <= row_max)]
+        if not part_candidates:
+            continue
+        part_height = max(1.0, part_stop - part_start)
+        for row_index in range(rows):
+            target_row = part_start + (row_index + 0.5) * part_height / rows
+            for col_index in range(columns):
+                target_col = col_min + (col_index + 0.5) * col_span / columns
+                ranked = sorted(
+                    part_candidates,
+                    key=lambda value: (
+                        (value // 220 - target_row) ** 2 + (value % 220 - target_col) ** 2,
+                        int(stim_unit_by_electrode[value]),
+                        value,
+                    ),
+                )
+                selected: list[int] = []
+                selected_units: set[int] = set()
+                for value in ranked:
+                    unit = int(stim_unit_by_electrode[value])
+                    if value in used_electrodes or unit in used_partition_units or unit in selected_units:
+                        continue
+                    selected.append(int(value))
+                    selected_units.add(unit)
+                    if len(selected) >= local_count:
+                        break
+                if len(selected) < local_count:
+                    continue
+                used_electrodes.update(selected)
+                used_partition_units.update(selected_units)
+                groups.append(selected)
+    if len(groups) < rows * columns * factor:
+        logging.warning("Scan mode selected %d/%d spatial sites because CFG candidates were exhausted", len(groups), rows * columns * factor)
+    return groups
+
+
+def _scan_route_groups(scan_groups: list[list[int]], max_units: int = 30) -> list[list[int]]:
+    """Pack complete local sites into hardware-sized route groups."""
+    limit = max(1, int(max_units))
+    routes: list[list[int]] = []
+    current: list[int] = []
+    current_set: set[int] = set()
+    for raw_group in scan_groups:
+        group = _unique_ints([int(value) for value in raw_group])
+        if not group:
+            continue
+        group_set = set(group)
+        if len(group_set) > limit:
+            raise RuntimeError(f"Scan local site contains {len(group_set)} electrodes, exceeding route limit {limit}")
+        if current and len(current_set | group_set) > limit:
+            routes.append(current)
+            current = []
+            current_set = set()
+        current.extend(value for value in group if value not in current_set)
+        current_set.update(group_set)
+    if current:
+        routes.append(current)
+    return routes
+
+
+def _scan_mode_enabled(protocol: dict[str, Any]) -> bool:
+    return _scan_mode_factor(protocol.get("scan", {}) if isinstance(protocol, dict) else {}) > 0
+
+
+def _effective_electrode_group(
+    protocol: dict[str, Any],
+    electrode_group: dict[str, Any],
+    *,
+    cfg_electrodes: list[int] | None = None,
+    stim_unit_by_electrode: dict[int, int] | None = None,
+    reserved_units: set[int] | None = None,
+    recording_rates: dict[int, float] | None = None,
+    rate_threshold: float | None = None,
+    cfg_path: Path | None = None,
+    system_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     fallback = [int(item) for item in electrode_group.get("electrodes", [])]
+    scan_cfg = protocol.get("scan", {}) if isinstance(protocol, dict) else {}
+    if isinstance(scan_cfg, dict) and _scan_mode_factor(scan_cfg) > 0:
+        if cfg_electrodes is None or stim_unit_by_electrode is None:
+            raise RuntimeError("Scan mode requires a loaded CFG and stimulation-unit scan")
+        scan_groups = _scan_spatial_event_groups(cfg_electrodes, stim_unit_by_electrode, scan_cfg)
+        if not scan_groups:
+            raise RuntimeError("Scan mode could not select any stimulation sites")
+        selection_protocol = dict(protocol)
+        switch_cfg = dict(selection_protocol.get("site_switch", {}) or {})
+        switch_cfg.update({
+            "enabled": True,
+            "selection_mode": str(scan_cfg.get("selection_mode", "random") or "random"),
+            "random_seed": int(scan_cfg.get("random_seed", protocol.get("random_seed", 42))),
+            "event_groups": scan_groups,
+            "event_group_centers": [group[0] for group in scan_groups],
+            "event_group_counts": [len(group) for group in scan_groups],
+        })
+        selection_protocol["site_switch"] = switch_cfg
+        effective = dict(electrode_group)
+        effective["electrodes"] = _unique_ints([item for group in scan_groups for item in group])
+        effective["candidate_source"] = "cfg_spatial_scan"
+        effective["resolved_plan_key"] = "site_switch"
+        effective["resolved_plan_event_groups"] = scan_groups
+        effective["resolved_plan_event_centers"] = [group[0] for group in scan_groups]
+        effective["scan_route_groups"] = _scan_route_groups(scan_groups)
+        effective["scan_stim_unit_by_electrode"] = {int(key): int(value) for key, value in stim_unit_by_electrode.items()}
+        return effective
+    runtime_electrodes = _runtime_group_electrodes(
+        electrode_group,
+        cfg_electrodes or [],
+        stim_unit_by_electrode,
+        reserved_units,
+        recording_rates,
+        rate_threshold,
+    )
+    if runtime_electrodes is not None:
+        fallback = runtime_electrodes
+        if not _protocol_uses_plan(protocol):
+            effective = dict(electrode_group)
+            effective["electrodes"] = runtime_electrodes
+            effective["resolved_from_cfg_units"] = stim_unit_by_electrode is not None
+            return effective
+    selection_protocol = protocol
+    resolved_plan_key: str | None = None
+    resolved_plan_groups: list[list[int]] | None = None
+    resolved_plan_centers: list[int | None] | None = None
+    if cfg_electrodes is not None and stim_unit_by_electrode is not None and _protocol_uses_plan(protocol):
+        selection_protocol = dict(protocol)
+        for switch_key in ("site_switch", "electrode_pool_sequence"):
+            switch_cfg = protocol.get(switch_key)
+            if not isinstance(switch_cfg, dict) or not switch_cfg.get("event_groups"):
+                continue
+            groups_cfg = dict(switch_cfg)
+            centers = list(groups_cfg.get("event_group_centers") or [])
+            counts = list(groups_cfg.get("event_group_counts") or [])
+            resolved_groups: list[list[int]] = []
+            plan_reserved_units: set[int] = set()
+            plan_selected_pool: list[int] = []
+            for index, raw_group in enumerate(groups_cfg.get("event_groups") or []):
+                center = _normalize_site_switch_center(centers[index] if index < len(centers) else None)
+                count = max(1, int(counts[index])) if index < len(counts) else 1
+                if center is None:
+                    resolved_groups.append(_unique_ints(_event_group_values(raw_group)))
+                    continue
+                selected = _runtime_group_electrodes(
+                    {
+                        "name": f"{electrode_group.get('name', '')}:{index}",
+                        "center_electrode": center,
+                        "multi_electrode": count > 1,
+                        "electrode_count": count,
+                    },
+                    cfg_electrodes,
+                    stim_unit_by_electrode,
+                    plan_reserved_units,
+                    recording_rates,
+                    rate_threshold,
+                    cfg_path,
+                    system_config,
+                    plan_selected_pool,
+                )
+                resolved_groups.append(selected or [center])
+            groups_cfg["event_groups"] = resolved_groups
+            selection_protocol[switch_key] = groups_cfg
+            resolved_plan_key = switch_key
+            resolved_plan_groups = resolved_groups
+            resolved_plan_centers = [
+                _normalize_site_switch_center(centers[index] if index < len(centers) else None)
+                for index in range(len(resolved_groups))
+            ]
     if protocol.get("type") == "poisson_random_electrodes":
         candidate_electrodes = select_poisson_candidate_electrodes(protocol, fallback)
         source = "poisson_random_electrodes"
     elif protocol.get("type") == "electrode_pool_sequence":
-        event_groups = electrode_pool_event_groups(protocol, fallback)
+        event_groups = electrode_pool_event_groups(selection_protocol, fallback)
         candidate_electrodes = _unique_ints([electrode for group in event_groups for electrode in group]) or fallback
         source = "electrode_pool_sequence"
     elif _protocol_uses_plan(protocol):
         stim_count = len(get_stim_times_for_protocol(protocol, 24 * 60 * 60))
-        event_groups = site_switch_event_groups_for_count(protocol, fallback, stim_count)
+        event_groups = site_switch_event_groups_for_count(selection_protocol, fallback, stim_count)
         candidate_electrodes = _unique_ints([electrode for group in event_groups for electrode in group]) or fallback
         source = "site_switch"
     else:
@@ -2619,7 +3556,36 @@ def _effective_electrode_group(protocol: dict[str, Any], electrode_group: dict[s
     effective = dict(electrode_group)
     effective["electrodes"] = candidate_electrodes
     effective["candidate_source"] = source
+    if resolved_plan_key is not None and resolved_plan_groups is not None:
+        # These are the actual CFG/unit-resolved electrodes to be used by the
+        # pulse plan. Keep them on the effective group so plan generation does
+        # not fall back to center-only event groups later in the run.
+        effective["resolved_plan_key"] = resolved_plan_key
+        effective["resolved_plan_event_groups"] = resolved_plan_groups
+        effective["resolved_plan_event_centers"] = resolved_plan_centers or []
     return effective
+
+
+def _protocol_with_runtime_plan_groups(
+    protocol: dict[str, Any],
+    electrode_group: dict[str, Any],
+) -> dict[str, Any]:
+    key = electrode_group.get("resolved_plan_key")
+    groups = electrode_group.get("resolved_plan_event_groups")
+    if not isinstance(key, str) or not isinstance(groups, list):
+        return protocol
+    updated = dict(protocol)
+    config = dict(updated.get(key, {}) or {})
+    config["event_groups"] = [list(map(int, group)) for group in groups]
+    centers = electrode_group.get("resolved_plan_event_centers")
+    if isinstance(centers, list):
+        config["event_group_centers"] = [
+            None if center is None else int(center) for center in centers
+        ]
+    updated[key] = config
+    if key == "site_switch":
+        updated["site_switch"] = config
+    return updated
 
 
 def _validate_stimulation_unit_pool_size(protocol: dict[str, Any], electrode_group: dict[str, Any], *, context: str) -> None:
@@ -2710,17 +3676,40 @@ def _replace_unconnectable_poisson_electrodes(
     electrode_group: dict[str, Any],
     system_config: dict[str, Any],
     protocol: dict[str, Any],
+    *,
+    rates: dict[int, float] | None = None,
+    rate_threshold: float | None = None,
 ) -> tuple[dict[str, Any], dict[int, int], list[int]]:
     original_electrodes = [int(item) for item in electrode_group.get("electrodes", [])]
-    rates, random_cfg = poisson_rates_for_electrodes(protocol, original_electrodes, restrict_to_fallback=False)
+    random_cfg = protocol.get("random_electrode_plan", {})
+    rate_map = {
+        int(electrode): float(rate)
+        for electrode, rate in (rates or {}).items()
+        if math.isfinite(float(rate))
+    }
+    if not rate_map:
+        rate_map, random_cfg = poisson_rates_for_electrodes(
+            protocol,
+            original_electrodes,
+            restrict_to_fallback=False,
+        )
+    rate_filter_cfg = protocol.get("stimulation_rate_filter", {})
+    rate_filter_disabled = (
+        isinstance(rate_filter_cfg, dict)
+        and str(rate_filter_cfg.get("threshold_mode", "")).strip().lower()
+        in {"none", "off", "disabled"}
+    )
+    if rate_threshold is None and rate_map and not rate_filter_disabled:
+        rate_threshold = float(statistics.median(rate_map.values()))
     floor = float(random_cfg.get("lambda_floor_hz", 0.001))
     return _replace_unconnectable_stimulation_electrodes(
         cfg_path,
         electrode_group,
-                effective_hardware_config,
+        system_config,
         protocol,
-        rates=rates,
+        rates=rate_map,
         floor=floor,
+        rate_threshold=rate_threshold,
         max_radius=int(random_cfg.get("replacement_max_radius", 10) or 10),
     )
 
@@ -2733,11 +3722,31 @@ def _replace_unconnectable_stimulation_electrodes(
     *,
     rates: dict[int, float] | None = None,
     floor: float = 1.0,
+    rate_threshold: float | None = None,
     max_radius: int | None = None,
     electrode_center_lookup: dict[int, int] | None = None,
 ) -> tuple[dict[str, Any], dict[int, int], list[int]]:
     original_electrodes = _unique_ints([int(item) for item in electrode_group.get("electrodes", [])])
-    rate_map = rates or {electrode: float(floor) for electrode in original_electrodes}
+    rate_map = {
+        int(electrode): float(rate)
+        for electrode, rate in (rates or {}).items()
+        if math.isfinite(float(rate))
+    }
+    rate_filter_cfg = protocol.get("stimulation_rate_filter", {}) if isinstance(protocol, dict) else {}
+    rate_filter_disabled = (
+        isinstance(rate_filter_cfg, dict)
+        and str(rate_filter_cfg.get("threshold_mode", "")).strip().lower()
+        in {"none", "off", "disabled"}
+    )
+    if rate_threshold is None and rate_map and not rate_filter_disabled:
+        rate_threshold = float(statistics.median(rate_map.values()))
+
+    def _rate_ok(electrode: int) -> bool:
+        if rate_threshold is None:
+            return True
+        rate = rate_map.get(int(electrode))
+        return rate is not None and math.isfinite(float(rate)) and float(rate) > float(rate_threshold)
+
     maxwell_cfg = system_config.get("maxwell", {}) if isinstance(system_config, dict) else {}
     protocol_cfg = protocol.get("random_electrode_plan", {}) if isinstance(protocol, dict) else {}
     if max_radius is None:
@@ -2754,49 +3763,37 @@ def _replace_unconnectable_stimulation_electrodes(
         rate_map,
         floor,
     )
-    unresolved_targets = _unique_ints([*missing_electrodes, *stim_unit_conflicts])
+    low_rate_electrodes = [electrode for electrode in primary_electrodes if not _rate_ok(electrode)]
+    if low_rate_electrodes:
+        logging.warning(
+            "Re-selecting stimulation electrodes below firing-rate threshold %.6g Hz: %s",
+            float(rate_threshold),
+            ",".join(str(item) for item in low_rate_electrodes),
+        )
+        low_rate_set = set(low_rate_electrodes)
+        primary_electrodes = [electrode for electrode in primary_electrodes if electrode not in low_rate_set]
+    unresolved_targets = _unique_ints([
+        *missing_electrodes,
+        *stim_unit_conflicts,
+        *low_rate_electrodes,
+    ])
     if not unresolved_targets:
         filtered = dict(electrode_group)
         filtered["electrodes"] = primary_electrodes
+        if rate_threshold is not None:
+            filtered["stimulation_rate_threshold_hz"] = float(rate_threshold)
         return filtered, {}, []
 
     search_radii = _replacement_search_radii(max_radius)
     used = set(primary_electrodes)
-    used_stim_units = {int(stim_unit_by_electrode[electrode]) for electrode in primary_electrodes if electrode in stim_unit_by_electrode}
     missing_set = set(unresolved_targets)
     cfg_electrodes = _cfg_recording_electrodes(cfg_path)
     center_electrode = _group_center_electrode(electrode_group)
     center_lookup = {int(key): int(value) for key, value in (electrode_center_lookup or {}).items()}
-    center_pool = sorted(set(center_lookup.values()) | ({center_electrode} if center_electrode is not None else set()))
-    if center_pool:
-        neighbor_pool = sorted(
-            (candidate for candidate in cfg_electrodes if candidate not in missing_set),
-            key=lambda candidate: (
-                min(_electrode_grid_distance(center, candidate) for center in center_pool),
-                candidate,
-            ),
-        )
-    else:
-        neighbor_pool = sorted(
-            {
-                candidate
-                for electrode in unresolved_targets
-                for candidate in _electrode_neighbors(electrode, max_radius)
-                if candidate not in missing_set and candidate in cfg_electrodes
-            }
-        )
-    probe_group = dict(electrode_group)
-    probe_group["electrodes"] = neighbor_pool
-    if neighbor_pool:
-        connectable_neighbors, _skipped_neighbors, neighbor_stim_units = probe_stimulation_electrodes(
-            cfg_path,
-            probe_group,
-            system_config,
-        )
-        connectable_neighbor_set = set(connectable_neighbors)
-    else:
-        connectable_neighbor_set = set()
-        neighbor_stim_units = {}
+    try:
+        candidate_limit = max(1, int(maxwell_cfg.get("replacement_max_candidates", 128) or 128))
+    except (TypeError, ValueError):
+        candidate_limit = 128
 
     replacements: dict[int, int] = {}
     unresolved: list[int] = []
@@ -2805,7 +3802,7 @@ def _replace_unconnectable_stimulation_electrodes(
         target_center = center_lookup.get(int(electrode), center_electrode)
         for radius in ([None] if target_center is not None else search_radii):
             if target_center is not None:
-                radius_candidates = neighbor_pool
+                radius_candidates = cfg_electrodes
             else:
                 radius_candidates = _electrode_neighbors(electrode, radius)
             ranked = sorted(
@@ -2813,9 +3810,10 @@ def _replace_unconnectable_stimulation_electrodes(
                     candidate
                     for candidate in radius_candidates
                     if (
-                        candidate in connectable_neighbor_set
+                        candidate in cfg_electrodes
                         and candidate not in used
-                        and int(neighbor_stim_units.get(candidate, -1)) not in used_stim_units
+                        and candidate not in missing_set
+                        and _rate_ok(candidate)
                     )
                 ),
                 key=lambda candidate: (
@@ -2823,27 +3821,43 @@ def _replace_unconnectable_stimulation_electrodes(
                     -float(rate_map.get(candidate, floor)),
                     candidate,
                 ),
-            )
-            if ranked:
-                replacement = ranked[0]
+            )[:candidate_limit]
+            for candidate in ranked:
+                # Stimulation-unit allocation is stateful. Validate the
+                # candidate together with every electrode already selected;
+                # a unit observed in a separate probe Array is not reusable
+                # evidence for the final route.
+                trial_electrodes = _unique_ints([*primary_electrodes, *replacements.values(), candidate])
+                trial_group = dict(electrode_group)
+                trial_group["electrodes"] = trial_electrodes
+                trial_connected, trial_missing, trial_units = probe_stimulation_electrodes(
+                    cfg_path,
+                    trial_group,
+                    system_config,
+                )
+                if trial_missing or set(trial_connected) != set(trial_electrodes):
+                    continue
+                if len(set(trial_units.values())) != len(trial_electrodes):
+                    continue
+                replacement = candidate
+                break
+            if replacement is not None:
                 break
         if replacement is None:
             unresolved.append(electrode)
             continue
         replacements[electrode] = replacement
         used.add(replacement)
-        used_stim_units.add(int(neighbor_stim_units[replacement]))
 
-    resolved_electrodes: list[int] = []
-    for electrode in original_electrodes:
-        if electrode in primary_electrodes:
-            resolved_electrodes.append(electrode)
-        elif electrode in replacements:
-            resolved_electrodes.append(replacements[electrode])
+    # Preserve the exact connection order used by the successful incremental
+    # trials; changing it can cause Maxwell to choose a different allocation.
+    resolved_electrodes = _unique_ints([*primary_electrodes, *replacements.values()])
     filtered = dict(electrode_group)
     filtered["electrodes"] = _unique_ints(resolved_electrodes)
+    if rate_threshold is not None:
+        filtered["stimulation_rate_threshold_hz"] = float(rate_threshold)
     if not filtered["electrodes"]:
-        return filtered, replacements, unresolved
+        return filtered, replacements, _unique_ints(unresolved)
     final_connected, _final_missing, final_stim_units = probe_stimulation_electrodes(
         cfg_path,
         filtered,
@@ -2855,10 +3869,16 @@ def _replace_unconnectable_stimulation_electrodes(
         rate_map,
         floor,
     )
-    if final_conflicts:
+    final_low_rate = [electrode for electrode in final_primary if not _rate_ok(electrode)]
+    if final_conflicts or final_low_rate:
         unresolved.extend(final_conflicts)
+        unresolved.extend(final_low_rate)
+        filtered["electrodes"] = [
+            electrode for electrode in final_primary if _rate_ok(electrode)
+        ]
+    else:
         filtered["electrodes"] = final_primary
-    return filtered, replacements, unresolved
+    return filtered, replacements, _unique_ints(unresolved)
 
 
 def _group_center_electrode(electrode_group: dict[str, Any]) -> int | None:
@@ -3173,7 +4193,7 @@ def build_poisson_random_plan(
                     "firing_rate_hz": round(firing_rate, 6),
                     "lambda_hz": round(lambda_hz, 6),
                     "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
-                    "pulse_width_us": float(protocol.get("pulse_width_us", 300.0)),
+                    "pulse_width_us": float(protocol.get("pulse_width_us", 200.0)),
                     "pulses_per_stimulus": 1,
                 }
             )
@@ -3229,7 +4249,7 @@ def build_electrode_pool_sequence_plan(
                 "firing_rate_hz": "",
                 "lambda_hz": "",
                 "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
-                "pulse_width_us": float(protocol.get("pulse_width_us", 300.0)),
+                "pulse_width_us": float(protocol.get("pulse_width_us", 200.0)),
                 "pulses_per_stimulus": 1,
             }
         )
@@ -3278,7 +4298,7 @@ def build_site_switch_plan(
             "firing_rate_hz": "",
             "lambda_hz": "",
             "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
-            "pulse_width_us": float(protocol.get("pulse_width_us", 300.0)),
+            "pulse_width_us": float(protocol.get("pulse_width_us", 200.0)),
             "pulses_per_stimulus": 1,
         }
         if center is not None:
@@ -3402,7 +4422,7 @@ def _normalize_event_center(value: Any) -> int | None:
 
 def _site_switch_pulses_per_event(protocol: dict[str, Any]) -> int:
     protocol_type = str(protocol.get("type", ""))
-    if protocol_type in {"individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
+    if protocol_type in {"individual_burst", "sequence_with_burst", "random", "sequence_with_poisson_burst"}:
         return max(1, int(protocol.get("pulses_per_burst", 1) or 1))
     return 1
 
@@ -3445,6 +4465,12 @@ def _balanced_site_switch_groups(
         rng = random.Random(int(random_seed))
         rng.shuffle(expanded)
         return expanded
+    if mode in {"scan_band_sequence", "band_sequence"}:
+        return [
+            list(group)
+            for group, quota in zip(groups, quotas)
+            for _repeat in range(quota)
+        ]
     ordered: list[list[int]] = []
     used = [0] * len(groups)
     while len(ordered) < target:
@@ -3504,7 +4530,7 @@ def enforce_common_dac_spacing(
     skipped = 0
     max_interval_s = 0.0
     for row in rows:
-        interval_s = (2.0 * float(row.get("pulse_width_us", 300.0)) + max(0.0, float(inter_phase_interval_us))) / 1_000_000.0
+        interval_s = (2.0 * float(row.get("pulse_width_us", 200.0)) + max(0.0, float(inter_phase_interval_us))) / 1_000_000.0
         max_interval_s = max(max_interval_s, interval_s)
         time_s = float(row["time_sec"])
         if time_s + 1e-9 < next_available_s:
@@ -3813,20 +4839,36 @@ def _mx() -> Any:
     return mx
 
 
-def initialize_maxlab() -> None:
+def enable_stimulation_power() -> None:
     mx = _mx()
-    mx.initialize()
     response = mx.send(mx.Core().enable_stimulation_power(True))
     if response != "Ok":
-        raise RuntimeError(f"MaxLab initialization failed: {response}")
-    time.sleep(getattr(mx.Timing, "waitInit", 0))
+        raise RuntimeError(f"MaxLab stimulation power enable failed: {response}")
+
+
+def initialize_maxlab(
+    system_config: dict[str, Any] | None = None,
+    *,
+    power_up_stimulation: bool = True,
+) -> None:
+    mx = _mx()
+    mx.initialize()
+    time.sleep(mx.Timing.waitInit)
+    if power_up_stimulation:
+        enable_stimulation_power()
+    config = (system_config or {}).get("maxwell", {})
+    mx.send(mx.Amplifier().set_gain(int(config.get("amplifier_gain", 512))))
+    mx.set_event_threshold(float(config.get("event_threshold", 5.5)))
 
 
 def _event(properties: str, event_id: int) -> Any:
     mx = _mx()
-    if len(properties.split()) % 2 != 0:
-        raise ValueError("mx.Event properties must be key-value pairs")
-    return mx.Event(0, 1, event_id, properties)
+    tokens = str(properties).split()
+    # Maxwell accepts only key-value pairs. Keep diagnostics best-effort so a
+    # malformed event label never aborts an otherwise valid stimulation.
+    if len(tokens) % 2:
+        tokens.append("none")
+    return mx.Event(0, 1, event_id, " ".join(tokens))
 
 
 def _half_bits(amplitude_mv: float) -> int:
@@ -3873,7 +4915,7 @@ def _default_stim_unit_dac_sources(
     system_config: dict[str, Any] | None = None,
 ) -> dict[int, int]:
     signal_dacs, _neutral_dac, _sync_dual_dac = _hardware_dac_config(system_config)
-    units = sorted({int(value) for value in stim_unit_by_electrode.values()})
+    units = list(dict.fromkeys(int(value) for value in stim_unit_by_electrode.values()))
     return {
         unit: int(signal_dacs[index % len(signal_dacs)])
         for index, unit in enumerate(units)
@@ -3970,238 +5012,134 @@ def _route_signature(
     return units, dac_items
 
 
+class _HostPulseSequence:
+    """D21: switch immediately, wait for the deadline, send one pulse."""
+
+    def __init__(self, protocol, rows, unit_map, unit_sources, system_config, *, switch, route_configurator=None):
+        self.protocol = protocol
+        self.rows = sorted(rows, key=lambda row: float(row["time_sec"]))
+        self.unit_map = unit_map
+        self.unit_sources = unit_sources
+        self.system_config = system_config or {}
+        self.switch = switch
+        self.route_configurator = route_configurator
+        self.sent_epochs = []
+        self.route_records = []
+
+    def send(self):
+        mx = _mx()
+        signal, neutral, sync = _hardware_dac_config(self.system_config)
+        hold = sorted(set(signal) | {neutral})
+        previous = set()
+        previous_sent = None
+        previous_plan = 0.0
+        configured_route_key = None
+        origin = time.time()
+        sample_us = float(self.system_config.get("maxwell", {}).get("sample_us", 50.0))
+        if sample_us <= 0:
+            raise ValueError("sample_us must be positive")
+        self.sent_epochs = []
+        self.route_records = []
+
+        def zero():
+            seq = mx.Sequence(initial_delay=0, persistent=False)
+            _append_dac_codes(seq, hold, 512, sync_dual_dac=sync)
+            seq.send()
+
+        try:
+            for index, row in enumerate(self.rows, 1):
+                electrodes = _row_electrodes(row)
+                connected_at = None
+                if self.switch:
+                    if self.route_configurator is not None:
+                        configured_route_key = self.route_configurator(electrodes, configured_route_key)
+                    electrodes = [electrode for electrode in electrodes if electrode in self.unit_map]
+                units = {int(self.unit_map[e]) for e in electrodes}
+                sources = (_event_unit_dac_sources(electrodes, self.unit_map, signal)
+                           if self.switch else self.unit_sources)
+                active = sorted({sources[u] for u in units})
+                if row.get("channel") is not None:
+                    active = [int(row["channel"])]
+                if self.switch:
+                    zero()
+                    for unit in sorted(previous - units):
+                        mx.send(mx.StimulationUnit(unit).connect(False))
+                    for electrode in sorted(set(electrodes)):
+                        unit = int(self.unit_map[electrode])
+                        mx.send(mx.StimulationUnit(unit).power_up(True).connect(True)
+                                .set_voltage_mode().dac_source(sources[unit]))
+                    connected_at = time.time()
+                planned = float(row["time_sec"])
+                deadline = (origin + planned if previous_sent is None else
+                            previous_sent + max(0.0, planned - previous_plan))
+                time.sleep(max(0.0, deadline - time.time()))
+                amplitude = float(row.get("amplitude_mv", self.protocol.get("amplitude_mv", 150.0)))
+                lsb = float(mx.query_DAC_lsb_mV())
+                if lsb <= 0:
+                    raise ValueError("DAC LSB must be positive")
+                bits = int(round(abs(amplitude) / lsb))
+                if not 1 <= bits <= 511:
+                    raise ValueError(f"Stimulation amplitude out of DAC range: {amplitude}")
+                width = float(row.get("pulse_width_us", self.protocol.get("pulse_width_us", 200.0)))
+                phase_samples = max(1, int(round(width / sample_us)))
+                pulse = mx.Sequence(initial_delay=100, persistent=False)
+                electrode_text = "-".join(map(str, electrodes)) or "none"
+                pulse.append(_event(f"type stim mode {'pool_fast_switch' if self.switch else 'single_connect'} "
+                                    f"pulse {index}/{len(self.rows)} electrodes {electrode_text}", index))
+                _append_dac_codes(pulse, hold, 512, sync_dual_dac=sync)
+                inactive = sorted(set(hold) - set(active))
+                for code in (512 - bits, 512 + bits):
+                    _append_dac_codes(pulse, active, code, sync_dual_dac=sync)
+                    _append_dac_codes(pulse, inactive, 512, sync_dual_dac=sync)
+                    pulse.append(mx.DelaySamples(phase_samples))
+                _append_dac_codes(pulse, hold, 512, sync_dual_dac=sync)
+                sent = time.time()
+                pulse.send()
+                self.sent_epochs.append(sent)
+                self.route_records.append({
+                    "stim_index": index, "pulse_time_s": sent - origin,
+                    "route_switch": self.switch, "connect_epoch": connected_at,
+                    "connect_time_s": None if connected_at is None else connected_at - origin,
+                    "settle_ms": 0.0 if connected_at is None else (sent - connected_at) * 1000.0,
+                    "previous_stim_units": sorted(previous), "target_stim_units": sorted(units),
+                    "active_dac_sources": active,
+                    "stim_unit_to_event_dac": {u: sources[u] for u in units},
+                    "electrodes": electrodes, "timing_source": "host_send",
+                })
+                previous = units
+                previous_sent, previous_plan = sent, planned
+        finally:
+            if self.switch:
+                zero()
+                for unit in sorted(set(self.unit_map.values())):
+                    mx.send(mx.StimulationUnit(unit).connect(False))
+        time.sleep(float(self.protocol.get("tail_wait_sec", 0.5)))
+
+
 def build_stim_sequence(
-    protocol: dict[str, Any],
-    electrode_group_name: str,
-    *,
-    stim_unit_by_electrode: dict[int, int] | None = None,
-    stim_unit_to_dac: dict[int, int] | None = None,
-    electrode_group_electrodes: list[int] | None = None,
-    system_config: dict[str, Any] | None = None,
-) -> Any:
-    mx = _mx()
-    seq = mx.Sequence(initial_delay=100, persistent=False)
-    name = str(protocol.get("name", "stim"))
-    width_us = float(protocol.get("pulse_width_us", 300.0))
-    ipi_us = float(protocol.get("inter_phase_interval_us", 0.0))
-    signal_dacs, neutral_dac, sync_dual_dac = _hardware_dac_config(system_config)
-    unit_map = {int(key): int(value) for key, value in (stim_unit_by_electrode or {}).items()}
-    unit_to_dac = {int(key): int(value) for key, value in (stim_unit_to_dac or {}).items()}
-    if unit_map and not unit_to_dac:
-        unit_to_dac = _default_stim_unit_dac_sources(unit_map, system_config)
-    target_electrodes = [int(value) for value in (electrode_group_electrodes or [])]
-    active_dacs = _active_dac_sources(target_electrodes, unit_map, unit_to_dac) or list(signal_dacs)
-    hold_dacs = sorted(set(signal_dacs) | {int(neutral_dac)})
-    event_id = 1
-
-    def pulse(
-        amplitude_mv: float,
-        event_index: int,
-        duration_us: float = width_us,
-        pulse_dacs: list[int] | None = None,
-    ) -> float:
-        bits = _half_bits(amplitude_mv)
-        current_dacs = sorted({int(value) for value in (pulse_dacs or active_dacs)})
-        seq.append(
-            _event(
-                f"type stim name {name} amplitude_mv {amplitude_mv} "
-                f"electrode_group {electrode_group_name} "
-                f"dac_sources {','.join(str(value) for value in current_dacs)}",
-                event_index,
-            )
-        )
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        _append_dac_codes(seq, current_dacs, 512 - bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        if ipi_us > 0:
-            seq.append(mx.DelaySamples(_samples_us(ipi_us)))
-        _append_dac_codes(seq, current_dacs, 512 + bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
-
-    ptype = protocol.get("type")
-    if ptype in {"single_pulse", "individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
-        current_ms = 0.0
-        for stim_ms in _scheduled_stim_times_ms(protocol):
-            if stim_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))
-            current_ms = max(current_ms, stim_ms) + pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
-            event_id += 1
-    elif ptype == "custom_sequence":
-        current_ms = 0.0
-        for point in sorted(protocol.get("custom_points", []), key=lambda item: float(item["time_ms"])):
-            point_ms = float(point["time_ms"])
-            if point_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            point_dacs = (
-                [int(point["channel"])]
-                if "channel" in point and str(point.get("channel", "")).strip()
-                else None
-            )
-            pulse_width_ms = pulse(
-                float(point["amplitude_mv"]),
-                event_id,
-                float(point.get("duration_us", width_us)),
-                point_dacs,
-            )
-            event_id += 1
-            current_ms = max(current_ms, point_ms) + pulse_width_ms
+    protocol, electrode_group_name, *, stim_unit_by_electrode=None,
+    stim_unit_to_dac=None, electrode_group_electrodes=None, system_config=None,
+):
+    if protocol.get("type") == "custom_sequence":
+        rows = [dict(point, time_sec=float(point["time_ms"]) / 1000.0,
+                     pulse_width_us=point.get("duration_us", protocol.get("pulse_width_us", 200.0)))
+                for point in protocol.get("custom_points", [])]
     else:
-        raise ValueError(f"Unsupported protocol type: {ptype}")
-    return seq
+        rows = [{"time_sec": value / 1000.0} for value in _scheduled_stim_times_ms(protocol)]
+    for row in rows:
+        row["electrodes"] = list(electrode_group_electrodes or [])
+    unit_map = stim_unit_by_electrode or {}
+    sources = stim_unit_to_dac or _default_stim_unit_dac_sources(unit_map, system_config)
+    return _HostPulseSequence(protocol, rows, unit_map, sources, system_config, switch=False)
 
 
 def build_poisson_random_sequence(
-    protocol: dict[str, Any],
-    plan_rows: list[dict[str, Any]],
-    stim_unit_by_electrode: dict[int, int],
-    stim_unit_to_dac: dict[int, int] | None = None,
-    system_config: dict[str, Any] | None = None,
-) -> Any:
-    mx = _mx()
-    seq = mx.Sequence(initial_delay=100, persistent=False)
-    name = str(protocol.get("name", "poisson_random"))
-    width_us_default = float(protocol.get("pulse_width_us", 300.0))
-    ipi_us = float(protocol.get("inter_phase_interval_us", 0.0) or 0.0)
-    signal_dacs, neutral_dac, sync_dual_dac = _hardware_dac_config(system_config)
-    normalized_unit_map = {int(key): int(value) for key, value in stim_unit_by_electrode.items()}
-    normalized_unit_to_dac = {
-        int(key): int(value)
-        for key, value in (stim_unit_to_dac or {}).items()
-    }
-    if not normalized_unit_to_dac:
-        normalized_unit_to_dac = _default_stim_unit_dac_sources(normalized_unit_map, system_config)
-    hold_dacs = sorted(set(signal_dacs) | {int(neutral_dac)})
-    current_ms = 0.0
-    event_id = 1
-    connected_stim_unit: set[int] | None = None
-    connected_route_signature: tuple[tuple[int, ...], tuple[tuple[int, int], ...]] | None = None
-    connect_settle_ms = _plan_connect_settle_ms(protocol)
-    event_level_switch = _event_level_switch_enabled(protocol)
-
-    def pulse(
-        amplitude_mv: float,
-        event_index: int,
-        duration_us: float,
-        active_dacs: list[int],
-        target_units: list[int],
-    ) -> float:
-        bits = _half_bits(amplitude_mv)
-        seq.append(
-            _event(
-                f"type stim name {name} amplitude_mv {amplitude_mv} "
-                f"stim_units {','.join(str(value) for value in target_units)} "
-                f"dac_sources {','.join(str(value) for value in active_dacs)}",
-                event_index,
-            )
-        )
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        _append_dac_codes(seq, active_dacs, 512 - bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        if ipi_us > 0:
-            seq.append(mx.DelaySamples(_samples_us(ipi_us)))
-        _append_dac_codes(seq, active_dacs, 512 + bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
-
-    for row in sorted(plan_rows, key=lambda item: (float(item["time_sec"]), int(item.get("electrode", 0)))):
-        row_electrodes = _row_electrodes(row)
-        if not row_electrodes:
-            continue
-        missing = [electrode for electrode in row_electrodes if electrode not in stim_unit_by_electrode]
-        if missing:
-            raise RuntimeError(f"No stimulation unit configured for stimulation electrode(s): {','.join(str(item) for item in missing)}")
-        target_stim_units = {
-            int(normalized_unit_map[electrode])
-            for electrode in row_electrodes
-        }
-        target_unit_list = sorted(target_stim_units)
-        event_unit_to_dac = (
-            _event_unit_dac_sources(row_electrodes, normalized_unit_map, signal_dacs)
-            if event_level_switch
-            else {
-                int(unit): int(normalized_unit_to_dac[unit])
-                for unit in target_unit_list
-                if unit in normalized_unit_to_dac
-            }
-        )
-        route_signature = _route_signature(
-            target_unit_list,
-            event_unit_to_dac if event_level_switch else None,
-            normalized_unit_to_dac,
-            event_level_switch=event_level_switch,
-        )
-        active_dacs = sorted(set(event_unit_to_dac.values()))
-        if not active_dacs:
-            raise RuntimeError(
-                "No DAC source configured for stimulation electrodes: "
-                + ",".join(str(item) for item in row_electrodes)
-            )
-        point_ms = float(row["time_sec"]) * 1000.0
-        current_units = set() if connected_stim_unit is None else set(connected_stim_unit)
-        route_changed = (
-            connected_route_signature is None
-            or connected_route_signature != route_signature
-            or (not event_level_switch and current_units != target_stim_units)
-        )
-        switch_needed = bool(route_changed)
-        if route_changed and connect_settle_ms > 0.0:
-            switch_ms = max(current_ms, point_ms - connect_settle_ms)
-            if switch_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(switch_ms - current_ms)))
-                current_ms = switch_ms
-        elif point_ms > current_ms:
-            seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            current_ms = point_ms
-        if switch_needed:
-            if event_level_switch:
-                _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-            for stim_unit in sorted(current_units - target_stim_units):
-                seq.append(mx.StimulationUnit(stim_unit).connect(False))
-            units_to_activate = (
-                sorted(target_stim_units)
-                if event_level_switch
-                else sorted(target_stim_units - current_units)
-            )
-            for stim_unit in units_to_activate:
-                source = int(
-                    event_unit_to_dac.get(
-                        stim_unit,
-                        normalized_unit_to_dac.get(stim_unit, signal_dacs[0]),
-                    )
-                )
-                if event_level_switch:
-                    seq.append(
-                        mx.StimulationUnit(stim_unit)
-                        .power_up(True)
-                        .connect(True)
-                        .set_voltage_mode()
-                        .dac_source(source)
-                    )
-                else:
-                    seq.append(mx.StimulationUnit(stim_unit).connect(True))
-            connected_stim_unit = set(target_stim_units)
-            connected_route_signature = route_signature
-        if point_ms > current_ms:
-            seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            current_ms = point_ms
-        duration_ms = pulse(
-            float(row.get("amplitude_mv", protocol.get("amplitude_mv", 150.0))),
-            event_id,
-            float(row.get("pulse_width_us", width_us_default)),
-            active_dacs,
-            target_unit_list,
-        )
-        event_id += 1
-        current_ms = max(current_ms, point_ms) + duration_ms
-    if connected_stim_unit is not None:
-        if event_level_switch:
-            _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        for stim_unit in sorted(connected_stim_unit):
-            seq.append(mx.StimulationUnit(stim_unit).connect(False))
-    return seq
+    protocol, plan_rows, stim_unit_by_electrode, stim_unit_to_dac=None, system_config=None,
+    route_configurator=None,
+):
+    return _HostPulseSequence(protocol, plan_rows, stim_unit_by_electrode,
+                              stim_unit_to_dac or {}, system_config, switch=True,
+                              route_configurator=route_configurator)
 
 
 def _plan_connect_settle_ms(protocol: dict[str, Any]) -> float:
@@ -4254,6 +5192,7 @@ def resolve_experiment_array(
     return_stim_units: bool = False,
     return_hardware_mapping: bool = False,
     initial_connect: bool = True,
+    require_unique_units: bool = True,
 ) -> Any:
     mx = _mx()
     electrodes = [int(item) for item in electrode_group.get("electrodes", [])]
@@ -4272,25 +5211,47 @@ def resolve_experiment_array(
     if not cfg_path.is_file():
         raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
     array.load_config(str(cfg_path))
-    stim_units = []
     stim_unit_by_electrode: dict[int, int] = {}
     connected_electrodes: list[int] = []
     skipped_electrodes: list[int] = []
+    # Maxwell can revise an earlier allocation when a later electrode is
+    # connected. Query only after every connection request has completed so
+    # the returned mapping describes the final shared Array state.
     for electrode in electrodes:
         try:
             array.connect_electrode_to_stimulation(electrode)
-            stim_unit = array.query_stimulation_at_electrode(electrode)
-            if len(stim_unit) == 0:
-                raise RuntimeError(f"No stimulation unit can connect to electrode {electrode}")
         except Exception:
             if allow_missing_electrodes:
                 skipped_electrodes.append(electrode)
                 continue
             raise
-        stim_unit_int = int(stim_unit)
-        stim_units.append(stim_unit_int)
         connected_electrodes.append(electrode)
-        stim_unit_by_electrode[electrode] = stim_unit_int
+    queried_electrodes: list[int] = []
+    for electrode in connected_electrodes:
+        try:
+            stim_unit = array.query_stimulation_at_electrode(electrode)
+            if stim_unit is None or (isinstance(stim_unit, str) and not stim_unit.strip()):
+                raise RuntimeError(f"No stimulation unit can connect to electrode {electrode}")
+            stim_unit_by_electrode[electrode] = int(stim_unit)
+            queried_electrodes.append(electrode)
+        except Exception:
+            if allow_missing_electrodes:
+                skipped_electrodes.append(electrode)
+                continue
+            raise
+    connected_electrodes = queried_electrodes
+    if require_unique_units:
+        unit_to_electrodes: dict[int, list[int]] = {}
+        for electrode, stim_unit in stim_unit_by_electrode.items():
+            unit_to_electrodes.setdefault(int(stim_unit), []).append(int(electrode))
+        conflicts = {unit: mapped for unit, mapped in unit_to_electrodes.items() if len(mapped) > 1}
+        if conflicts:
+            details = "; ".join(f"unit {unit}: {mapped}" for unit, mapped in sorted(conflicts.items()))
+            raise RuntimeError(
+                "Each stimulation electrode must have a unique stimulation unit; "
+                f"allocation conflicts detected ({details})"
+            )
+    stim_units = list(stim_unit_by_electrode.values())
     explicit_unit_sources = {
         int(key): int(value)
         for key, value in (source_by_stim_unit or {}).items()
@@ -4331,8 +5292,18 @@ def resolve_experiment_array(
             return array, connected_electrodes, skipped_electrodes, stim_unit_by_electrode
         return array, connected_electrodes, skipped_electrodes
     mx.activate([0])
+    array.download()
+    time.sleep(mx.Timing.waitAfterDownload)
+    mx.offset()
+    device = str(system_config.get("maxwell", {}).get("device", "maxone")).lower()
+    offset_wait = mx.Timing.waitInMX2Offset if device == "maxtwo" else mx.Timing.waitInMX1Offset
+    time.sleep(offset_wait + getattr(mx.Timing, "waitAfterOffset", 0.0))
+    signal, neutral, sync = _hardware_dac_config(system_config)
+    zero = mx.Sequence(initial_delay=0, persistent=False)
+    _append_dac_codes(zero, sorted(set(signal) | {neutral}), 512, sync_dual_dac=sync)
+    zero.send()
     _signal_dacs, neutral_dac, _sync_dual_dac = _hardware_dac_config(system_config)
-    for stim_unit in sorted(set(stim_units)):
+    for stim_unit in dict.fromkeys(stim_units):
         initial_source = (
             int(neutral_dac)
             if not initial_connect
@@ -4345,9 +5316,7 @@ def resolve_experiment_array(
             .set_voltage_mode()
             .dac_source(initial_source)
         )
-    array.download([0])
-    time.sleep(getattr(mx.Timing, "waitAfterDownload", 0))
-    mx.offset()
+    mx.clear_events()
     if return_hardware_mapping:
         return array, connected_electrodes, skipped_electrodes, stim_unit_by_electrode, stim_unit_sources
     if return_stim_units:
@@ -4369,6 +5338,7 @@ def probe_stimulation_electrodes(
             allow_missing_electrodes=True,
             probe_only=True,
             return_stim_units=True,
+            require_unique_units=False,
         )
         return connected, skipped, stim_units
 
@@ -4386,11 +5356,105 @@ def probe_stimulation_electrodes(
             allow_missing_electrodes=True,
             probe_only=True,
             return_stim_units=True,
+            require_unique_units=False,
         )
         connected_all.extend(int(item) for item in connected)
         skipped_all.extend(int(item) for item in skipped)
         stim_units_all.update({int(electrode): int(stim_unit) for electrode, stim_unit in stim_units.items()})
     return connected_all, skipped_all, stim_units_all
+
+
+def probe_stimulation_electrode_detail(
+    cfg_path: Path,
+    electrode: int,
+    system_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the uncollapsed reason for one electrode's unit allocation."""
+    detail: dict[str, Any] = {
+        "electrode": int(electrode),
+        "cfg_present": bool(cfg_path.is_file()),
+        "cfg_loaded": False,
+        "connect_ok": False,
+        "query_ok": False,
+        "status": "unknown",
+        "stim_unit": None,
+        "query_raw_repr": None,
+        "reset_error": None,
+        "load_error": None,
+        "connect_error": None,
+        "query_error": None,
+    }
+    if not detail["cfg_present"]:
+        detail["status"] = "cfg_missing"
+        return detail
+    try:
+        mx = _mx()
+        array = mx.Array("stimulation")
+        try:
+            array.reset()
+            array.clear_selected_electrodes()
+        except Exception as exc:
+            detail["reset_error"] = f"{type(exc).__name__}: {exc}"
+            detail["status"] = "reset_failed"
+            return detail
+        try:
+            array.load_config(str(cfg_path))
+            detail["cfg_loaded"] = True
+        except Exception as exc:
+            detail["load_error"] = f"{type(exc).__name__}: {exc}"
+            detail["status"] = "cfg_load_failed"
+            return detail
+        try:
+            array.connect_electrode_to_stimulation(int(electrode))
+            detail["connect_ok"] = True
+        except Exception as exc:
+            detail["connect_error"] = f"{type(exc).__name__}: {exc}"
+            detail["status"] = "connect_failed"
+            return detail
+        try:
+            raw_unit = array.query_stimulation_at_electrode(int(electrode))
+            detail["query_raw_repr"] = repr(raw_unit)
+            if raw_unit is None or (isinstance(raw_unit, str) and not raw_unit.strip()):
+                detail["status"] = "no_stimulation_unit"
+                return detail
+            detail["stim_unit"] = int(raw_unit)
+            detail["query_ok"] = True
+            detail["status"] = "assigned_unit"
+            return detail
+        except Exception as exc:
+            detail["query_error"] = f"{type(exc).__name__}: {exc}"
+            detail["status"] = "query_failed"
+            return detail
+    except Exception as exc:
+        detail["status"] = "probe_failed"
+        detail["probe_error"] = f"{type(exc).__name__}: {exc}"
+        return detail
+
+
+def scan_cfg_stimulation_units(
+    cfg_path: Path,
+    cfg_electrodes: list[int],
+    system_config: dict[str, Any],
+) -> tuple[dict[int, int], list[int], list[dict[str, Any]]]:
+    """Probe CFG electrodes one at a time and return the hardware unit map.
+
+    Maxwell allocates stimulation units from the loaded CFG rather than from
+    the numeric electrode ID.  Probing one electrode per temporary Array is
+    deliberately conservative: it prevents a multi-electrode probe from
+    creating duplicate-unit false positives while selecting a stimulation
+    group.
+    """
+    unit_map: dict[int, int] = {}
+    unresolved: list[int] = []
+    diagnostics: list[dict[str, Any]] = []
+    for electrode in sorted({int(value) for value in cfg_electrodes}):
+        detail = probe_stimulation_electrode_detail(cfg_path, electrode, system_config)
+        if detail.get("status") == "assigned_unit" and detail.get("stim_unit") is not None:
+            unit_map[int(electrode)] = int(detail["stim_unit"])
+        else:
+            unresolved.append(int(electrode))
+        diagnostics.append(detail)
+    return unit_map, unresolved, diagnostics
 
 
 def configure_experiment_array(
@@ -4454,12 +5518,38 @@ def configure_poisson_experiment_array(
     return array, stim_unit_by_electrode, stim_unit_to_dac
 
 
-def create_experiment_saving(run_dir: Path, file_name: str) -> Any:
+def record_channels_excluding(cfg_path: Path, electrodes: list[int]) -> list[int]:
+    import re
+    excluded = set(map(int, electrodes))
+    text = cfg_path.read_text(encoding="utf-8", errors="replace")
+    channels = sorted({int(ch) for ch, el in re.findall(r"(\d+)\((\d+)\)", text)
+                       if int(el) not in excluded})
+    if not channels:
+        raise ValueError("No recording channels remain in the CFG mapping")
+    return channels
+
+
+def prepare_recording_only(cfg_path: Path, system_config: dict[str, Any]) -> None:
+    mx = _mx()
+    array = mx.Array("stimulation")
+    array.load_config(str(cfg_path))
+    mx.activate([0])
+    array.download()
+    time.sleep(mx.Timing.waitAfterDownload)
+    mx.offset()
+    device = str(system_config.get("maxwell", {}).get("device", "maxone")).lower()
+    offset_wait = mx.Timing.waitInMX2Offset if device == "maxtwo" else mx.Timing.waitInMX1Offset
+    time.sleep(offset_wait + getattr(mx.Timing, "waitAfterOffset", 0.0))
+    mx.clear_events()
+
+
+def create_experiment_saving(run_dir: Path, file_name: str, record_channels: list[int]) -> Any:
     mx = _mx()
     saving = mx.Saving()
     saving.open_directory(str(run_dir))
+    saving.group_delete_all()
+    saving.group_define(0, "exp", record_channels)
     saving.start_file(file_name)
-    saving.group_define(0, "all_channels", list(range(1024)))
     saving.start_recording([0])
     return saving
 
@@ -4484,6 +5574,18 @@ def _scheduled_stim_times_ms(protocol: dict[str, Any]) -> list[float]:
         else:
             interval = _pulse_interval_ms(protocol)
             times_ms.extend(start_ms + i * interval for i in range(int(protocol.get("pulses_per_burst", 5))))
+    elif ptype == "random":
+        burst_starts = _random_burst_starts_ms(protocol)
+        if _randomize_burst_pulse_intervals(protocol):
+            rng = random.Random(_burst_pulse_interval_seed(protocol))
+            for burst_start in burst_starts:
+                for offset_ms in _burst_pulse_offsets_ms(protocol, rng):
+                    times_ms.append(burst_start + offset_ms)
+        else:
+            interval = _pulse_interval_ms(protocol)
+            for burst_start in burst_starts:
+                for pulse_index in range(int(protocol.get("pulses_per_burst", 5))):
+                    times_ms.append(burst_start + pulse_index * interval)
     elif ptype in {"sequence_with_burst", "sequence_with_poisson_burst"}:
         interval = _pulse_interval_ms(protocol)
         burst_starts = _burst_starts_ms(protocol, poisson=(ptype == "sequence_with_poisson_burst"))
@@ -4529,6 +5631,7 @@ def _randomize_burst_pulse_intervals(protocol: dict[str, Any]) -> bool:
 
 
 def _burst_pulse_interval_seed(protocol: dict[str, Any]) -> int:
+    random_cfg = protocol.get("random", {}) or {}
     seed_payload = json.dumps(
         {
             "name": protocol.get("name", ""),
@@ -4543,7 +5646,12 @@ def _burst_pulse_interval_seed(protocol: dict[str, Any]) -> int:
             "burst_pulse_interval_max_ms": protocol.get("burst_pulse_interval_max_ms", 100.0),
             "random_seed": protocol.get("random_seed", 42),
             "amplitude_mv": protocol.get("amplitude_mv", 150.0),
-            "pulse_width_us": protocol.get("pulse_width_us", 300.0),
+            "pulse_width_us": protocol.get("pulse_width_us", 200.0),
+            "random_distribution": random_cfg.get("distribution", protocol.get("random_distribution", "poisson")),
+            "random_lambda_hz": random_cfg.get("lambda_hz", protocol.get("random_lambda_hz", 5.0)),
+            "random_interval_min_ms": random_cfg.get("interval_min_ms", protocol.get("random_interval_min_ms", 100.0)),
+            "random_interval_max_ms": random_cfg.get("interval_max_ms", protocol.get("random_interval_max_ms", 1000.0)),
+            "random_duration_s": random_cfg.get("duration_s", protocol.get("random_duration_s", 60.0)),
         },
         sort_keys=True,
     )
@@ -4571,6 +5679,58 @@ def _burst_interval_ms(protocol: dict[str, Any]) -> float:
     return 1000.0 / max(float(protocol.get("burst_frequency_hz", 5.0)), 0.001)
 
 
+def _random_burst_starts_ms(protocol: dict[str, Any]) -> list[float]:
+    random_cfg = protocol.get("random", {}) or {}
+    start_ms = float(protocol.get("start_ms", 0.0))
+    duration_s = max(0.0, float(random_cfg.get("duration_s", protocol.get("duration_s", 60.0))))
+    if duration_s <= 0.0:
+        return [start_ms]
+    stop_ms = start_ms + duration_s * 1000.0
+    distribution = str(random_cfg.get("distribution", protocol.get("random_distribution", "poisson")) or "poisson").strip().lower()
+    lambda_hz = max(float(random_cfg.get("lambda_hz", protocol.get("random_lambda_hz", 5.0))), 1e-9)
+    minimum = max(0.0, float(random_cfg.get("interval_min_ms", protocol.get("random_interval_min_ms", 100.0))))
+    maximum = max(minimum, float(random_cfg.get("interval_max_ms", protocol.get("random_interval_max_ms", 1000.0))))
+    seed_payload = json.dumps(
+        {
+            "name": protocol.get("name", ""),
+            "type": protocol.get("type", ""),
+            "start_ms": start_ms,
+            "burst_count": int(protocol.get("burst_count", 3)),
+            "burst_frequency_hz": float(protocol.get("burst_frequency_hz", 5.0)),
+            "random_distribution": distribution,
+            "random_lambda_hz": lambda_hz,
+            "random_interval_min_ms": minimum,
+            "random_interval_max_ms": maximum,
+            "random_duration_s": duration_s,
+            "pulses_per_burst": int(protocol.get("pulses_per_burst", 5)),
+            "pulse_frequency_hz": float(protocol.get("pulse_frequency_hz", 20.0)),
+            "randomize_burst_pulse_intervals": protocol.get("randomize_burst_pulse_intervals", False),
+            "burst_pulse_interval_min_ms": float(protocol.get("burst_pulse_interval_min_ms", 10.0)),
+            "burst_pulse_interval_max_ms": float(protocol.get("burst_pulse_interval_max_ms", 100.0)),
+            "random_seed": protocol.get("random_seed", random_cfg.get("random_seed", 42)),
+            "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
+            "pulse_width_us": float(protocol.get("pulse_width_us", 200.0)),
+        },
+        sort_keys=True,
+    )
+    seed = int(hashlib.sha256(seed_payload.encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    starts = [start_ms]
+    current_ms = start_ms
+    for _index in range(200_000):
+        if distribution in {"poisson", "exponential"}:
+            interval_ms = minimum + rng.expovariate(lambda_hz) * 1000.0
+        elif distribution in {"uniform", "flat"}:
+            interval_ms = rng.uniform(minimum, maximum)
+        else:
+            raise ValueError(f"Unsupported random burst distribution: {distribution}")
+        current_ms += max(0.001, interval_ms)
+        if current_ms > stop_ms:
+            break
+        starts.append(current_ms)
+    return starts
+
+
 def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
     burst_count = max(0, int(protocol.get("burst_count", 3)))
     start_ms = float(protocol.get("start_ms", 0.0))
@@ -4590,7 +5750,7 @@ def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
                 "pulses_per_burst": int(protocol.get("pulses_per_burst", 5)),
                 "pulse_frequency_hz": float(protocol.get("pulse_frequency_hz", 20.0)),
                 "amplitude_mv": float(protocol.get("amplitude_mv", 150.0)),
-                "pulse_width_us": float(protocol.get("pulse_width_us", 300.0)),
+                "pulse_width_us": float(protocol.get("pulse_width_us", 200.0)),
             },
             sort_keys=True,
         )

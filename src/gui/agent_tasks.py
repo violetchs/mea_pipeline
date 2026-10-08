@@ -60,6 +60,11 @@ try:
 except ImportError as exc:  # pragma: no cover - GUI import guard.
     raise SystemExit("PySide6 is required for Agent Custom Code.") from exc
 
+try:
+    from .i18n import LocalizedLogTextEdit
+except ImportError:  # pragma: no cover - direct ``gui`` package execution.
+    from gui.i18n import LocalizedLogTextEdit
+
 
 RawProvider = Callable[[], list[dict]]
 ProcessedProvider = Callable[[], list[dict]]
@@ -837,7 +842,7 @@ class AgentEnvironmentCheckDialog(QDialog):
         self.steps.setHorizontalHeaderLabels(["Step", "Status", "Details"])
         self.steps.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.steps.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.log = QTextEdit()
+        self.log = LocalizedLogTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas", 8))
         self.log.document().setMaximumBlockCount(2000)
@@ -1234,7 +1239,7 @@ class AgentCustomCodeDialog(QDialog):
         self.delete_button = QPushButton("Delete")
         self.delete_button.clicked.connect(self._delete_selected_module)
 
-        self.log = QTextEdit()
+        self.log = LocalizedLogTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Consolas", 8))
         self.log.setMinimumHeight(150)

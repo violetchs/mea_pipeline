@@ -29,13 +29,17 @@ def _mx() -> Any:
     return mx
 
 
-def initialize_maxlab() -> None:
+def initialize_maxlab(system_config: dict[str, Any] | None = None) -> None:
     mx = _mx()
     mx.initialize()
+    time.sleep(mx.Timing.waitInit)
     response = mx.send(mx.Core().enable_stimulation_power(True))
     if response != "Ok":
         raise RuntimeError(f"MaxLab initialization failed: {response}")
-    time.sleep(getattr(mx.Timing, "waitInit", 0))
+    config = (system_config or {}).get("maxwell", {})
+    mx.send(mx.Amplifier().set_gain(int(config.get("amplifier_gain", 512))))
+    mx.set_event_threshold(float(config.get("event_threshold", 5.5)))
+
 
 
 def _event(properties: str, event_id: int) -> Any:
@@ -89,11 +93,12 @@ def _default_stim_unit_dac_sources(
     system_config: dict[str, Any] | None = None,
 ) -> dict[int, int]:
     signal_dacs, _neutral_dac, _sync_dual_dac = _hardware_dac_config(system_config)
-    units = sorted({int(value) for value in stim_unit_by_electrode.values()})
+    units = list(dict.fromkeys(int(value) for value in stim_unit_by_electrode.values()))
     return {
         unit: int(signal_dacs[index % len(signal_dacs)])
         for index, unit in enumerate(units)
     }
+
 
 
 def _append_dac_codes(
@@ -187,237 +192,29 @@ def _route_signature(
 
 
 def build_stim_sequence(
-    protocol: dict[str, Any],
-    electrode_group_name: str,
-    *,
-    stim_unit_by_electrode: dict[int, int] | None = None,
-    stim_unit_to_dac: dict[int, int] | None = None,
-    electrode_group_electrodes: list[int] | None = None,
-    system_config: dict[str, Any] | None = None,
-) -> Any:
-    mx = _mx()
-    seq = mx.Sequence(initial_delay=100, persistent=False)
-    name = str(protocol.get("name", "stim"))
-    width_us = float(protocol.get("pulse_width_us", 300.0))
-    ipi_us = float(protocol.get("inter_phase_interval_us", 0.0))
-    signal_dacs, neutral_dac, sync_dual_dac = _hardware_dac_config(system_config)
-    unit_map = {int(key): int(value) for key, value in (stim_unit_by_electrode or {}).items()}
-    unit_to_dac = {int(key): int(value) for key, value in (stim_unit_to_dac or {}).items()}
-    if unit_map and not unit_to_dac:
-        unit_to_dac = _default_stim_unit_dac_sources(unit_map, system_config)
-    target_electrodes = [int(value) for value in (electrode_group_electrodes or [])]
-    active_dacs = _active_dac_sources(target_electrodes, unit_map, unit_to_dac) or list(signal_dacs)
-    hold_dacs = sorted(set(signal_dacs) | {int(neutral_dac)})
-    event_id = 1
-
-    def pulse(
-        amplitude_mv: float,
-        event_index: int,
-        duration_us: float = width_us,
-        pulse_dacs: list[int] | None = None,
-    ) -> float:
-        bits = _half_bits(amplitude_mv)
-        current_dacs = sorted({int(value) for value in (pulse_dacs or active_dacs)})
-        seq.append(
-            _event(
-                f"type stim name {name} amplitude_mv {amplitude_mv} "
-                f"electrode_group {electrode_group_name} "
-                f"dac_sources {','.join(str(value) for value in current_dacs)}",
-                event_index,
-            )
-        )
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        _append_dac_codes(seq, current_dacs, 512 - bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        if ipi_us > 0:
-            seq.append(mx.DelaySamples(_samples_us(ipi_us)))
-        _append_dac_codes(seq, current_dacs, 512 + bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
-
-    ptype = protocol.get("type")
-    if ptype in {"single_pulse", "individual_burst", "sequence_with_burst", "sequence_with_poisson_burst"}:
-        current_ms = 0.0
-        for stim_ms in _scheduled_stim_times_ms(protocol):
-            if stim_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(stim_ms - current_ms)))
-            current_ms = max(current_ms, stim_ms) + pulse(float(protocol.get("amplitude_mv", 150.0)), event_id)
-            event_id += 1
-    elif ptype == "custom_sequence":
-        current_ms = 0.0
-        for point in sorted(protocol.get("custom_points", []), key=lambda item: float(item["time_ms"])):
-            point_ms = float(point["time_ms"])
-            if point_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            point_dacs = (
-                [int(point["channel"])]
-                if "channel" in point and str(point.get("channel", "")).strip()
-                else None
-            )
-            pulse_width_ms = pulse(
-                float(point["amplitude_mv"]),
-                event_id,
-                float(point.get("duration_us", width_us)),
-                point_dacs,
-            )
-            event_id += 1
-            current_ms = max(current_ms, point_ms) + pulse_width_ms
+    protocol, electrode_group_name, *, stim_unit_by_electrode=None,
+    stim_unit_to_dac=None, electrode_group_electrodes=None, system_config=None,
+):
+    if protocol.get("type") == "custom_sequence":
+        rows = [dict(point, time_sec=float(point["time_ms"]) / 1000.0,
+                     pulse_width_us=point.get("duration_us", protocol.get("pulse_width_us", 300.0)))
+                for point in protocol.get("custom_points", [])]
     else:
-        raise ValueError(f"Unsupported protocol type: {ptype}")
-    return seq
+        rows = [{"time_sec": value / 1000.0} for value in _scheduled_stim_times_ms(protocol)]
+    for row in rows:
+        row["electrodes"] = list(electrode_group_electrodes or [])
+    unit_map = stim_unit_by_electrode or {}
+    sources = stim_unit_to_dac or _default_stim_unit_dac_sources(unit_map, system_config)
+    return _HostPulseSequence(protocol, rows, unit_map, sources, system_config, switch=False)
+
 
 
 def build_poisson_random_sequence(
-    protocol: dict[str, Any],
-    plan_rows: list[dict[str, Any]],
-    stim_unit_by_electrode: dict[int, int],
-    stim_unit_to_dac: dict[int, int] | None = None,
-    system_config: dict[str, Any] | None = None,
-) -> Any:
-    mx = _mx()
-    seq = mx.Sequence(initial_delay=100, persistent=False)
-    name = str(protocol.get("name", "poisson_random"))
-    width_us_default = float(protocol.get("pulse_width_us", 300.0))
-    ipi_us = float(protocol.get("inter_phase_interval_us", 0.0) or 0.0)
-    signal_dacs, neutral_dac, sync_dual_dac = _hardware_dac_config(system_config)
-    normalized_unit_map = {int(key): int(value) for key, value in stim_unit_by_electrode.items()}
-    normalized_unit_to_dac = {
-        int(key): int(value)
-        for key, value in (stim_unit_to_dac or {}).items()
-    }
-    if not normalized_unit_to_dac:
-        normalized_unit_to_dac = _default_stim_unit_dac_sources(normalized_unit_map, system_config)
-    hold_dacs = sorted(set(signal_dacs) | {int(neutral_dac)})
-    current_ms = 0.0
-    event_id = 1
-    connected_stim_unit: set[int] | None = None
-    connected_route_signature: tuple[tuple[int, ...], tuple[tuple[int, int], ...]] | None = None
-    connect_settle_ms = _plan_connect_settle_ms(protocol)
-    event_level_switch = _event_level_switch_enabled(protocol)
+    protocol, plan_rows, stim_unit_by_electrode, stim_unit_to_dac=None, system_config=None,
+):
+    return _HostPulseSequence(protocol, plan_rows, stim_unit_by_electrode,
+                              stim_unit_to_dac or {}, system_config, switch=True)
 
-    def pulse(
-        amplitude_mv: float,
-        event_index: int,
-        duration_us: float,
-        active_dacs: list[int],
-        target_units: list[int],
-    ) -> float:
-        bits = _half_bits(amplitude_mv)
-        seq.append(
-            _event(
-                f"type stim name {name} amplitude_mv {amplitude_mv} "
-                f"stim_units {','.join(str(value) for value in target_units)} "
-                f"dac_sources {','.join(str(value) for value in active_dacs)}",
-                event_index,
-            )
-        )
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        _append_dac_codes(seq, active_dacs, 512 - bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        if ipi_us > 0:
-            seq.append(mx.DelaySamples(_samples_us(ipi_us)))
-        _append_dac_codes(seq, active_dacs, 512 + bits, sync_dual_dac=sync_dual_dac)
-        seq.append(mx.DelaySamples(_samples_us(duration_us)))
-        _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        return (float(duration_us) * 2.0 + max(0.0, ipi_us)) / 1000.0
-
-    for row in sorted(plan_rows, key=lambda item: (float(item["time_sec"]), int(item.get("electrode", 0)))):
-        row_electrodes = _row_electrodes(row)
-        if not row_electrodes:
-            continue
-        missing = [electrode for electrode in row_electrodes if electrode not in stim_unit_by_electrode]
-        if missing:
-            raise RuntimeError(f"No stimulation unit configured for stimulation electrode(s): {','.join(str(item) for item in missing)}")
-        target_stim_units = {
-            int(normalized_unit_map[electrode])
-            for electrode in row_electrodes
-        }
-        target_unit_list = sorted(target_stim_units)
-        event_unit_to_dac = (
-            _event_unit_dac_sources(row_electrodes, normalized_unit_map, signal_dacs)
-            if event_level_switch
-            else {
-                int(unit): int(normalized_unit_to_dac[unit])
-                for unit in target_unit_list
-                if unit in normalized_unit_to_dac
-            }
-        )
-        route_signature = _route_signature(
-            target_unit_list,
-            event_unit_to_dac if event_level_switch else None,
-            normalized_unit_to_dac,
-            event_level_switch=event_level_switch,
-        )
-        active_dacs = sorted(set(event_unit_to_dac.values()))
-        if not active_dacs:
-            raise RuntimeError(
-                "No DAC source configured for stimulation electrodes: "
-                + ",".join(str(item) for item in row_electrodes)
-            )
-        point_ms = float(row["time_sec"]) * 1000.0
-        current_units = set() if connected_stim_unit is None else set(connected_stim_unit)
-        route_changed = (
-            connected_route_signature is None
-            or connected_route_signature != route_signature
-            or (not event_level_switch and current_units != target_stim_units)
-        )
-        switch_needed = bool(route_changed)
-        if route_changed and connect_settle_ms > 0.0:
-            switch_ms = max(current_ms, point_ms - connect_settle_ms)
-            if switch_ms > current_ms:
-                seq.append(mx.DelaySamples(_samples_ms(switch_ms - current_ms)))
-                current_ms = switch_ms
-        elif point_ms > current_ms:
-            seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            current_ms = point_ms
-        if switch_needed:
-            if event_level_switch:
-                _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-            for stim_unit in sorted(current_units - target_stim_units):
-                seq.append(mx.StimulationUnit(stim_unit).connect(False))
-            units_to_activate = (
-                sorted(target_stim_units)
-                if event_level_switch
-                else sorted(target_stim_units - current_units)
-            )
-            for stim_unit in units_to_activate:
-                source = int(
-                    event_unit_to_dac.get(
-                        stim_unit,
-                        normalized_unit_to_dac.get(stim_unit, signal_dacs[0]),
-                    )
-                )
-                if event_level_switch:
-                    seq.append(
-                        mx.StimulationUnit(stim_unit)
-                        .power_up(True)
-                        .connect(True)
-                        .set_voltage_mode()
-                        .dac_source(source)
-                    )
-                else:
-                    seq.append(mx.StimulationUnit(stim_unit).connect(True))
-            connected_stim_unit = set(target_stim_units)
-            connected_route_signature = route_signature
-        if point_ms > current_ms:
-            seq.append(mx.DelaySamples(_samples_ms(point_ms - current_ms)))
-            current_ms = point_ms
-        duration_ms = pulse(
-            float(row.get("amplitude_mv", protocol.get("amplitude_mv", 150.0))),
-            event_id,
-            float(row.get("pulse_width_us", width_us_default)),
-            active_dacs,
-            target_unit_list,
-        )
-        event_id += 1
-        current_ms = max(current_ms, point_ms) + duration_ms
-    if connected_stim_unit is not None:
-        if event_level_switch:
-            _append_dac_codes(seq, hold_dacs, 512, sync_dual_dac=sync_dual_dac)
-        for stim_unit in sorted(connected_stim_unit):
-            seq.append(mx.StimulationUnit(stim_unit).connect(False))
-    return seq
 
 
 def _plan_connect_settle_ms(protocol: dict[str, Any]) -> float:
@@ -470,6 +267,7 @@ def resolve_experiment_array(
     return_stim_units: bool = False,
     return_hardware_mapping: bool = False,
     initial_connect: bool = True,
+    require_unique_units: bool = True,
 ) -> Any:
     mx = _mx()
     electrodes = [int(item) for item in electrode_group.get("electrodes", [])]
@@ -488,25 +286,47 @@ def resolve_experiment_array(
     if not cfg_path.is_file():
         raise FileNotFoundError(f"cfg_path does not exist: {cfg_path}")
     array.load_config(str(cfg_path))
-    stim_units = []
     stim_unit_by_electrode: dict[int, int] = {}
     connected_electrodes: list[int] = []
     skipped_electrodes: list[int] = []
+    # Maxwell can revise an earlier allocation when a later electrode is
+    # connected. Query only after every connection request has completed so
+    # the returned mapping describes the final shared Array state.
     for electrode in electrodes:
         try:
             array.connect_electrode_to_stimulation(electrode)
-            stim_unit = array.query_stimulation_at_electrode(electrode)
-            if len(stim_unit) == 0:
-                raise RuntimeError(f"No stimulation unit can connect to electrode {electrode}")
         except Exception:
             if allow_missing_electrodes:
                 skipped_electrodes.append(electrode)
                 continue
             raise
-        stim_unit_int = int(stim_unit)
-        stim_units.append(stim_unit_int)
         connected_electrodes.append(electrode)
-        stim_unit_by_electrode[electrode] = stim_unit_int
+    queried_electrodes: list[int] = []
+    for electrode in connected_electrodes:
+        try:
+            stim_unit = array.query_stimulation_at_electrode(electrode)
+            if stim_unit is None or (isinstance(stim_unit, str) and not stim_unit.strip()):
+                raise RuntimeError(f"No stimulation unit can connect to electrode {electrode}")
+            stim_unit_by_electrode[electrode] = int(stim_unit)
+            queried_electrodes.append(electrode)
+        except Exception:
+            if allow_missing_electrodes:
+                skipped_electrodes.append(electrode)
+                continue
+            raise
+    connected_electrodes = queried_electrodes
+    if require_unique_units:
+        unit_to_electrodes: dict[int, list[int]] = {}
+        for electrode, stim_unit in stim_unit_by_electrode.items():
+            unit_to_electrodes.setdefault(int(stim_unit), []).append(int(electrode))
+        conflicts = {unit: mapped for unit, mapped in unit_to_electrodes.items() if len(mapped) > 1}
+        if conflicts:
+            details = "; ".join(f"unit {unit}: {mapped}" for unit, mapped in sorted(conflicts.items()))
+            raise RuntimeError(
+                "Each stimulation electrode must have a unique stimulation unit; "
+                f"allocation conflicts detected ({details})"
+            )
+    stim_units = list(stim_unit_by_electrode.values())
     explicit_unit_sources = {
         int(key): int(value)
         for key, value in (source_by_stim_unit or {}).items()
@@ -547,8 +367,18 @@ def resolve_experiment_array(
             return array, connected_electrodes, skipped_electrodes, stim_unit_by_electrode
         return array, connected_electrodes, skipped_electrodes
     mx.activate([0])
+    array.download()
+    time.sleep(mx.Timing.waitAfterDownload)
+    mx.offset()
+    device = str(system_config.get("maxwell", {}).get("device", "maxone")).lower()
+    offset_wait = mx.Timing.waitInMX2Offset if device == "maxtwo" else mx.Timing.waitInMX1Offset
+    time.sleep(offset_wait + getattr(mx.Timing, "waitAfterOffset", 0.0))
+    signal, neutral, sync = _hardware_dac_config(system_config)
+    zero = mx.Sequence(initial_delay=0, persistent=False)
+    _append_dac_codes(zero, sorted(set(signal) | {neutral}), 512, sync_dual_dac=sync)
+    zero.send()
     _signal_dacs, neutral_dac, _sync_dual_dac = _hardware_dac_config(system_config)
-    for stim_unit in sorted(set(stim_units)):
+    for stim_unit in dict.fromkeys(stim_units):
         initial_source = (
             int(neutral_dac)
             if not initial_connect
@@ -561,14 +391,13 @@ def resolve_experiment_array(
             .set_voltage_mode()
             .dac_source(initial_source)
         )
-    array.download([0])
-    time.sleep(getattr(mx.Timing, "waitAfterDownload", 0))
-    mx.offset()
+    mx.clear_events()
     if return_hardware_mapping:
         return array, connected_electrodes, skipped_electrodes, stim_unit_by_electrode, stim_unit_sources
     if return_stim_units:
         return array, connected_electrodes, skipped_electrodes, stim_unit_by_electrode
     return array, connected_electrodes, skipped_electrodes
+
 
 
 def probe_stimulation_electrodes(
@@ -585,6 +414,7 @@ def probe_stimulation_electrodes(
             allow_missing_electrodes=True,
             probe_only=True,
             return_stim_units=True,
+            require_unique_units=False,
         )
         return connected, skipped, stim_units
 
@@ -602,6 +432,7 @@ def probe_stimulation_electrodes(
             allow_missing_electrodes=True,
             probe_only=True,
             return_stim_units=True,
+            require_unique_units=False,
         )
         connected_all.extend(int(item) for item in connected)
         skipped_all.extend(int(item) for item in skipped)
@@ -670,14 +501,16 @@ def configure_poisson_experiment_array(
     return array, stim_unit_by_electrode, stim_unit_to_dac
 
 
-def create_experiment_saving(run_dir: Path, file_name: str) -> Any:
+def create_experiment_saving(run_dir: Path, file_name: str, record_channels: list[int]) -> Any:
     mx = _mx()
     saving = mx.Saving()
     saving.open_directory(str(run_dir))
+    saving.group_delete_all()
+    saving.group_define(0, "exp", record_channels)
     saving.start_file(file_name)
-    saving.group_define(0, "all_channels", list(range(1024)))
     saving.start_recording([0])
     return saving
+
 
 
 def get_stim_times_for_protocol(protocol: dict[str, Any], duration_s: int) -> list[float]:
@@ -820,3 +653,124 @@ def _burst_starts_ms(protocol: dict[str, Any], *, poisson: bool) -> list[float]:
         return starts
     burst_interval = _burst_interval_ms(protocol)
     return [start_ms + burst_index * burst_interval for burst_index in range(burst_count)]
+
+class _HostPulseSequence:
+    """D21: switch immediately, wait for the deadline, send one pulse."""
+
+    def __init__(self, protocol, rows, unit_map, unit_sources, system_config, *, switch):
+        self.protocol = protocol
+        self.rows = sorted(rows, key=lambda row: float(row["time_sec"]))
+        self.unit_map = unit_map
+        self.unit_sources = unit_sources
+        self.system_config = system_config or {}
+        self.switch = switch
+        self.sent_epochs = []
+        self.route_records = []
+
+    def send(self):
+        mx = _mx()
+        signal, neutral, sync = _hardware_dac_config(self.system_config)
+        hold = sorted(set(signal) | {neutral})
+        previous = set()
+        previous_sent = None
+        previous_plan = 0.0
+        origin = time.time()
+        sample_us = float(self.system_config.get("maxwell", {}).get("sample_us", 50.0))
+        if sample_us <= 0:
+            raise ValueError("sample_us must be positive")
+        self.sent_epochs = []
+        self.route_records = []
+
+        def zero():
+            seq = mx.Sequence(initial_delay=0, persistent=False)
+            _append_dac_codes(seq, hold, 512, sync_dual_dac=sync)
+            seq.send()
+
+        try:
+            for index, row in enumerate(self.rows, 1):
+                electrodes = _row_electrodes(row)
+                units = {int(self.unit_map[e]) for e in electrodes}
+                sources = (_event_unit_dac_sources(electrodes, self.unit_map, signal)
+                           if self.switch else self.unit_sources)
+                active = sorted({sources[u] for u in units})
+                if row.get("channel") is not None:
+                    active = [int(row["channel"])]
+                connected_at = None
+                if self.switch:
+                    zero()
+                    for unit in sorted(previous - units):
+                        mx.send(mx.StimulationUnit(unit).connect(False))
+                    for electrode in sorted(set(electrodes)):
+                        unit = int(self.unit_map[electrode])
+                        mx.send(mx.StimulationUnit(unit).power_up(True).connect(True)
+                                .set_voltage_mode().dac_source(sources[unit]))
+                    connected_at = time.time()
+                planned = float(row["time_sec"])
+                deadline = (origin + planned if previous_sent is None else
+                            previous_sent + max(0.0, planned - previous_plan))
+                time.sleep(max(0.0, deadline - time.time()))
+                amplitude = float(row.get("amplitude_mv", self.protocol.get("amplitude_mv", 150.0)))
+                lsb = float(mx.query_DAC_lsb_mV())
+                if lsb <= 0:
+                    raise ValueError("DAC LSB must be positive")
+                bits = int(round(abs(amplitude) / lsb))
+                if not 1 <= bits <= 511:
+                    raise ValueError(f"Stimulation amplitude out of DAC range: {amplitude}")
+                width = float(row.get("pulse_width_us", self.protocol.get("pulse_width_us", 300.0)))
+                phase_samples = max(1, int(round(width / sample_us)))
+                pulse = mx.Sequence(initial_delay=100, persistent=False)
+                pulse.append(_event(f"type stim mode {'pool_fast_switch' if self.switch else 'single_connect'} "
+                                    f"pulse {index}/{len(self.rows)} els {'-'.join(map(str, electrodes))}", index))
+                _append_dac_codes(pulse, hold, 512, sync_dual_dac=sync)
+                inactive = sorted(set(hold) - set(active))
+                for code in (512 - bits, 512 + bits):
+                    _append_dac_codes(pulse, active, code, sync_dual_dac=sync)
+                    _append_dac_codes(pulse, inactive, 512, sync_dual_dac=sync)
+                    pulse.append(mx.DelaySamples(phase_samples))
+                _append_dac_codes(pulse, hold, 512, sync_dual_dac=sync)
+                sent = time.time()
+                pulse.send()
+                self.sent_epochs.append(sent)
+                self.route_records.append({
+                    "stim_index": index, "pulse_time_s": sent - origin,
+                    "route_switch": self.switch, "connect_epoch": connected_at,
+                    "connect_time_s": None if connected_at is None else connected_at - origin,
+                    "settle_ms": 0.0 if connected_at is None else (sent - connected_at) * 1000.0,
+                    "previous_stim_units": sorted(previous), "target_stim_units": sorted(units),
+                    "active_dac_sources": active,
+                    "stim_unit_to_event_dac": {u: sources[u] for u in units},
+                    "electrodes": electrodes, "timing_source": "host_send",
+                })
+                previous = units
+                previous_sent, previous_plan = sent, planned
+        finally:
+            if self.switch:
+                zero()
+                for unit in sorted(set(self.unit_map.values())):
+                    mx.send(mx.StimulationUnit(unit).connect(False))
+        time.sleep(float(self.protocol.get("tail_wait_sec", 0.5)))
+
+
+def record_channels_excluding(cfg_path: Path, electrodes: list[int]) -> list[int]:
+    import re
+    excluded = set(map(int, electrodes))
+    text = cfg_path.read_text(encoding="utf-8", errors="replace")
+    channels = sorted({int(ch) for ch, el in re.findall(r"(\d+)\((\d+)\)", text)
+                       if int(el) not in excluded})
+    if not channels:
+        raise ValueError("No recording channels remain in the CFG mapping")
+    return channels
+
+
+def prepare_recording_only(cfg_path: Path, system_config: dict[str, Any]) -> None:
+    mx = _mx()
+    array = mx.Array("stimulation")
+    array.load_config(str(cfg_path))
+    mx.activate([0])
+    array.download()
+    time.sleep(mx.Timing.waitAfterDownload)
+    mx.offset()
+    device = str(system_config.get("maxwell", {}).get("device", "maxone")).lower()
+    offset_wait = mx.Timing.waitInMX2Offset if device == "maxtwo" else mx.Timing.waitInMX1Offset
+    time.sleep(offset_wait + getattr(mx.Timing, "waitAfterOffset", 0.0))
+    mx.clear_events()

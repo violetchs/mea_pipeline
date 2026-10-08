@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .figures import create_generic_analysis_figure
+from .channel_forecast import ChannelForecastSummary, global_response_lines, load_channel_forecast_summary, spatial_response_metrics
 from .pivae import PiVAEAnalysisConfig, derive_pivae_covariates, fit_pivae_latent_states
 from .primitives import (
     PreparedMatrix,
@@ -19,6 +20,7 @@ from .primitives import (
 
 __all__ = [
     "Analyzer",
+    "ChannelForecastSummary",
     "PreparedMatrix",
     "PiVAEAnalysisConfig",
     "assign_feature_clusters",
@@ -26,11 +28,14 @@ __all__ = [
     "create_generic_analysis_figure",
     "derive_pivae_covariates",
     "fit_pivae_latent_states",
+    "global_response_lines",
     "hierarchical_order_and_groups",
     "normalize_feature_matrix",
+    "load_channel_forecast_summary",
     "prepare_feature_matrix",
     "reduce_feature_matrix",
     "run_generic_matrix_analysis",
+    "spatial_response_metrics",
 ]
 
 
